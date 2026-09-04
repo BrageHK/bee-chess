@@ -35,6 +35,3 @@ cd frontend && npm install && npm run build
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and branch
 naming conventions.
 
-## Authors
-
-[@bragehk](https://github.com/bragehk), [@johsol](https://github.com/johsol), [@sebasabe](https://github.com/sebasabe)
