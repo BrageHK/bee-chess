@@ -5,6 +5,7 @@ import { parseUci } from "chessops/util";
 import type { Key } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
 import { whiteEngine, blackEngine } from "./engine";
+import { UciLogPanel } from "./UciLogPanel";
 import {
   DEFAULT_GAME_CONFIG,
   MAX_STOCKFISH_ELO,
@@ -37,6 +38,11 @@ export default function App() {
   const [fen, setFen] = useState(START_FEN);
   const [lastMove, setLastMove] = useState<Key[] | undefined>();
   const [status, setStatus] = useState("");
+  // Mirrors gameIdRef in state (a ref alone can't drive a re-render).
+  // Used as part of each UciLogPanel's `key` below so a new game
+  // remounts (and so clears) both panels instead of carrying over the
+  // previous game's log history.
+  const [gameSeq, setGameSeq] = useState(0);
 
   const startGame = async (gameConfig: GameConfig) => {
     const gameId = ++gameIdRef.current;
@@ -47,6 +53,7 @@ export default function App() {
     setLastMove(undefined);
     setPhase("playing");
     setStatus("connecting to the bridge…");
+    setGameSeq(gameId);
 
     const moves: string[] = [];
 
@@ -118,6 +125,18 @@ export default function App() {
           {phase === "finished" && (
             <button onClick={() => setPhase("config")}>New game</button>
           )}
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
+            <UciLogPanel
+              key={`white-${gameSeq}`}
+              name={whiteEngine.name}
+              subscribe={(l) => whiteEngine.onLog(l)}
+            />
+            <UciLogPanel
+              key={`black-${gameSeq}`}
+              name={blackEngine.name}
+              subscribe={(l) => blackEngine.onLog(l)}
+            />
+          </div>
         </>
       )}
     </main>

@@ -6,11 +6,23 @@
  * socket.
  */
 
-class UciClient {
+/** One line of raw UCI traffic, for the log panel. */
+export interface UciLogLine {
+  direction: "sent" | "received";
+  text: string;
+  timestamp: number;
+}
+
+export class UciClient {
   private readonly url: string;
   private ws: WebSocket | null = null;
   private ready: Promise<void> | null = null;
   private readonly listeners = new Set<(line: string) => void>();
+  // Separate from `listeners`: those are one-shot protocol subscribers
+  // (bestMove/setOption waiting for a specific reply), these are
+  // permanent log consumers that want every line, sent and received,
+  // unconditionally -- see `onLog`.
+  private readonly logListeners = new Set<(line: UciLogLine) => void>();
 
   /** Name the engine reports via `id name`, until then the given label. */
   name: string;
@@ -18,6 +30,26 @@ class UciClient {
   constructor(url: string, label: string) {
     this.url = url;
     this.name = label;
+  }
+
+  /**
+   * Subscribes to every line of raw UCI traffic this client sends or
+   * receives, in order, for as long as the client exists. Returns an
+   * unsubscribe function.
+   */
+  onLog(listener: (line: UciLogLine) => void): () => void {
+    this.logListeners.add(listener);
+    return () => this.logListeners.delete(listener);
+  }
+
+  private logSent(text: string) {
+    const line: UciLogLine = { direction: "sent", text, timestamp: Date.now() };
+    for (const listener of this.logListeners) listener(line);
+  }
+
+  private logReceived(text: string) {
+    const line: UciLogLine = { direction: "received", text, timestamp: Date.now() };
+    for (const listener of this.logListeners) listener(line);
   }
 
   /** Connects and runs the `uci` / `isready` handshake. */
@@ -41,6 +73,7 @@ class UciClient {
         for (const raw of e.data.split("\n")) {
           const line = raw.trim();
           if (!line) continue;
+          this.logReceived(line);
           if (line.startsWith("id name ")) this.name = line.slice(8);
           if (line === "uciok") this.send("isready");
           if (line === "readyok") resolve();
@@ -114,6 +147,7 @@ class UciClient {
   }
 
   private send(cmd: string) {
+    this.logSent(cmd);
     this.ws?.send(cmd);
   }
 }
