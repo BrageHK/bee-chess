@@ -3,8 +3,9 @@
 //!
 //! This module defines board layout, castling rights, en passant target,
 //! halfmove clock, side to move, and a hardcoded starting position. FEN
-//! parsing/serialization lives in `super::fen`. Pseudo-legal/legal move
-//! generation, make/unmake, and Zobrist hashing land in follow-up PRs.
+//! parsing/serialization lives in `super::fen`; make/unmake lives in
+//! `super::make_unmake`. Pseudo-legal/legal move generation and Zobrist
+//! hashing land in follow-up PRs.
 
 use super::castling::CastlingRights;
 use super::piece::{Color, Piece, PieceKind};
