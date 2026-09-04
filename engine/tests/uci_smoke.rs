@@ -29,7 +29,7 @@ fn uci_handshake_over_stdio() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be valid utf8");
-    assert!(stdout.contains("id name Bee"));
+    assert!(stdout.contains("id name bee-chess"));
     assert!(stdout.contains("id author"));
     assert!(stdout.contains("uciok"));
     assert!(stdout.contains("readyok"));
