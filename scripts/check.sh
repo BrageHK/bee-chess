@@ -28,6 +28,9 @@ echo "==> bridge: ruff check"
 echo "==> frontend: lint"
 npm --prefix frontend run lint
 
+echo "==> frontend: test"
+npm --prefix frontend test
+
 echo "==> frontend: build"
 npm --prefix frontend run build
 

@@ -6,17 +6,8 @@
  * socket.
  */
 
-/** Remaining time and increment for both sides, in milliseconds. */
-export interface Clock {
-  wtime: number;
-  btime: number;
-  winc: number;
-  binc: number;
-}
-
 class UciClient {
   private readonly url: string;
-  private readonly options: readonly string[];
   private ws: WebSocket | null = null;
   private ready: Promise<void> | null = null;
   private readonly listeners = new Set<(line: string) => void>();
@@ -24,13 +15,12 @@ class UciClient {
   /** Name the engine reports via `id name`, until then the given label. */
   name: string;
 
-  constructor(url: string, label: string, options: readonly string[] = []) {
+  constructor(url: string, label: string) {
     this.url = url;
     this.name = label;
-    this.options = options;
   }
 
-  /** Connects and runs the `uci` / `setoption` / `isready` handshake. */
+  /** Connects and runs the `uci` / `isready` handshake. */
   init(): Promise<void> {
     if (this.ready) return this.ready;
 
@@ -43,18 +33,16 @@ class UciClient {
       ws.onerror = fail;
       ws.onclose = fail;
       ws.onopen = () => this.send("uci");
-      // One `onmessage` for the life of the socket: `bestMove` subscribes
-      // through `listeners` instead of replacing this handler, so nothing
-      // clobbers the handshake or a concurrent search.
+      // One `onmessage` for the life of the socket: `bestMove` and
+      // `setOption` subscribe through `listeners` instead of replacing
+      // this handler, so nothing clobbers the handshake or a concurrent
+      // search.
       ws.onmessage = (e: MessageEvent<string>) => {
         for (const raw of e.data.split("\n")) {
           const line = raw.trim();
           if (!line) continue;
           if (line.startsWith("id name ")) this.name = line.slice(8);
-          if (line === "uciok") {
-            for (const option of this.options) this.send(option);
-            this.send("isready");
-          }
+          if (line === "uciok") this.send("isready");
           if (line === "readyok") resolve();
           for (const listener of this.listeners) listener(line);
         }
@@ -65,18 +53,40 @@ class UciClient {
   }
 
   /**
-   * Asks for a move in the position reached by `moves` from the start
-   * position, under the given clock.
-   *
-   * The move list is sent rather than a bare FEN so the engine can see
-   * repetitions. Rejects if the engine stays silent past its own clock —
-   * the Bee engine only implements the UCI handshake so far, so it never
-   * answers `go`.
+   * Sends `setoption name <name> value <value>` and waits for the
+   * engine to confirm it's still ready, so a caller can rely on the
+   * option being applied before the next `go`. Safe to call again
+   * before a new game to change settings (e.g. Stockfish's Elo) without
+   * reconnecting.
    */
-  async bestMove(moves: readonly string[], clk: Clock, white: boolean): Promise<string> {
+  async setOption(name: string, value: string | number | boolean): Promise<void> {
     await this.init();
 
-    const budget = (white ? clk.wtime : clk.btime) + 5000;
+    return new Promise<void>((resolve) => {
+      const listener = (line: string) => {
+        if (line !== "readyok") return;
+        this.listeners.delete(listener);
+        resolve();
+      };
+      this.listeners.add(listener);
+      this.send(`setoption name ${name} value ${value}`);
+      this.send("isready");
+    });
+  }
+
+  /**
+   * Asks for a move in the position reached by `moves` from the start
+   * position, thinking for exactly `moveTimeMs` (a fixed move-time
+   * budget, not a chess clock -- see GameConfig).
+   *
+   * The move list is sent rather than a bare FEN so the engine can see
+   * repetitions. Rejects if the engine stays silent well past its
+   * budget, so a stuck engine can't hang the game loop forever.
+   */
+  async bestMove(moves: readonly string[], moveTimeMs: number): Promise<string> {
+    await this.init();
+
+    const budget = moveTimeMs + 5000;
 
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -99,9 +109,7 @@ class UciClient {
 
       this.listeners.add(listener);
       this.send(moves.length ? `position startpos moves ${moves.join(" ")}` : "position startpos");
-      this.send(
-        `go wtime ${ms(clk.wtime)} btime ${ms(clk.btime)} winc ${ms(clk.winc)} binc ${ms(clk.binc)}`,
-      );
+      this.send(`go movetime ${Math.max(1, Math.round(moveTimeMs))}`);
     });
   }
 
@@ -110,16 +118,5 @@ class UciClient {
   }
 }
 
-const ms = (t: number) => Math.max(0, Math.round(t));
-
-/**
- * Stockfish at full strength is not a fair fight, so it is capped here.
- * Raise `UCI_Elo` (1320-3190) or drop both lines to unleash it.
- */
-const STOCKFISH_OPTIONS = [
-  "setoption name UCI_LimitStrength value true",
-  "setoption name UCI_Elo value 1600",
-];
-
-export const whiteEngine = new UciClient("ws://localhost:8765", "stockfish", STOCKFISH_OPTIONS);
+export const whiteEngine = new UciClient("ws://localhost:8765", "stockfish");
 export const blackEngine = new UciClient("ws://localhost:8766", "bee");

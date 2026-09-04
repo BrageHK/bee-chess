@@ -1,16 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Chess } from "chessops/chess";
 import { makeFen } from "chessops/fen";
 import { parseUci } from "chessops/util";
 import type { Key } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
 import { whiteEngine, blackEngine } from "./engine";
+import {
+  DEFAULT_GAME_CONFIG,
+  MAX_STOCKFISH_ELO,
+  MIN_MOVE_TIME_MS,
+  MIN_STOCKFISH_ELO,
+  validateGameConfig,
+  type GameConfig,
+} from "./gameConfig";
 import "@lichess-org/chessground/assets/chessground.base.css";
 import "@lichess-org/chessground/assets/chessground.brown.css";
 import "@lichess-org/chessground/assets/chessground.cburnett.css";
-
-const START = 3 * 60 * 1000; // 3 min
-const INC = 2000; // +2s
 
 /** Claim a draw once the fifty-move counter is full; chessops does not. */
 const MAX_HALFMOVES = 100;
@@ -18,97 +23,159 @@ const MAX_HALFMOVES = 100;
 /** Board position before any move; avoids reading the ref during render. */
 const START_FEN = makeFen(Chess.default().toSetup());
 
-const fmt = (t: number) =>
-  `${Math.floor(t / 60000)}:${String(Math.floor((t % 60000) / 1000)).padStart(2, "0")}`;
+type GamePhase = "config" | "playing" | "finished";
 
 export default function App() {
   const posRef = useRef(Chess.default());
+  // Bumped on every startGame() call; a running loop checks it still
+  // matches the value it started with before writing state, so a stale
+  // loop (superseded by a newer "Start Game" click) can't clobber a
+  // later game's state after the fact.
+  const gameIdRef = useRef(0);
+  const [phase, setPhase] = useState<GamePhase>("config");
+  const [config, setConfig] = useState<GameConfig>(DEFAULT_GAME_CONFIG);
   const [fen, setFen] = useState(START_FEN);
   const [lastMove, setLastMove] = useState<Key[] | undefined>();
-  const [clocks, setClocks] = useState({ w: START, b: START });
-  const [status, setStatus] = useState("connecting to the bridge…");
+  const [status, setStatus] = useState("");
 
-  useEffect(() => {
-    let alive = true;
+  const startGame = async (gameConfig: GameConfig) => {
+    const gameId = ++gameIdRef.current;
+    const current = () => gameId === gameIdRef.current;
 
-    void (async () => {
-      const clk = { w: START, b: START };
-      const moves: string[] = [];
+    posRef.current = Chess.default();
+    setFen(START_FEN);
+    setLastMove(undefined);
+    setPhase("playing");
+    setStatus("connecting to the bridge…");
 
-      try {
-        await Promise.all([whiteEngine.init(), blackEngine.init()]);
-      } catch (err) {
-        if (alive) setStatus(message(err));
+    const moves: string[] = [];
+
+    try {
+      await Promise.all([whiteEngine.init(), blackEngine.init()]);
+      await whiteEngine.setOption("UCI_LimitStrength", true);
+      await whiteEngine.setOption("UCI_Elo", gameConfig.stockfishElo);
+    } catch (err) {
+      if (current()) {
+        setStatus(message(err));
+        setPhase("finished");
+      }
+      return;
+    }
+
+    while (current() && !posRef.current.isEnd()) {
+      if (posRef.current.halfmoves >= MAX_HALFMOVES) {
+        setStatus("draw by the fifty-move rule");
+        setPhase("finished");
         return;
       }
 
-      while (alive && !posRef.current.isEnd()) {
-        if (posRef.current.halfmoves >= MAX_HALFMOVES) {
-          setStatus("draw by the fifty-move rule");
-          return;
+      const white = posRef.current.turn === "white";
+      const engine = white ? whiteEngine : blackEngine;
+      setStatus(`${engine.name} thinking…`);
+
+      let uci: string;
+      try {
+        uci = await engine.bestMove(moves, gameConfig.moveTimeMs);
+      } catch (err) {
+        if (current()) {
+          setStatus(message(err));
+          setPhase("finished");
         }
+        return;
+      }
+      if (!current()) return;
 
-        const white = posRef.current.turn === "white";
-        const engine = white ? whiteEngine : blackEngine;
-        setStatus(`${engine.name} thinking…`);
-
-        const t0 = performance.now();
-        let uci: string;
-        try {
-          uci = await engine.bestMove(
-            moves,
-            { wtime: clk.w, btime: clk.b, winc: INC, binc: INC },
-            white,
-          );
-        } catch (err) {
-          if (alive) setStatus(message(err));
-          return;
-        }
-        const spent = performance.now() - t0;
-        if (!alive) return;
-
-        if (white) clk.w = clk.w - spent + INC;
-        else clk.b = clk.b - spent + INC;
-        if (clk.w <= 0 || clk.b <= 0) {
-          setClocks({ ...clk });
-          setStatus(
-            `${clk.w <= 0 ? whiteEngine.name : blackEngine.name} flags — out of time`,
-          );
-          return;
-        }
-
-        const move = parseUci(uci);
-        if (!move || !posRef.current.isLegal(move)) {
-          setStatus(`${engine.name} played an illegal move: ${uci}`);
-          return;
-        }
-
-        posRef.current.play(move);
-        moves.push(uci);
-        setFen(makeFen(posRef.current.toSetup()));
-        setLastMove([uci.slice(0, 2), uci.slice(2, 4)] as Key[]);
-        setClocks({ ...clk });
+      const move = parseUci(uci);
+      if (!move || !posRef.current.isLegal(move)) {
+        setStatus(`${engine.name} played an illegal move: ${uci}`);
+        setPhase("finished");
+        return;
       }
 
-      if (alive) setStatus(outcome(posRef.current));
-    })();
+      posRef.current.play(move);
+      moves.push(uci);
+      setFen(makeFen(posRef.current.toSetup()));
+      setLastMove([uci.slice(0, 2), uci.slice(2, 4)] as Key[]);
+    }
 
-    return () => {
-      alive = false;
-    };
-  }, []);
+    if (current()) {
+      setStatus(outcome(posRef.current));
+      setPhase("finished");
+    }
+  };
 
   return (
     <main style={{ display: "grid", placeItems: "center", gap: 8, padding: 24 }}>
       <h1>
         {whiteEngine.name} (white) vs {blackEngine.name} (black)
       </h1>
-      <p>
-        white {fmt(clocks.w)} — black {fmt(clocks.b)}
-      </p>
-      <Chessground config={{ fen, lastMove, viewOnly: true }} />
-      <p>{status}</p>
+      {phase === "config" ? (
+        <GameConfigForm initial={config} onStart={(c) => { setConfig(c); void startGame(c); }} />
+      ) : (
+        <>
+          <Chessground config={{ fen, lastMove, viewOnly: true }} />
+          <p>{status}</p>
+          {phase === "finished" && (
+            <button onClick={() => setPhase("config")}>New game</button>
+          )}
+        </>
+      )}
     </main>
+  );
+}
+
+function GameConfigForm({
+  initial,
+  onStart,
+}: {
+  initial: GameConfig;
+  onStart: (config: GameConfig) => void;
+}) {
+  // Kept as strings while editing so the field can be temporarily empty
+  // or mid-edit (e.g. "16") without snapping back to a number.
+  const [eloText, setEloText] = useState(String(initial.stockfishElo));
+  const [moveTimeText, setMoveTimeText] = useState(String(initial.moveTimeMs));
+
+  const config: GameConfig = {
+    stockfishElo: Number(eloText),
+    moveTimeMs: Number(moveTimeText),
+  };
+  const error = validateGameConfig(config);
+
+  return (
+    <form
+      style={{ display: "grid", gap: 12, justifyItems: "start" }}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!error) onStart(config);
+      }}
+    >
+      <label style={{ display: "grid", gap: 4 }}>
+        Stockfish Elo
+        <input
+          type="number"
+          value={eloText}
+          min={MIN_STOCKFISH_ELO}
+          max={MAX_STOCKFISH_ELO}
+          step={1}
+          onChange={(e) => setEloText(e.target.value)}
+        />
+      </label>
+      <label style={{ display: "grid", gap: 4 }}>
+        Time per move (ms)
+        <input
+          type="number"
+          value={moveTimeText}
+          min={MIN_MOVE_TIME_MS}
+          step={1}
+          onChange={(e) => setMoveTimeText(e.target.value)}
+        />
+      </label>
+      {error && <p style={{ color: "crimson", margin: 0 }}>{error}</p>}
+      <button type="submit" disabled={error !== null}>
+        Start Game
+      </button>
+    </form>
   );
 }
 
