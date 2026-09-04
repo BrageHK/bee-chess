@@ -12,8 +12,8 @@
 
 use std::io::{BufRead, Write};
 
-pub const ENGINE_NAME: &str = "Bee";
-pub const ENGINE_AUTHOR: &str = "Bee Chess Contributors";
+pub const ENGINE_NAME: &str = "bee-chess";
+pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
 
 /// A parsed UCI command. Only the handshake subset is implemented in the
 /// bootstrap PR; unrecognized input is ignored rather than erroring, per
