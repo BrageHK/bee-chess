@@ -1,9 +1,9 @@
 //! Chess position: board state plus everything needed to make/unmake
 //! moves and detect draws.
 //!
-//! This module currently defines the primitives only — board layout,
-//! castling rights, en passant target, halfmove clock, side to move, and
-//! a hardcoded starting position. FEN parsing, pseudo-legal/legal move
+//! This module defines board layout, castling rights, en passant target,
+//! halfmove clock, side to move, and a hardcoded starting position. FEN
+//! parsing/serialization lives in `super::fen`. Pseudo-legal/legal move
 //! generation, make/unmake, and Zobrist hashing land in follow-up PRs.
 
 use super::castling::CastlingRights;
