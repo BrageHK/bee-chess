@@ -1,0 +1,35 @@
+name: CI / Python
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'training/**'
+      - '.github/workflows/ci-python.yml'
+  pull_request:
+    paths:
+      - 'training/**'
+      - '.github/workflows/ci-python.yml'
+
+concurrency:
+  group: ci-python-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - name: Sync
+        run: uv sync
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest
