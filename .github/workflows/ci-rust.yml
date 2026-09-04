@@ -36,3 +36,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Test (ignored, e.g. deep perft)
+        run: cargo test --release -- --ignored
