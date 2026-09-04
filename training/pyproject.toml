@@ -6,9 +6,15 @@ requires-python = ">=3.14"
 dependencies = [
     "torch>=2.14.0",
     "torchvision>=0.29.0",
+    "chess>=1.11.0",
+    "httpx>=0.28.0",
+    "tqdm>=4.66.0",
     "mambapy>=1.2.0",
     "triton-rocm>=3.8.0,<3.9 ; sys_platform == 'linux'",
 ]
+
+[project.scripts]
+bee-training = "bee_training.cli:main"
 
 [dependency-groups]
 dev = [
