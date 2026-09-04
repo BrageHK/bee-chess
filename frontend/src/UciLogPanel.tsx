@@ -38,7 +38,20 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
   }, [lines]);
 
   return (
-    <section style={{ display: "grid", gap: 4, minWidth: 320, textAlign: "left" }}>
+    <section
+      style={{
+        display: "grid",
+        gap: 4,
+        width: "100%",
+        // Flex children default to min-width: auto, which lets a long
+        // UCI line (a long PV, say) force this panel wider than its
+        // flex parent intends. min-width: 0 lets it actually respect
+        // width: 100% and scroll its own content horizontally instead.
+        minWidth: 0,
+        maxWidth: 480,
+        textAlign: "left",
+      }}
+    >
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <strong>{name}</strong>
         <button type="button" onClick={() => setLines([])}>
@@ -56,14 +69,16 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
         }}
         style={{
           height: 200,
+          width: "100%",
+          boxSizing: "border-box",
           overflowY: "auto",
+          overflowX: "auto",
           background: "#111",
           color: "#ddd",
           fontFamily: "monospace",
           fontSize: 12,
           padding: 8,
           borderRadius: 4,
-          whiteSpace: "pre-wrap",
           textAlign: "left",
         }}
       >
@@ -71,7 +86,10 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
         {lines.map((line, index) => (
           <div
             key={index}
-            style={{ color: line.direction === "sent" ? "#7fd1ff" : "#8fe38f" }}
+            style={{
+              color: line.direction === "sent" ? "#7fd1ff" : "#8fe38f",
+              whiteSpace: "pre",
+            }}
           >
             {line.direction === "sent" ? "→ " : "← "}
             {line.text}
