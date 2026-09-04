@@ -5,6 +5,9 @@
 /training/.venv/
 /training/.pytest_cache/
 /training/.ruff_cache/
+/training/.cache/
+/training/data/
+/training/books/
 __pycache__/
 *.pyc
 
