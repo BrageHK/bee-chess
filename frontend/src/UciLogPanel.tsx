@@ -42,13 +42,16 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
       style={{
         display: "grid",
         gap: 4,
-        width: "100%",
-        // Flex children default to min-width: auto, which lets a long
-        // UCI line (a long PV, say) force this panel wider than its
-        // flex parent intends. min-width: 0 lets it actually respect
-        // width: 100% and scroll its own content horizontally instead.
+        // flex: "1 1 0" makes every panel in the row claim an equal
+        // share of the row's fixed width, unconditionally -- not "as
+        // much as its content wants" (the default flex-basis: auto).
+        // Flex children also default to min-width: auto, which lets a
+        // long UCI line (a long PV, say) override that equal share and
+        // force the panel wider than intended; minWidth: 0 removes
+        // that override so the panel's width never depends on its own
+        // content, only on the row's fixed width.
+        flex: "1 1 0",
         minWidth: 0,
-        maxWidth: 480,
         textAlign: "left",
       }}
     >

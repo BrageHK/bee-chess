@@ -112,7 +112,23 @@ export default function App() {
   };
 
   return (
-    <main style={{ display: "grid", placeItems: "center", gap: 8, padding: 24, textAlign: "center" }}>
+    <main
+      style={{
+        display: "grid",
+        // An explicit 1fr column (rather than relying on the default
+        // auto-sized implicit track) makes every child's available
+        // width equal to <main>'s own width, not the width of the
+        // widest child -- otherwise the grid track itself grows and
+        // shrinks with content, and everything centered inside it
+        // (including the log row below) reflows along with it.
+        gridTemplateColumns: "1fr",
+        justifyItems: "center",
+        alignItems: "center",
+        gap: 8,
+        padding: 24,
+        textAlign: "center",
+      }}
+    >
       <h1>
         {whiteEngine.name} (white) vs {blackEngine.name} (black)
       </h1>
@@ -125,7 +141,17 @@ export default function App() {
           {phase === "finished" && (
             <button onClick={() => setPhase("config")}>New game</button>
           )}
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center" }}>
+          {/*
+            Fixed width, no wrap: with flexWrap and content-dependent
+            panel widths, whether the two panels sat side by side or
+            stacked flipped depending on how much log text had
+            accumulated in each -- an unstable layout that changed
+            shape as a game ran. A fixed-width row where each panel
+            always takes an equal, fixed share (flex: "1 1 0",
+            minWidth: 0 so it can't grow past that share) removes the
+            two things that made width depend on content.
+          */}
+          <div style={{ display: "flex", gap: 16, width: "100%", maxWidth: 900 }}>
             <UciLogPanel
               key={`white-${gameSeq}`}
               name={whiteEngine.name}
