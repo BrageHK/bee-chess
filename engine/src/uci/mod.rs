@@ -12,7 +12,7 @@
 
 use std::io::{BufRead, Write};
 
-use crate::chess::{PieceKind, Position, Square};
+use crate::chess::{Move, PieceKind, Position, Square};
 use crate::engine::Engine;
 
 pub const ENGINE_NAME: &str = "bee-chess";
@@ -149,12 +149,41 @@ fn parse_moves_suffix(s: &str) -> Option<Vec<UciMove>> {
     rest.split_whitespace().map(UciMove::parse).collect()
 }
 
+/// The parsed body of a `go` command. Only `depth` is recognized so
+/// far -- enough to return a legal move, not to search. Clock/
+/// increment/nodes/movetime/infinite/ponder and the rest of `go`'s
+/// fields, along with `stop` and actual search, are a follow-up
+/// milestone's work; see `SearchLimits` in `crate::search` for the
+/// eventual full shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GoCommand {
+    pub depth: Option<u32>,
+}
+
+impl GoCommand {
+    /// Parses the argument portion of a `go` command, i.e. everything
+    /// after `"go"`. Currently only recognizes `depth <n>`; any other
+    /// token is ignored rather than rejected, since a real `go` line
+    /// from a GUI will carry fields (`wtime`, `btime`, ...) this
+    /// milestone doesn't act on yet, and ignoring them is more useful
+    /// than refusing the whole command over them.
+    pub fn parse(args: &str) -> Self {
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        let depth = tokens
+            .iter()
+            .position(|&token| token == "depth")
+            .and_then(|index| tokens.get(index + 1))
+            .and_then(|value| value.parse().ok());
+        GoCommand { depth }
+    }
+}
+
 /// A parsed UCI command. Only a subset of the full protocol is
 /// implemented so far; unrecognized input is ignored rather than
 /// erroring, per the UCI convention of tolerating unknown commands. The
-/// full asynchronous state machine (`setoption`, `go`, `stop`,
-/// `ponderhit`, concurrent input handling while searching) lands in a
-/// follow-up PR.
+/// full asynchronous state machine (`setoption`, `stop`, `ponderhit`,
+/// concurrent input handling while searching, and actual search) lands
+/// in a follow-up milestone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UciCommand {
     Uci,
@@ -162,6 +191,7 @@ pub enum UciCommand {
     Debug(bool),
     NewGame,
     Position(PositionCommand),
+    Go(GoCommand),
     Quit,
     Unknown(String),
 }
@@ -181,6 +211,9 @@ impl UciCommand {
                         None => UciCommand::Unknown(line.to_string()),
                     };
                 }
+                if let Some(rest) = line.strip_prefix("go") {
+                    return UciCommand::Go(GoCommand::parse(rest));
+                }
                 match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["debug", "on"] => UciCommand::Debug(true),
                     ["debug", "off"] => UciCommand::Debug(false),
@@ -188,6 +221,26 @@ impl UciCommand {
                 }
             }
         }
+    }
+}
+
+/// Formats a move as UCI long algebraic notation, e.g. `e2e4` or
+/// `e7e8q`. The inverse of `UciMove::parse`'s promotion-letter mapping.
+fn format_uci_move(mv: Move) -> String {
+    match mv.flag().promotion_kind() {
+        Some(kind) => {
+            let letter = match kind {
+                PieceKind::Queen => 'q',
+                PieceKind::Rook => 'r',
+                PieceKind::Bishop => 'b',
+                PieceKind::Knight => 'n',
+                PieceKind::Pawn | PieceKind::King => {
+                    unreachable!("promotion_kind never returns Pawn or King")
+                }
+            };
+            format!("{}{}{letter}", mv.from(), mv.to())
+        }
+        None => format!("{}{}", mv.from(), mv.to()),
     }
 }
 
@@ -227,6 +280,20 @@ pub fn run<R: BufRead, W: Write>(
                     }
                 }
             }
+            UciCommand::Go(_go_command) => {
+                // Not real search yet: return the first legal move.
+                // `_go_command.depth` (and the rest of `go`'s fields)
+                // are unused until iterative deepening/alpha-beta land
+                // in a follow-up milestone -- see GoCommand's docs.
+                let moves = engine.position().generate_legal_moves();
+                match moves.first() {
+                    Some(&mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
+                    // No legal moves (checkmate/stalemate): UCI's
+                    // convention for "no move to make" is bestmove
+                    // 0000 rather than omitting the response.
+                    None => writeln!(output, "bestmove 0000")?,
+                }
+            }
             UciCommand::Quit => {
                 break;
             }
@@ -249,6 +316,75 @@ mod tests {
         assert_eq!(UciCommand::parse("isready"), UciCommand::IsReady);
         assert_eq!(UciCommand::parse("ucinewgame"), UciCommand::NewGame);
         assert_eq!(UciCommand::parse("quit"), UciCommand::Quit);
+    }
+
+    #[test]
+    fn go_command_parses_depth() {
+        assert_eq!(
+            UciCommand::parse("go depth 1"),
+            UciCommand::Go(GoCommand { depth: Some(1) })
+        );
+        assert_eq!(
+            UciCommand::parse("go depth 12"),
+            UciCommand::Go(GoCommand { depth: Some(12) })
+        );
+    }
+
+    #[test]
+    fn go_command_with_no_depth_has_none() {
+        assert_eq!(
+            UciCommand::parse("go"),
+            UciCommand::Go(GoCommand { depth: None })
+        );
+    }
+
+    #[test]
+    fn go_command_ignores_unrecognized_fields() {
+        // A real GUI's `go` line carries fields (wtime/btime/...) this
+        // milestone doesn't act on yet; they must not prevent parsing
+        // the fields we do recognize.
+        assert_eq!(
+            UciCommand::parse("go wtime 300000 btime 300000 depth 3"),
+            UciCommand::Go(GoCommand { depth: Some(3) })
+        );
+    }
+
+    #[test]
+    fn go_command_with_malformed_depth_value_has_none() {
+        assert_eq!(
+            UciCommand::parse("go depth notanumber"),
+            UciCommand::Go(GoCommand { depth: None })
+        );
+    }
+
+    #[test]
+    fn format_uci_move_formats_quiet_move() {
+        let mv = UciMove::parse("e2e4").unwrap();
+        let position_move = crate::chess::Move::new(mv.from, mv.to, crate::chess::MoveFlag::Quiet);
+        assert_eq!(format_uci_move(position_move), "e2e4");
+    }
+
+    #[test]
+    fn format_uci_move_formats_every_promotion_letter() {
+        use crate::chess::MoveFlag;
+        let from = "a7".parse().unwrap();
+        let to = "a8".parse().unwrap();
+        assert_eq!(
+            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteQueen)),
+            "a7a8q"
+        );
+        assert_eq!(
+            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteRook)),
+            "a7a8r"
+        );
+        assert_eq!(
+            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteBishop)),
+            "a7a8b"
+        );
+        assert_eq!(
+            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteKnight)),
+            "a7a8n"
+        );
     }
 
     #[test]
@@ -551,5 +687,85 @@ mod tests {
         apply_legal_move(&mut expected, UciMove::parse("e2e4").unwrap());
 
         assert_eq!(engine.position(), &expected);
+    }
+
+    /// The vertical path the milestone asks for, verbatim:
+    ///
+    ///     uci
+    ///     isready
+    ///     position startpos
+    ///     go depth 1
+    ///     quit
+    ///
+    /// asserting the returned bestmove is a move that is actually legal
+    /// in the resulting position -- not merely that the output looks
+    /// like a move.
+    #[test]
+    fn go_depth_1_from_startpos_returns_a_legal_move() {
+        let input = b"uci\nisready\nposition startpos\ngo depth 1\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let bestmove_line = text
+            .lines()
+            .find(|line| line.starts_with("bestmove "))
+            .expect("should emit a bestmove line");
+        let uci_move = bestmove_line.strip_prefix("bestmove ").unwrap();
+
+        let legal_moves = Position::startpos().generate_legal_moves();
+        assert!(
+            legal_moves
+                .into_iter()
+                .any(|mv| format_uci_move(mv) == uci_move),
+            "{uci_move} is not among startpos's legal moves"
+        );
+    }
+
+    #[test]
+    fn go_depth_1_returns_the_only_legal_move_when_there_is_exactly_one() {
+        // White king a1 in check from a black rook on e1 (checks along
+        // rank 1); black king c3 covers every flight square except a2.
+        // a1a2 is the position's one and only legal move.
+        let fen = "8/8/8/8/8/2k5/8/K3r3 w - - 0 1";
+        let position = Position::from_fen(fen).expect("valid FEN");
+        assert_eq!(
+            position.generate_legal_moves().len(),
+            1,
+            "test setup: expected exactly one legal move"
+        );
+
+        let input = format!("position fen {fen}\ngo depth 1\nquit\n");
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines().any(|line| line == "bestmove a1a2"),
+            "expected `bestmove a1a2`, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn go_with_no_legal_moves_returns_null_move() {
+        // Checkmate: no legal moves exist, so bestmove must be the UCI
+        // null-move convention "0000" rather than omitting the response
+        // or panicking.
+        let fen = "6k1/8/8/8/8/8/5PPP/r6K w - - 0 1";
+        let position = Position::from_fen(fen).expect("valid FEN");
+        assert!(
+            position.generate_legal_moves().is_empty(),
+            "test setup: expected checkmate"
+        );
+
+        let input = format!("position fen {fen}\ngo depth 1\nquit\n");
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(text.lines().any(|line| line == "bestmove 0000"));
     }
 }
