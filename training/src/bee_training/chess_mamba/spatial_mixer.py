@@ -20,10 +20,10 @@ are concatenated and projected back down to d_model.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from geometry import build_line_families, build_knight_adjacency
-from mamba_core import MambaBlock
+from bee_training.chess_mamba.geometry import build_knight_adjacency, build_line_families
+from bee_training.chess_mamba.mamba_core import MambaBlock
 
 
 class DirectionalMamba(nn.Module):
@@ -64,9 +64,7 @@ class DirectionalMamba(nn.Module):
 
     @staticmethod
     def _scan_batched(mamba, flat, per_line_mask):
-        """flat: (num_lines*B... wait see below) -- run mamba once over all lines at once."""
-        # flat comes in as (B*num_lines, max_len, D) already (see caller); mask is
-        # (num_lines, max_len) and needs tiling to match the batch*lines leading dim.
+        """flat: (B*num_lines, max_len, D) -- run mamba once over all lines at once."""
         num_lines, max_len = per_line_mask.shape
         total = flat.shape[0]
         B = total // num_lines

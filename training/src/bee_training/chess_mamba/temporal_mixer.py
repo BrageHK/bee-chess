@@ -18,9 +18,9 @@ state that gets updated by one Mamba step per new ply, so:
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from mamba_core import MambaBlock
+from bee_training.chess_mamba.mamba_core import MambaBlock
 
 
 class TemporalHistoryMamba(nn.Module):

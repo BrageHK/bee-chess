@@ -1,13 +1,16 @@
 """
-Minimal, pure-PyTorch selective SSM ("S6" / Mamba) block.
+Minimal selective SSM ("S6" / Mamba) block, scan backed by `mambapy`'s
+parallel scan.
 
 This is a from-scratch, readable reimplementation of the core Mamba
-recurrence (Gu & Dao, 2023) -- NOT the official `mamba_ssm` CUDA package.
-It's intentionally simple because every sequence we scan in this project
-(a chess rank/file/diagonal, or a game's move history) is short (<= 64
-steps), so a plain Python-level sequential scan is fast enough and there's
-no need for the parallel-scan CUDA kernel that makes the official package
-fast on sequences of thousands of tokens.
+recurrence (Gu & Dao, 2023) -- NOT the official `mamba_ssm` CUDA package,
+which requires custom CUDA/HIP kernels that do not build on RDNA3/gfx1100
+ROCm (confirmed broken upstream on RX 7900-class cards as of 2026).
+Instead, the scan itself is delegated to `mambapy.pscan.pscan` -- a
+Blelloch parallel-scan `torch.autograd.Function` built entirely from
+plain tensor ops (add/mul), so it needs no custom kernel and runs
+unmodified on ROCm. It turns the O(L) sequential Python loop a
+hand-rolled version would need into O(log L) sequential tensor steps.
 
 Discretization uses the simple Euler approximation (Abar = exp(dt*A),
 Bbar = dt*B) rather than the exact zero-order-hold used in the paper --
@@ -17,13 +20,15 @@ slightly better, but that doesn't change the qualitative behaviour.
 Supports an optional per-step `mask`: masked steps get dt forced to 0,
 which makes Abar = 1 and Bbar = 0, i.e. the hidden state just passes
 through unchanged and the step contributes nothing to the output. This
-is what lets us pad variable-length diagonals up to a fixed length.
+is what lets us pad variable-length diagonals up to a fixed length. This
+masking is applied before/after the scan, so it's unaffected by which
+scan implementation computes the recurrence.
 """
 
-import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from mambapy.pscan import pscan
+from torch import nn
 
 
 class SelectiveSSM(nn.Module):
@@ -55,7 +60,7 @@ class SelectiveSSM(nn.Module):
         mask : optional (L,) or (B, L) bool tensor, True = real step, False = padding
         returns y: (B, L, d_inner)
         """
-        B, L, D = x.shape
+        B, L, _D = x.shape
         N = self.d_state
         A = -torch.exp(self.A_log.float())  # (D, N), negative real => stable
 
@@ -72,14 +77,12 @@ class SelectiveSSM(nn.Module):
         # discretize: Abar_{b,l,d,n} = exp(dt_{b,l,d} * A_{d,n})
         Abar = torch.exp(dt.unsqueeze(-1) * A)                # (B, L, D, N)
         Bbar = dt.unsqueeze(-1) * Bmat.unsqueeze(2)            # (B, L, D, N)
+        BX = Bbar * x.unsqueeze(-1)                            # (B, L, D, N)
 
-        h = x.new_zeros(B, D, N)
-        ys = []
-        for t in range(L):
-            h = Abar[:, t] * h + Bbar[:, t] * x[:, t].unsqueeze(-1)   # (B, D, N)
-            y_t = torch.einsum("bdn,bn->bd", h, Cmat[:, t])           # (B, D)
-            ys.append(y_t)
-        y = torch.stack(ys, dim=1)  # (B, L, D)
+        # h_t = Abar_t * h_{t-1} + BX_t, h_{-1} = 0 -- computed via parallel
+        # scan (O(log L) sequential tensor steps) instead of a Python loop.
+        hs = pscan(Abar, BX)  # (B, L, D, N)
+        y = torch.einsum("bldn,bln->bld", hs, Cmat)
         y = y + x * self.D
         if mask is not None:
             y = y * mask.unsqueeze(-1).to(y.dtype)
@@ -117,7 +120,6 @@ if __name__ == "__main__":
     mask = torch.tensor([True, True, True, False, False, False, False, False])
     x2 = x.clone()
     x2[:, 3:] = torch.randn(4, 5, 32) * 100  # garbage in the padded region
-    y_real = MambaBlock(32)
     torch.manual_seed(1)
     m = MambaBlock(d_model=32)
     y_a = m(x, mask=mask)

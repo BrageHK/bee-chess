@@ -7,5 +7,6 @@ use std::io::{stdin, stdout};
 fn main() -> std::io::Result<()> {
     let stdin = stdin();
     let stdout = stdout();
-    bee_engine::uci::run(stdin.lock(), stdout.lock())
+    let mut engine = bee_engine::engine::Engine::default();
+    bee_engine::uci::run(stdin.lock(), stdout.lock(), &mut engine)
 }

@@ -24,6 +24,7 @@
 //! No raw UCI strings may appear below the `uci` module.
 
 pub mod chess;
+pub mod engine;
 pub mod eval;
 pub mod search;
 pub mod uci;
