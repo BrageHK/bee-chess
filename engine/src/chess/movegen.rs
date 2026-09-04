@@ -3,14 +3,13 @@
 //! "Pseudo-legal" here means: the move follows the piece's normal
 //! movement pattern and does not move onto a square occupied by a piece
 //! of the same color. It does **not** check whether the side to move is
-//! left in check afterward — that is legality, a follow-up milestone
-//! step that will filter this module's output using
-//! `Position::is_square_attacked`/`Position::in_check` (not yet
-//! implemented). Castling moves generated here likewise only check that
-//! the relevant squares are empty and the castling right is still held;
-//! they do not check that the king is not currently in check or does
-//! not pass through an attacked square, since that also depends on
-//! attack detection.
+//! left in check afterward — that is legality, implemented in
+//! `super::attacks` (`Position::is_square_attacked`, `Position::in_check`,
+//! `Position::generate_legal_moves`), which filters this module's
+//! output. Castling moves generated here likewise only check that the
+//! relevant squares are empty and the castling right is still held;
+//! `super::attacks` is responsible for rejecting castling while in
+//! check, into check, or through an attacked square.
 //!
 //! This is deliberately a simple, unoptimized generator over the
 //! existing array-of-`Option<Piece>` board — no bitboards, no magic
@@ -23,7 +22,10 @@ use super::piece::{Color, Piece, PieceKind};
 use super::position::Position;
 use super::square::Square;
 
-const KNIGHT_OFFSETS: [(i8, i8); 8] = [
+/// Shared with `super::attacks`, which needs the same movement geometry
+/// to answer "does a knight on this square attack that square" without
+/// duplicating these tables.
+pub(super) const KNIGHT_OFFSETS: [(i8, i8); 8] = [
     (1, 2),
     (2, 1),
     (2, -1),
@@ -34,7 +36,7 @@ const KNIGHT_OFFSETS: [(i8, i8); 8] = [
     (-1, 2),
 ];
 
-const KING_OFFSETS: [(i8, i8); 8] = [
+pub(super) const KING_OFFSETS: [(i8, i8); 8] = [
     (1, 0),
     (1, 1),
     (0, 1),
@@ -45,8 +47,8 @@ const KING_OFFSETS: [(i8, i8); 8] = [
     (1, -1),
 ];
 
-const BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-const ROOK_DIRECTIONS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+pub(super) const BISHOP_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+pub(super) const ROOK_DIRECTIONS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 const PROMOTION_KINDS: [MoveFlag; 4] = [
     MoveFlag::PromoteQueen,
@@ -245,8 +247,8 @@ fn push_pawn_move(from: Square, to: Square, promotion_rank: u8, moves: &mut Vec<
 }
 
 /// Applies a file/rank offset to `square`, returning `None` if the
-/// result falls off the board.
-fn offset_square(square: Square, df: i8, dr: i8) -> Option<Square> {
+/// result falls off the board. Shared with `super::attacks`.
+pub(super) fn offset_square(square: Square, df: i8, dr: i8) -> Option<Square> {
     let file = square.file() as i8 + df;
     let rank = square.rank() as i8 + dr;
     if !(0..8).contains(&file) || !(0..8).contains(&rank) {
