@@ -12,6 +12,8 @@
 
 use std::io::{BufRead, Write};
 
+use crate::engine::Engine;
+
 pub const ENGINE_NAME: &str = "bee-chess";
 pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
 
@@ -22,26 +24,41 @@ pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
 pub enum UciCommand {
     Uci,
     IsReady,
+    Debug(bool),
     Quit,
     Unknown(String),
 }
 
 impl UciCommand {
     pub fn parse(line: &str) -> Self {
-        match line.trim() {
+        let line = line.trim();
+        match line {
             "uci" => UciCommand::Uci,
             "isready" => UciCommand::IsReady,
             "quit" => UciCommand::Quit,
-            other => UciCommand::Unknown(other.to_string()),
+            _ => match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["debug", "on"] => UciCommand::Debug(true),
+                ["debug", "off"] => UciCommand::Debug(false),
+                _ => UciCommand::Unknown(line.to_string()),
+            },
         }
     }
 }
 
 /// Runs the UCI loop, reading commands from `input` and writing responses
 /// to `output`, until `quit` is received or input ends.
-pub fn run<R: BufRead, W: Write>(input: R, mut output: W) -> std::io::Result<()> {
+pub fn run<R: BufRead, W: Write>(
+    input: R,
+    mut output: W,
+    engine: &mut Engine,
+) -> std::io::Result<()> {
     for line in input.lines() {
         let line = line?;
+
+        if engine.debug() {
+            writeln!(output, "info string received: {line}")?;
+        }
+
         match UciCommand::parse(&line) {
             UciCommand::Uci => {
                 writeln!(output, "id name {ENGINE_NAME}")?;
@@ -50,6 +67,9 @@ pub fn run<R: BufRead, W: Write>(input: R, mut output: W) -> std::io::Result<()>
             }
             UciCommand::IsReady => {
                 writeln!(output, "readyok")?;
+            }
+            UciCommand::Debug(on) => {
+                engine.set_debug(on);
             }
             UciCommand::Quit => {
                 break;
@@ -83,14 +103,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_debug_on_and_off() {
+        assert_eq!(UciCommand::parse("debug on"), UciCommand::Debug(true));
+        assert_eq!(UciCommand::parse("debug off"), UciCommand::Debug(false));
+    }
+
+    #[test]
+    fn parses_debug_with_bad_argument_as_unknown() {
+        assert_eq!(
+            UciCommand::parse("debug maybe"),
+            UciCommand::Unknown("debug maybe".to_string())
+        );
+    }
+
+    #[test]
     fn uci_handshake_produces_expected_output() {
         let input = b"uci\nisready\nquit\n".as_slice();
         let mut output = Vec::new();
-        run(input, &mut output).expect("run should succeed");
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
         let text = String::from_utf8(output).expect("output should be valid utf8");
         assert!(text.contains(&format!("id name {ENGINE_NAME}")));
         assert!(text.contains(&format!("id author {ENGINE_AUTHOR}")));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
+    }
+
+    #[test]
+    fn debug_on_sets_engine_debug_flag() {
+        let input = b"debug on\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(engine.debug());
+    }
+
+    #[test]
+    fn debug_off_clears_engine_debug_flag() {
+        let input = b"debug on\ndebug off\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.debug());
+    }
+
+    #[test]
+    fn debug_mode_echoes_received_commands() {
+        let input = b"debug on\nisready\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("info string received: isready"));
+    }
+
+    #[test]
+    fn debug_off_by_default_does_not_echo_commands() {
+        let input = b"isready\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(!text.contains("info string"));
     }
 }
