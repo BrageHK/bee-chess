@@ -5,6 +5,9 @@
 /training/.venv/
 /training/.pytest_cache/
 /training/.ruff_cache/
+/bridge/.venv/
+/bridge/.pytest_cache/
+/bridge/.ruff_cache/
 __pycache__/
 *.pyc
 
@@ -15,6 +18,6 @@ dist-ssr/
 
 # Editor / OS
 .DS_Store
-.vscode/*
-!.vscode/extensions.json
+.vscode/
+*.code-workspace
 .idea/

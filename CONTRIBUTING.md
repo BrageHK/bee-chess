@@ -13,6 +13,10 @@ for the v1 architecture these rules assume.
 
 ## Local checks
 
+`./scripts/check.sh` runs everything below in one go (after
+`./scripts/setup.sh` once). To run a single subproject's checks
+directly:
+
 Rust (`engine/`):
 
 ```bash
@@ -29,6 +33,15 @@ uv run pytest
 uv run ruff check .
 ```
 
+Python (`bridge/`, the development WebSocket <-> UCI adapter --
+`training/`'s environment is unrelated and much heavier, so this is a
+separate `uv`-managed environment on purpose):
+
+```bash
+uv sync
+uv run ruff check .
+```
+
 Frontend (`frontend/`):
 
 ```bash
@@ -37,7 +50,9 @@ npm run lint
 npm run build
 ```
 
-All three run in CI on every pull request and must pass before merging.
+Rust, Python (`training/`), and frontend checks run in CI on every pull
+request and must pass before merging. `bridge/` has no CI job yet since
+it has no behavior to regression-test beyond linting.
 
 ## Branch naming
 
