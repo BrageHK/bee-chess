@@ -1,0 +1,20 @@
+# Rust
+/engine/target/
+
+# Python
+/training/.venv/
+/training/.pytest_cache/
+/training/.ruff_cache/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/

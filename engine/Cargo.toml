@@ -1,0 +1,14 @@
+[package]
+name = "bee-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Bee Chess UCI engine"
+license = "MIT"
+
+[[bin]]
+name = "bee"
+path = "src/bin/bee.rs"
+
+[dependencies]
+
+[dev-dependencies]
