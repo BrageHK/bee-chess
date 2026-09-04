@@ -8,6 +8,7 @@
 /training/.cache/
 /training/data/
 /training/books/
+/training/checkpoints/
 __pycache__/
 *.pyc
 

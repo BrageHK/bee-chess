@@ -91,6 +91,37 @@ def encode_position_record(record: PositionRecord, n_value_bins: int = 128,
     return planes, move_target, value_bin_target
 
 
+def load_all_records(shard_paths) -> list[PositionRecord]:
+    """Reads every record from `shard_paths` (list of `*.positions.jsonl`
+    files) into memory. At this project's current data scale (tens of
+    thousands of positions), the records themselves (not yet encoded)
+    are small enough that this is fine; re-visit if `data/` grows much
+    larger than that."""
+    records: list[PositionRecord] = []
+    for path in shard_paths:
+        for d in read_jsonl(Path(path)):
+            records.append(PositionRecord.from_dict(d))
+    return records
+
+
+class PositionDataset(torch.utils.data.Dataset):
+    """Wraps a list of `PositionRecord`s, encoding each one lazily in
+    `__getitem__` (not all up front) so a `DataLoader` with
+    `num_workers > 0` can parallelize the python-chess FEN parsing across
+    processes instead of it being a serial bottleneck before training
+    even starts."""
+
+    def __init__(self, records: list[PositionRecord], n_value_bins: int = 128):
+        self.records = records
+        self.n_value_bins = n_value_bins
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, int]:
+        return encode_position_record(self.records[idx], n_value_bins=self.n_value_bins)
+
+
 def load_real_batch(shard_paths, batch_size: int, n_value_bins: int = 128,
                      device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reads real self-play positions from `shard_paths` (list of
