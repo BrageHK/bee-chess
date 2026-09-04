@@ -30,6 +30,12 @@ attention (even with GAB's dynamic bias) never explicitly has.
 Knight moves aren't collinear with any straight line, so they get a
 separate fixed-adjacency graph mixer instead (`KnightGraphMixer`).
 
+Since the SSM ray scan is 20-170x slower than plain attention at board
+scale (see benchmark below), `ChessMamba` also supports a **hybrid**
+layout: a couple of `SpatialMixer` layers near the input, plain attention
+(`AttentionMixer`) for the rest (`model.py`'s `hybrid_layer_types`) — see
+"Hybrid architecture" below for the real-data numbers.
+
 A second, unrelated use of Mamba is included for game history
 (`temporal_mixer.py`): instead of Chessformer's fixed n=7-ply concatenated
 window, a Mamba scan along the *move* axis keeps a running, unbounded
@@ -48,8 +54,11 @@ All under `src/bee_training/chess_mamba/`:
 | `triton_scan.py` | `triton_pscan`: fused Triton kernel alternative to `mambapy.pscan`, streams over L instead of materializing `(B,L,D,N)`. CUDA/ROCm only. |
 | `spatial_mixer.py` | `SpatialMixer`: the drop-in replacement for GAB+attention. Runs a shared Mamba scan per line family, both directions, plus the knight graph mixer. |
 | `temporal_mixer.py` | `TemporalHistoryMamba`: Mamba over the ply axis for unbounded game history. |
-| `model.py` | `ChessMamba`: full model — embedding, stacked blocks, from-to policy head, HL-Gauss-style value head. |
-| `benchmark.py` | Honest speed check against plain attention at board scale, on CPU and GPU. |
+| `attention_mixer.py` | `AttentionMixer`: plain multi-head self-attention over the 64 squares, drop-in alternative to `SpatialMixer` for the hybrid architecture below. |
+| `model.py` | `ChessMamba`: full model — embedding, stacked blocks (each `"ssm"` or `"attn"` via `layer_types`), from-to policy head, HL-Gauss-style value head. `hybrid_layer_types()` builds the recommended mix. |
+| `encode.py` | Minimal FEN → `(64, in_dim)` plane encoder + target extraction from this project's self-play `PositionRecord` schema — just enough to run real `data/main-dawg/` positions through the model (see Known limitations: not the validated Phase 4 encoder). |
+| `benchmark.py` | Honest speed check against plain attention at board scale (one mixer in isolation), on CPU and GPU. |
+| `hybrid_benchmark.py` | Whole-model speed check (pure-SSM vs. hybrid vs. pure-attention `ChessMamba`), on a real training step (forward+backward+Adam) over real `data/main-dawg/` positions. `--light` flag for a quick GPU-only, fewer-iteration run. |
 
 ## Honest benchmark result
 
@@ -136,23 +145,80 @@ accuracy / sample efficiency versus GAB at equal parameter count — see
 `CHESSMAMBA_PLAN.md` Phase 6/7 for the controlled comparison that would
 answer that.
 
+## Hybrid architecture: SSM where it might matter, attention everywhere else
+
+None of the tricks above change the fundamental problem: at L=64, plain
+attention is close to the cheapest operation there is, and paying the SSM
+tax in *every* layer for an unproven inductive-bias bet is expensive —
+running `SpatialMixer` in all 8 layers of a small `ChessMamba` costs
+~25x what running it in just 1-2 layers does (see table below).
+
+This is not a workaround, it's the standard pattern real hybrid SSM/
+attention models use (Jamba, Griffin/Hawk, Zamba): interleave a few SSM
+layers among many attention layers (or vice versa), not an all-or-nothing
+choice. `model.py`'s `hybrid_layer_types(n_layers, n_ssm)` builds this —
+`n_ssm` `SpatialMixer` layers first (closest to the input, where the raw
+"stops at first blocker" line-of-sight extraction plausibly matters
+most), plain `AttentionMixer` (`attention_mixer.py`) for the rest.
+
+**Real-data training-step benchmark** (`hybrid_benchmark.py --light`):
+`d_model=192`, 8 layers, batch 64, on the RX 7900 XTX — a full forward +
+backward + Adam step, on **real self-play positions from
+`data/main-dawg/`** (via `encode.py`), not random tensors:
+
+```
+[cuda] batch=64, d_model=192, n_layers=8 -- real data, real backprop
+  pure-ssm (8 ssm)                          388.7 ms/step     165 pos/sec  10.80h per 100k steps  11,066,816 params
+  pure-ssm (8 ssm) + compile                255.6 ms/step     250 pos/sec   7.10h per 100k steps  11,066,816 params
+  hybrid (2 ssm, 6 attn)                     108.5 ms/step     590 pos/sec   3.01h per 100k steps   4,195,136 params
+  hybrid (2 ssm, 6 attn) + compile            73.0 ms/step     876 pos/sec   2.03h per 100k steps   4,195,136 params
+  hybrid (1 ssm, 7 attn)                      62.0 ms/step   1,032 pos/sec   1.72h per 100k steps   3,049,856 params
+  hybrid (1 ssm, 7 attn) + compile            42.6 ms/step   1,502 pos/sec   1.18h per 100k steps   3,049,856 params
+  hybrid (1 ssm, 7 attn, triton)              55.1 ms/step   1,161 pos/sec   1.53h per 100k steps   3,049,856 params
+  hybrid (1 ssm, 7 attn, triton) + compile    35.6 ms/step   1,799 pos/sec   0.99h per 100k steps   3,049,856 params
+  pure-attn (8 attn)                          15.5 ms/step   4,133 pos/sec   0.43h per 100k steps   1,904,576 params
+  pure-attn (8 attn) + compile                 12.4 ms/step   5,147 pos/sec   0.35h per 100k steps   1,904,576 params
+```
+
+**The best hybrid config (1 SSM layer + Triton scan + compile) trains at
+0.99h per 100k steps — 2.8x slower than pure attention, but 7.2x *faster*
+than pure-SSM's 7.1h**, while still keeping the inductive-bias bet alive
+in the one layer closest to the input. That's the actual trade this
+project is making: pay a real but bounded speed cost to keep testing
+whether the geometry-aware scan helps at all (Phase 6/7), instead of
+either paying it 8x over or abandoning the hypothesis entirely.
+
+Param counts aren't matched across configs above (pure-ssm's 11M vs.
+pure-attn's 1.9M at the same `d_model` — each `SpatialMixer` layer has
+many more independent weight matrices: 4 line families × 2 directions ×
+a full `MambaBlock` each, vs. one `AttentionMixer`'s single QKV+out
+projection) — a real Phase 6 comparison would need to control for that,
+same as the plan's own matched-parameter baseline methodology.
+
 ## Wiring this up to real training
 
-This repo only has the model — you'd still need to:
+`encode.py` + `data/main-dawg/` (this project's own self-play/Stockfish
+pipeline, `bee_training.dataset`) get real positions through the model
+for benchmarking, but real training still needs:
 
-1. **Board encoder**: convert a `python-chess` `Board` (or FEN) into the
-   `(64, in_dim)` plane tensor `ChessMamba.forward` expects — one-hot
-   piece-per-square for the current position and last `n_history` plies,
-   plus castling/en-passant/rule-50 scalars broadcast across squares
-   (see Chessformer §3.1 / §A.2 for the exact recipe this follows).
-2. **Data**: the DeepMind `ChessBench` dataset (Stockfish-annotated
+1. **A real board encoder**, not `encode.py`'s minimal one: game-history
+   planes (`n_history` past plies, not just the current position) and the
+   side-to-move board flip (see Chessformer §3.1 / §A.2) — both skipped
+   in `encode.py` for simplicity. `encode.py` also uses a fixed 8-slot aux
+   layout rather than the plan's full castling(4)+en-passant(9)+halfmove
+   (1)+repetition(1+n_history) breakdown (Section 2) — `ChessMamba`'s
+   `in_dim` formula already assumes a fixed "+8", so a real encoder needs
+   that formula revisited too, not just the encoder.
+2. **More/better data**: `data/main-dawg/` is this project's own
+   self-play data; the DeepMind `ChessBench` dataset (Stockfish-annotated
    action-values, `google-deepmind/searchless_chess` on GitHub) is the
-   natural choice, since it's public and lets you compare directly
-   against the published AC-9M/136M/270M numbers.
-3. **Losses**: bin the Stockfish win% into `n_value_bins` classes and
-   train the value head with HL-Gauss or plain cross-entropy (already
-   scaffolded); train the policy head with cross-entropy over the
-   flattened `(64*64)` from-to logits against the oracle's UCI move.
+   published-comparison choice if you want numbers directly comparable to
+   AC-9M/136M/270M.
+3. **Real losses**: `encode.py`'s value target is a simple linear cp
+   binning, not the HL-Gauss transform over win% Section 6 calls for
+   (already scaffolded on the value head, just needs the real target
+   transform); the policy target (from-square*64+to-square vs. the
+   oracle move) is already what Section 6 describes.
 
 ## Known limitations
 
@@ -164,6 +230,14 @@ This repo only has the model — you'd still need to:
 - `TemporalHistoryMamba.step()` is a stub — real incremental single-ply
   inference needs Mamba's actual recurrent state API, not the batched
   `forward()` used here for clarity.
-- Nothing here has been trained. All tests (`tests/chess_mamba/`) are
-  shape/gradient/masking/locality sanity checks, not chess-strength
-  evaluation.
+- `encode.py` is a minimal single-position encoder (no history planes, no
+  side-to-move flip, simple linear value binning) built to run real data
+  through the model for benchmarking — not the validated Phase 4 encoder
+  real training needs (see "Wiring this up to real training").
+- `AttentionMixer` is plain attention, no GAB/smolgen-style dynamic
+  positional bias — a natural follow-up for the hybrid's attention layers
+  if Phase 6/7's own ablation says the extra parameters are worth it.
+- Nothing here has been trained on a real objective. All tests
+  (`tests/chess_mamba/`) are shape/gradient/masking/locality/encoding
+  sanity checks (`test_encode.py` validates against hand-picked FENs),
+  not chess-strength evaluation.

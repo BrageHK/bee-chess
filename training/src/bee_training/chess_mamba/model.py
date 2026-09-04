@@ -23,17 +23,52 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from bee_training.chess_mamba.attention_mixer import AttentionMixer
 from bee_training.chess_mamba.spatial_mixer import SpatialMixer
 
 N_PIECE_TYPES = 12  # 6 piece types x 2 colors
 N_SQUARES = 64
 
 
+def hybrid_layer_types(n_layers, n_ssm=2):
+    """Recommended hybrid layout: `n_ssm` SpatialMixer (SSM ray-scan) layers
+    first, plain AttentionMixer for the rest.
+
+    Rationale (see benchmark.py / README for the numbers): the SSM ray
+    scan is 20-40x slower than plain attention at board scale (L=64), so
+    running it in every layer is expensive for a bet that's about
+    inductive bias, not speed. Putting it only in the first couple of
+    layers keeps the "explicit blocker-stop" mechanism where it plausibly
+    matters most -- extracting raw sliding-piece line-of-sight structure
+    close to the input -- while the remaining, cheaper attention layers
+    handle higher-level mixing. This is the same pattern real hybrid
+    SSM/attention models use (Jamba, Griffin/Hawk, Zamba): interleave a
+    few attention layers among many SSM layers (or vice versa), not an
+    all-or-nothing choice between the two.
+    """
+    if not 0 <= n_ssm <= n_layers:
+        raise ValueError(f"n_ssm={n_ssm} must be between 0 and n_layers={n_layers}")
+    return ["ssm"] * n_ssm + ["attn"] * (n_layers - n_ssm)
+
+
 class ChessMambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=8, expand=1.0, scan_backend="pscan", ffn_mult=1.0):
+    """One residual block: mixer (SpatialMixer or AttentionMixer) + FFN.
+
+    `mixer_type` picks which geometry/context mixer this block uses -- see
+    `hybrid_layer_types` for why you'd want to mix the two across a model's
+    layers rather than use just one throughout.
+    """
+
+    def __init__(self, d_model, mixer_type="ssm", d_state=8, expand=1.0, scan_backend="pscan",
+                 n_heads=8, ffn_mult=1.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.spatial = SpatialMixer(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
+        if mixer_type == "ssm":
+            self.mixer = SpatialMixer(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
+        elif mixer_type == "attn":
+            self.mixer = AttentionMixer(d_model, n_heads=n_heads)
+        else:
+            raise ValueError(f"unknown mixer_type {mixer_type!r}; expected 'ssm' or 'attn'")
         self.norm2 = nn.LayerNorm(d_model)
         d_ffn = int(d_model * ffn_mult)
         # LC0's ablations found little benefit from the usual 4x FFN expansion
@@ -45,7 +80,7 @@ class ChessMambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.spatial(self.norm1(x))
+        x = x + self.mixer(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -86,15 +121,27 @@ class ValueHead(nn.Module):
 
 
 class ChessMamba(nn.Module):
+    """
+    `layer_types`: optional list of `n_layers` entries, each `"ssm"` or
+    `"attn"`, picking each block's mixer. Defaults to all-`"ssm"` (the
+    original architecture) for backwards compatibility -- pass
+    `hybrid_layer_types(n_layers)` (or your own mix) to build the hybrid.
+    """
+
     def __init__(self, d_model=256, n_layers=8, d_state=8, expand=1.0, scan_backend="pscan",
-                 n_history=7, n_value_bins=128, ffn_mult=1.0):
+                 n_heads=8, layer_types=None, n_history=7, n_value_bins=128, ffn_mult=1.0):
         super().__init__()
+        if layer_types is None:
+            layer_types = ["ssm"] * n_layers
+        if len(layer_types) != n_layers:
+            raise ValueError(f"layer_types has {len(layer_types)} entries, expected n_layers={n_layers}")
+
         in_dim = N_PIECE_TYPES * (n_history + 1) + 8  # +8 for castling/ep/rule50/etc.
         self.embed = nn.Linear(in_dim, d_model)
         self.blocks = nn.ModuleList([
-            ChessMambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend,
-                             ffn_mult=ffn_mult)
-            for _ in range(n_layers)
+            ChessMambaBlock(d_model, mixer_type=mixer_type, d_state=d_state, expand=expand,
+                             scan_backend=scan_backend, n_heads=n_heads, ffn_mult=ffn_mult)
+            for mixer_type in layer_types
         ])
         self.final_norm = nn.LayerNorm(d_model)
         self.policy_head = FromToPolicyHead(d_model)
