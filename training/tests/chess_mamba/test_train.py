@@ -1,3 +1,6 @@
+import threading
+import time
+
 import chess
 import pytest
 import torch
@@ -7,23 +10,27 @@ from bee_training.chess_mamba.train import (
     build_model,
     load_checkpoint_if_compatible,
     save_checkpoint,
+    wait_for_data,
 )
 from bee_training.dataset.schema import PositionRecord, append_jsonl
 
 N_RECORDS = 20
 
 
-def _make_shard(tmp_path):
-    shard = tmp_path / "worker-0.positions.jsonl"
+def _write_records(shard_path, n, start=0):
     lines = []
-    for i in range(N_RECORDS):
+    for i in range(start, start + n):
         record = PositionRecord(
             schema_version=1, game_id="test-game", ply=i, fen=chess.STARTING_FEN,
             side_to_move="w", eval_cp=(i * 10) - 100, eval_mate=None, depth=1,
             best_move="e2e4", pv=["e2e4"], game_result="1-0", stockfish_version="test",
         )
         lines.append(record.to_json())
-    append_jsonl(shard, lines)
+    append_jsonl(shard_path, lines)
+
+
+def _make_shard(tmp_path):
+    _write_records(tmp_path / "worker-0.positions.jsonl", N_RECORDS)
     return tmp_path / "*.positions.jsonl"
 
 
@@ -88,6 +95,36 @@ def test_non_architecture_field_change_does_not_block_resume(tmp_path):
     different_config = _tiny_config(tmp_path, lr=1e-5, total_steps=100, scan_backend="pscan")
     loaded = load_checkpoint_if_compatible(ckpt_path, different_config)
     assert loaded is not None
+
+
+def test_wait_for_data_blocks_until_enough_records_then_returns(tmp_path):
+    """The generator writes a shard file only once its first game finishes
+    (see worker.py), which can happen well after training starts when the
+    two run side by side -- wait_for_data must poll, not crash, and must
+    actually pick up data that arrives late."""
+    shard_path = tmp_path / "worker-0.positions.jsonl"
+    config = TrainConfig(
+        data_glob=str(tmp_path / "*.positions.jsonl"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        batch_size=4,  # min_records = batch_size * 2 = 8
+    )
+
+    delay_s = 0.3
+
+    def write_late():
+        time.sleep(delay_s)
+        _write_records(shard_path, 20)
+
+    thread = threading.Thread(target=write_late)
+    thread.start()
+    t0 = time.perf_counter()
+    shard_paths, records = wait_for_data(config, poll_s=0.05)
+    elapsed = time.perf_counter() - t0
+    thread.join()
+
+    assert elapsed >= delay_s, "returned before the data actually existed"
+    assert len(records) == 20
+    assert shard_paths == [str(shard_path)]
 
 
 def test_train_runs_and_checkpoints_then_resumes(tmp_path):

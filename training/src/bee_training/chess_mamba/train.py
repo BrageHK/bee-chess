@@ -165,13 +165,37 @@ def split_records(records, val_fraction: float, seed: int):
     return train_records, val_records
 
 
+def wait_for_data(config: TrainConfig, poll_s: float = 10.0) -> tuple[list, list]:
+    """Polls `config.data_glob` until enough positions exist to train on,
+    returning (shard_paths, records).
+
+    Positions only appear on disk once a self-play *game* finishes (the
+    generator writes a whole game's worth of positions at once, not one
+    at a time -- see worker.py), which can take a while at a real node
+    budget. Running the generator and trainer side by side (this
+    project's train-mamba.sh) means the trainer would otherwise start and
+    immediately crash before the generator has produced its first game.
+    """
+    min_records = config.batch_size * 2
+    logged_waiting = False
+    while True:
+        shard_paths = sorted(glob.glob(config.data_glob))
+        records = load_all_records(shard_paths) if shard_paths else []
+        if len(records) >= min_records:
+            if logged_waiting:
+                print(f"found {len(records)} positions, proceeding")
+            return shard_paths, records
+        if not logged_waiting:
+            print(f"waiting for at least {min_records} positions at {config.data_glob} "
+                  f"(found {len(records)}) -- is the dataset generator running?")
+            logged_waiting = True
+        time.sleep(poll_s)
+
+
 def run(config: TrainConfig) -> None:
     torch.manual_seed(config.seed)
 
-    shard_paths = sorted(glob.glob(config.data_glob))
-    if not shard_paths:
-        raise FileNotFoundError(f"no shards found at {config.data_glob} -- run the dataset generator first")
-    records = load_all_records(shard_paths)
+    shard_paths, records = wait_for_data(config)
     print(f"loaded {len(records)} positions from {len(shard_paths)} shard(s)")
 
     train_records, val_records = split_records(records, config.val_fraction, config.seed)

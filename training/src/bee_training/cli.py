@@ -30,7 +30,7 @@ def _add_generate_parser(subparsers) -> None:
     p.add_argument("--games", type=int, required=True)
     p.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     p.add_argument("--limit-kind", choices=["nodes", "time", "depth"], default="nodes")
-    p.add_argument("--limit-value", type=float, default=25_000)
+    p.add_argument("--limit-value", type=float, default=25_000.0)
     p.add_argument("--opening-book", default=None, help="Path to an EPD or PGN opening book.")
     p.add_argument("--opening-plies", type=int, default=8, help="Used only without --opening-book.")
     p.add_argument("--resign-cp", type=int, default=1000)
