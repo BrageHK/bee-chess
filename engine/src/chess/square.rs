@@ -1,6 +1,7 @@
 //! Board squares.
 
 use std::fmt;
+use std::str::FromStr;
 
 /// A square on the board, encoded as `rank * 8 + file` (0 = a1, 63 = h8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,6 +50,29 @@ impl fmt::Display for Square {
     }
 }
 
+/// Parses a square from its algebraic notation, e.g. `"e4"`. Used both
+/// by FEN parsing (en passant square) and by UCI move notation
+/// (`e2e4`), so it lives here rather than being duplicated in either.
+impl FromStr for Square {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut chars = s.chars();
+        let (Some(file_char), Some(rank_char), None) = (chars.next(), chars.next(), chars.next())
+        else {
+            return Err(());
+        };
+
+        if !('a'..='h').contains(&file_char) || !('1'..='8').contains(&rank_char) {
+            return Err(());
+        }
+
+        let file = file_char as u8 - b'a';
+        let rank = rank_char as u8 - b'1';
+        Ok(Square::from_file_rank(file, rank))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +95,30 @@ mod tests {
             let square = Square::new(index);
             assert_eq!(Square::from_file_rank(square.file(), square.rank()), square);
         }
+    }
+
+    #[test]
+    fn parses_algebraic_notation() {
+        assert_eq!("a1".parse::<Square>(), Ok(Square::from_file_rank(0, 0)));
+        assert_eq!("h8".parse::<Square>(), Ok(Square::from_file_rank(7, 7)));
+        assert_eq!("e4".parse::<Square>(), Ok(Square::from_file_rank(4, 3)));
+    }
+
+    #[test]
+    fn every_square_round_trips_through_display_and_parse() {
+        for index in 0..64u8 {
+            let square = Square::new(index);
+            assert_eq!(square.to_string().parse::<Square>(), Ok(square));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_algebraic_notation() {
+        assert!("".parse::<Square>().is_err());
+        assert!("e".parse::<Square>().is_err());
+        assert!("e44".parse::<Square>().is_err());
+        assert!("i4".parse::<Square>().is_err());
+        assert!("e9".parse::<Square>().is_err());
+        assert!("E4".parse::<Square>().is_err());
     }
 }
