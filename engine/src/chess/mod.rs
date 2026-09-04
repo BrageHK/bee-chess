@@ -4,10 +4,12 @@
 //! first step (`Square`, `Piece`/`PieceKind`/`Color`, `Move`, `Position`
 //! with castling rights, en passant square, halfmove clock, and side to
 //! move), FEN parsing/serialization from the second step
-//! (`Position::from_fen`/`Position::to_fen`), and make/unmake from the
-//! third step (`Position::make_move`/`Position::unmake_move`, via the
-//! `Undo` record). Pseudo-legal and legal move generation and perft are
-//! separate follow-up steps in the same milestone.
+//! (`Position::from_fen`/`Position::to_fen`), make/unmake from the third
+//! step (`Position::make_move`/`Position::unmake_move`, via the `Undo`
+//! record), and pseudo-legal move generation from the fourth step
+//! (`Position::generate_pseudo_legal_moves`). Attack detection, legal
+//! move generation, and perft are separate follow-up steps in the same
+//! milestone.
 //!
 //! `Position` and `Move` are the shared vocabulary that `search`, `eval`,
 //! and `uci` all depend on, so their public shape is established here
@@ -16,6 +18,7 @@
 mod castling;
 mod fen;
 mod make_unmake;
+mod movegen;
 mod moves;
 mod piece;
 mod position;
