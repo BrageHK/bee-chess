@@ -6,15 +6,18 @@
 //! move), FEN parsing/serialization from the second step
 //! (`Position::from_fen`/`Position::to_fen`), make/unmake from the third
 //! step (`Position::make_move`/`Position::unmake_move`, via the `Undo`
-//! record), and pseudo-legal move generation from the fourth step
-//! (`Position::generate_pseudo_legal_moves`). Attack detection, legal
-//! move generation, and perft are separate follow-up steps in the same
-//! milestone.
+//! record), pseudo-legal move generation from the fourth step
+//! (`Position::generate_pseudo_legal_moves`), and attack detection plus
+//! legal move generation from the fifth step
+//! (`Position::is_square_attacked`, `Position::in_check`,
+//! `Position::generate_legal_moves`). Perft is a separate follow-up step
+//! in the same milestone.
 //!
 //! `Position` and `Move` are the shared vocabulary that `search`, `eval`,
 //! and `uci` all depend on, so their public shape is established here
 //! even before the rest of the implementation lands.
 
+mod attacks;
 mod castling;
 mod fen;
 mod make_unmake;
