@@ -1,7 +1,11 @@
+import copy
+
+import pytest
 import torch
 import torch.nn.functional as F
 
-from bee_training.chess_mamba.mamba_core import MambaBlock, SelectiveSSM
+from bee_training.chess_mamba.mamba_core import MambaBlock, SelectiveSSM, get_scan_fn
+from bee_training.chess_mamba.triton_scan import TRITON_AVAILABLE
 
 
 def test_gradients_flow_through_every_parameter():
@@ -90,3 +94,25 @@ def test_pscan_backend_matches_sequential_reference_padded():
     y_seq = _sequential_reference_scan(ssm, x, mask=mask)
 
     assert torch.allclose(y_pscan, y_seq, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not (TRITON_AVAILABLE and torch.cuda.is_available()),
+    reason="triton scan_backend requires Triton + a CUDA/ROCm GPU",
+)
+def test_triton_backend_matches_pscan_backend():
+    """scan_backend='triton' must produce the same result as the default
+    'pscan' backend given identical weights -- the choice of scan
+    implementation is purely a performance knob, never a numerics one."""
+    torch.manual_seed(0)
+    blk_pscan = MambaBlock(d_model=32, d_state=8, scan_backend="pscan").cuda()
+    blk_triton = copy.deepcopy(blk_pscan)
+    blk_triton.ssm._scan = get_scan_fn("triton")
+
+    x = torch.randn(3, 8, 32, device="cuda")
+    mask = torch.tensor([True, True, True, True, True, False, False, False], device="cuda")
+
+    y_pscan = blk_pscan(x, mask=mask)
+    y_triton = blk_triton(x, mask=mask)
+
+    assert torch.allclose(y_pscan, y_triton, atol=1e-4)

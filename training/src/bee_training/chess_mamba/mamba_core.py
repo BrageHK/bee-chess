@@ -1,16 +1,19 @@
 """
-Minimal selective SSM ("S6" / Mamba) block, scan backed by `mambapy`'s
-parallel scan.
+Minimal selective SSM ("S6" / Mamba) block, with a pluggable scan backend
+(see `SCAN_BACKENDS` below).
 
 This is a from-scratch, readable reimplementation of the core Mamba
 recurrence (Gu & Dao, 2023) -- NOT the official `mamba_ssm` CUDA package,
 which requires custom CUDA/HIP kernels that do not build on RDNA3/gfx1100
 ROCm (confirmed broken upstream on RX 7900-class cards as of 2026).
-Instead, the scan itself is delegated to `mambapy.pscan.pscan` -- a
-Blelloch parallel-scan `torch.autograd.Function` built entirely from
-plain tensor ops (add/mul), so it needs no custom kernel and runs
-unmodified on ROCm. It turns the O(L) sequential Python loop a
-hand-rolled version would need into O(log L) sequential tensor steps.
+Instead, the scan is delegated to one of two in-process backends: the
+default `mambapy.pscan.pscan` -- a Blelloch parallel-scan
+`torch.autograd.Function` built entirely from plain tensor ops (add/mul),
+so it needs no custom kernel and runs on any device -- or the opt-in
+`triton_scan.triton_pscan`, a fused Triton kernel (CUDA/ROCm only) that's
+faster but newer/less-battle-tested. Either way this turns the O(L)
+sequential Python loop a hand-rolled version would need into O(log L)
+tensor steps (pscan) or a single register-resident pass over L (triton).
 
 Discretization uses the simple Euler approximation (Abar = exp(dt*A),
 Bbar = dt*B) rather than the exact zero-order-hold used in the paper --
@@ -27,17 +30,42 @@ scan implementation computes the recurrence.
 
 import torch
 import torch.nn.functional as F
-from mambapy.pscan import pscan
+from mambapy.pscan import pscan as _mambapy_pscan
 from torch import nn
+
+from bee_training.chess_mamba.triton_scan import TRITON_AVAILABLE, triton_pscan
+
+# Pluggable scan backends, same (Abar, BX) -> hs contract either way (see
+# each implementation's own docstring). "pscan" (mambapy, pure PyTorch) is
+# the default -- it needs no custom kernel, so it's the safe choice on any
+# device. "triton" is a fused kernel that streams over L instead of
+# materializing the full (B,L,D,N) tensor pscan does; verified correct
+# (matches the sequential reference and mambapy.pscan, including gradients)
+# and ~1.2-1.4x faster end to end on this project's SpatialMixer on ROCm/
+# gfx1100 -- but it's CUDA/ROCm-only (no CPU path) and a newer, less-used
+# code path than mambapy, so it's opt-in rather than the default.
+SCAN_BACKENDS = {"pscan": _mambapy_pscan}
+if TRITON_AVAILABLE:
+    SCAN_BACKENDS["triton"] = triton_pscan
+
+
+def get_scan_fn(name: str):
+    try:
+        return SCAN_BACKENDS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown scan_backend {name!r}; available: {sorted(SCAN_BACKENDS)}"
+        ) from None
 
 
 class SelectiveSSM(nn.Module):
     """Core S6 recurrence, operating on an already-projected (B, L, D_inner) input."""
 
-    def __init__(self, d_inner, d_state=16, dt_rank=None):
+    def __init__(self, d_inner, d_state=16, dt_rank=None, scan_backend="pscan"):
         super().__init__()
         self.d_inner = d_inner
         self.d_state = d_state
+        self._scan = get_scan_fn(scan_backend)
         dt_rank = dt_rank or max(1, d_inner // 16)
 
         # input-dependent selection: project x -> (dt, B, C)
@@ -54,11 +82,18 @@ class SelectiveSSM(nn.Module):
         dt_init_std = dt_rank ** -0.5
         nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
 
-    def forward(self, x, mask=None):
+    def project(self, x, mask=None):
         """
+        Everything up to (but not including) the scan itself: input-dependent
+        dt/B/C, discretized into (Abar, BX, Cmat). Split out from `forward` so
+        callers that want to batch several independent scans together (e.g.
+        DirectionalMamba fusing its forward/backward passes) can concatenate
+        Abar/BX along the batch dim and call `pscan` once instead of once per
+        scan -- same math, fewer (and bigger) scan invocations.
+
         x    : (B, L, d_inner)
         mask : optional (L,) or (B, L) bool tensor, True = real step, False = padding
-        returns y: (B, L, d_inner)
+        returns (Abar, BX, Cmat) each (B, L, d_inner, d_state) / (B, L, d_state)
         """
         B, L, _D = x.shape
         N = self.d_state
@@ -78,25 +113,49 @@ class SelectiveSSM(nn.Module):
         Abar = torch.exp(dt.unsqueeze(-1) * A)                # (B, L, D, N)
         Bbar = dt.unsqueeze(-1) * Bmat.unsqueeze(2)            # (B, L, D, N)
         BX = Bbar * x.unsqueeze(-1)                            # (B, L, D, N)
+        return Abar, BX, Cmat
 
-        # h_t = Abar_t * h_{t-1} + BX_t, h_{-1} = 0 -- computed via parallel
-        # scan (O(log L) sequential tensor steps) instead of a Python loop.
-        hs = pscan(Abar, BX)  # (B, L, D, N)
+    def combine(self, hs, Cmat, x, mask=None):
+        """y_t = C_t . h_t + D*x_t, masked back to zero on padded steps."""
         y = torch.einsum("bldn,bln->bld", hs, Cmat)
         y = y + x * self.D
         if mask is not None:
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0).expand(x.shape[0], x.shape[1])
             y = y * mask.unsqueeze(-1).to(y.dtype)
         return y
 
+    def forward(self, x, mask=None):
+        """
+        x    : (B, L, d_inner)
+        mask : optional (L,) or (B, L) bool tensor, True = real step, False = padding
+        returns y: (B, L, d_inner)
+        """
+        Abar, BX, Cmat = self.project(x, mask=mask)
+        # h_t = Abar_t * h_{t-1} + BX_t, h_{-1} = 0.
+        hs = self._scan(Abar, BX)  # (B, L, D, N)
+        return self.combine(hs, Cmat, x, mask=mask)
+
 
 class MambaBlock(nn.Module):
-    """Standard Mamba wrapper: in-proj -> SSM -> gate -> out-proj, with residual outside."""
+    """Standard Mamba wrapper: in-proj -> SSM -> gate -> out-proj, with residual outside.
 
-    def __init__(self, d_model, d_inner=None, d_state=16):
+    `expand` defaults to 1x (d_inner=d_model), not the usual Mamba/LLM default
+    of 2x: SpatialMixer's scans are line lengths <=8, and the "SSM is
+    memory-bandwidth-bound at this scale" benchmark showed cost scales
+    ~linearly with d_inner (and with d_state) -- there's no evidence a chess
+    board's rank/file/diagonal scan needs 2x channel expansion to represent
+    "propagate until blocked", so the cheaper default is used until an
+    ablation shows otherwise (same reasoning ffn_mult=1.0 already uses
+    elsewhere in this codebase, after LC0's own ablations found no benefit
+    from the usual 4x FFN expansion for chess transformers).
+    """
+
+    def __init__(self, d_model, d_inner=None, d_state=16, expand=1.0, scan_backend="pscan"):
         super().__init__()
-        d_inner = d_inner or 2 * d_model
+        d_inner = d_inner or int(expand * d_model)
         self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
-        self.ssm = SelectiveSSM(d_inner, d_state=d_state)
+        self.ssm = SelectiveSSM(d_inner, d_state=d_state, scan_backend=scan_backend)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
 
     def forward(self, x, mask=None):

@@ -30,10 +30,10 @@ N_SQUARES = 64
 
 
 class ChessMambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, ffn_mult=1.0):
+    def __init__(self, d_model, d_state=8, expand=1.0, scan_backend="pscan", ffn_mult=1.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.spatial = SpatialMixer(d_model, d_state=d_state)
+        self.spatial = SpatialMixer(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
         self.norm2 = nn.LayerNorm(d_model)
         d_ffn = int(d_model * ffn_mult)
         # LC0's ablations found little benefit from the usual 4x FFN expansion
@@ -86,13 +86,14 @@ class ValueHead(nn.Module):
 
 
 class ChessMamba(nn.Module):
-    def __init__(self, d_model=256, n_layers=8, d_state=16, n_history=7,
-                 n_value_bins=128, ffn_mult=1.0):
+    def __init__(self, d_model=256, n_layers=8, d_state=8, expand=1.0, scan_backend="pscan",
+                 n_history=7, n_value_bins=128, ffn_mult=1.0):
         super().__init__()
         in_dim = N_PIECE_TYPES * (n_history + 1) + 8  # +8 for castling/ep/rule50/etc.
         self.embed = nn.Linear(in_dim, d_model)
         self.blocks = nn.ModuleList([
-            ChessMambaBlock(d_model, d_state=d_state, ffn_mult=ffn_mult)
+            ChessMambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend,
+                             ffn_mult=ffn_mult)
             for _ in range(n_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)

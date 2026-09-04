@@ -20,21 +20,33 @@ are concatenated and projected back down to d_model.
 """
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from bee_training.chess_mamba.geometry import build_knight_adjacency, build_line_families
-from bee_training.chess_mamba.mamba_core import MambaBlock
+from bee_training.chess_mamba.mamba_core import MambaBlock, get_scan_fn
 
 
 class DirectionalMamba(nn.Module):
-    """One shared Mamba scan applied to every line of a single family, both ways."""
+    """One shared Mamba scan applied to every line of a single family, both ways.
 
-    def __init__(self, d_model, idx, mask, d_state=16):
+    The forward and backward passes use separate learnable weights (they can
+    learn different dynamics), but the actual scan call -- the expensive,
+    memory-bandwidth-bound part -- doesn't care whose weights produced its
+    (Abar, BX) inputs, since the scan is independent per batch element. So we
+    run each direction's in_proj/x_proj/dt_proj separately (cheap), but
+    concatenate their (Abar, BX) along the batch dim and call the scan ONCE
+    for both directions instead of twice -- half the scan invocations, same
+    math (see `test_fused_fwd_bwd_pscan_matches_two_separate_calls`).
+    """
+
+    def __init__(self, d_model, idx, mask, d_state=16, expand=1.0, scan_backend="pscan"):
         super().__init__()
         self.register_buffer("idx", idx)     # (num_lines, max_len)
         self.register_buffer("mask", mask)   # (num_lines, max_len)
-        self.mamba_fwd = MambaBlock(d_model, d_state=d_state)
-        self.mamba_bwd = MambaBlock(d_model, d_state=d_state)
+        self.mamba_fwd = MambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
+        self.mamba_bwd = MambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
+        self._scan = get_scan_fn(scan_backend)
 
     def forward(self, board_feats):
         """board_feats: (B, 64, D) -> returns (B, 64, D), same-shape contribution."""
@@ -43,15 +55,37 @@ class DirectionalMamba(nn.Module):
 
         gathered = board_feats[:, self.idx.reshape(-1), :].view(B, num_lines, max_len, D)
         gathered = gathered * self.mask.unsqueeze(0).unsqueeze(-1)
-
         flat = gathered.reshape(B * num_lines, max_len, D)
 
-        # forward direction
-        y_fwd = self._scan_batched(self.mamba_fwd, flat, self.mask)
-        # backward direction: flip both sequence and mask, scan, flip back
-        y_bwd = self._scan_batched(
-            self.mamba_bwd, flat.flip(dims=[1]), self.mask.flip(dims=[-1])
-        ).flip(dims=[1])
+        mask_tiled = self.mask.unsqueeze(0).expand(B, num_lines, max_len).reshape(-1, max_len)
+
+        flat_fwd = flat
+        flat_bwd = flat.flip(dims=[1])
+        mask_fwd = mask_tiled
+        mask_bwd = mask_tiled.flip(dims=[-1])
+
+        # in_proj + SSM projection stay per-direction (separate weights, cheap)
+        xz_fwd = self.mamba_fwd.in_proj(flat_fwd)
+        x_fwd, z_fwd = xz_fwd.chunk(2, dim=-1)
+        Abar_f, BX_f, Cmat_f = self.mamba_fwd.ssm.project(x_fwd, mask=mask_fwd)
+
+        xz_bwd = self.mamba_bwd.in_proj(flat_bwd)
+        x_bwd, z_bwd = xz_bwd.chunk(2, dim=-1)
+        Abar_b, BX_b, Cmat_b = self.mamba_bwd.ssm.project(x_bwd, mask=mask_bwd)
+
+        # one fused pscan call for both directions
+        n_fwd = Abar_f.shape[0]
+        Abar_cat = torch.cat([Abar_f, Abar_b], dim=0)
+        BX_cat = torch.cat([BX_f, BX_b], dim=0)
+        hs_cat = self._scan(Abar_cat, BX_cat)
+        hs_f, hs_b = hs_cat[:n_fwd], hs_cat[n_fwd:]
+
+        y_fwd = self.mamba_fwd.ssm.combine(hs_f, Cmat_f, x_fwd, mask=mask_fwd)
+        y_fwd = self.mamba_fwd.out_proj(y_fwd * F.silu(z_fwd))
+
+        y_bwd = self.mamba_bwd.ssm.combine(hs_b, Cmat_b, x_bwd, mask=mask_bwd)
+        y_bwd = self.mamba_bwd.out_proj(y_bwd * F.silu(z_bwd))
+        y_bwd = y_bwd.flip(dims=[1])
 
         y = (y_fwd + y_bwd).view(B, num_lines, max_len, D)
         y = y * self.mask.unsqueeze(0).unsqueeze(-1)
@@ -61,15 +95,6 @@ class DirectionalMamba(nn.Module):
         y_flat = y.reshape(B, num_lines * max_len, D)
         out.index_add_(1, idx_flat, y_flat)
         return out
-
-    @staticmethod
-    def _scan_batched(mamba, flat, per_line_mask):
-        """flat: (B*num_lines, max_len, D) -- run mamba once over all lines at once."""
-        num_lines, max_len = per_line_mask.shape
-        total = flat.shape[0]
-        B = total // num_lines
-        mask_tiled = per_line_mask.unsqueeze(0).expand(B, num_lines, max_len).reshape(total, max_len)
-        return mamba(flat, mask=mask_tiled)
 
 
 class KnightGraphMixer(nn.Module):
@@ -117,11 +142,12 @@ class KnightGraphMixer(nn.Module):
 class SpatialMixer(nn.Module):
     """Combines all 4 ray directions + the knight graph into one geometry-aware mixer."""
 
-    def __init__(self, d_model, d_state=16):
+    def __init__(self, d_model, d_state=8, expand=1.0, scan_backend="pscan"):
         super().__init__()
         families = build_line_families()
         self.rays = nn.ModuleDict({
-            name: DirectionalMamba(d_model, idx, mask, d_state=d_state)
+            name: DirectionalMamba(d_model, idx, mask, d_state=d_state, expand=expand,
+                                    scan_backend=scan_backend)
             for name, (idx, mask) in families.items()
         })
         self.knight = KnightGraphMixer(d_model)
