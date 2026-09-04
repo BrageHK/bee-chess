@@ -24,12 +24,15 @@ if [ ! -d frontend/node_modules ]; then
   npm --prefix frontend install
 fi
 
-# The bridge needs `websockets`; uv gives it an ephemeral env so nothing has
-# to be installed system-wide.
+if [ ! -d bridge/.venv ]; then
+  echo "==> setting up the bridge environment"
+  (cd bridge && uv sync)
+fi
+
 if command -v uv >/dev/null 2>&1; then
-  BRIDGE=(uv run --quiet --with websockets python bridge/server.py)
+  BRIDGE=(uv run --project bridge --quiet python bridge/server.py)
 else
-  BRIDGE=(python3 bridge/server.py)
+  BRIDGE=(bridge/.venv/bin/python bridge/server.py)
 fi
 
 echo "==> starting the UCI bridge"
