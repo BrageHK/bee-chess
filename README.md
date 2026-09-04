@@ -35,3 +35,13 @@ cd frontend && npm install && npm run build
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and branch
 naming conventions.
 
+## Engine arena (Stockfish vs Bee)
+
+```bash
+git submodule update --init --recursive
+./scripts/dev.sh
+./scripts/build-stockfish.sh
+./scripts/build-bee.sh
+uv run --with websockets python bridge/server.py
+npm --prefix frontend run dev
+```
