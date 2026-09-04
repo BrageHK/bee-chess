@@ -1,12 +1,18 @@
 # ChessMamba — a selective-SSM searchless chess architecture
 
-A working prototype that swaps the attention-based geometric mixer
-(GAB / smolgen, from the Chessformer / Leela BT-series line of work) for
-selective state-space (Mamba/S6) scans, run along the actual lines that
-rook, bishop, and queen attacks travel. This is **not** a published
-architecture — it's a from-this-conversation hypothesis, implemented and
-smoke-tested but not trained or evaluated on real chess data. Treat it as
-a starting point for experiments, not a result.
+**The implementation now lives at `src/bee_training/chess_mamba/`**, with
+real pytest coverage under `tests/chess_mamba/` — this file and
+`CHESSMAMBA_PLAN.md` stay here as the architecture spec/design doc. This
+is **not** a published architecture — it's a from-this-conversation
+hypothesis, implemented and tested but not trained or evaluated on real
+chess data. Treat it as a starting point for experiments, not a result.
+
+The scan backend is `mambapy.pscan` (pure PyTorch, Blelloch parallel
+scan) rather than a hand-rolled Python loop or the official `mamba-ssm`
+CUDA kernel — the latter does not build on RDNA3/gfx1100 ROCm (RX 7900
+class cards), only on datacenter Instinct cards, so `mambapy` is the
+implementation that's actually runnable here. See
+`src/bee_training/chess_mamba/mamba_core.py`.
 
 ## The idea
 
@@ -29,39 +35,53 @@ plausibly matters for chess — unlike the within-position case.
 
 ## Files
 
+All under `src/bee_training/chess_mamba/`:
+
 | File | Contents |
 |---|---|
 | `geometry.py` | Precomputed rank/file/diagonal/anti-diagonal line indices and the knight-move adjacency table. Run standalone to sanity-check them. |
-| `mamba_core.py` | Minimal pure-PyTorch selective SSM (`SelectiveSSM`, `MambaBlock`). Not the official CUDA kernel — see caveats below. |
+| `mamba_core.py` | Selective SSM (`SelectiveSSM`, `MambaBlock`), scan computed via `mambapy.pscan` (parallel scan, pure PyTorch — no custom CUDA/HIP kernel, so it runs on ROCm unmodified). |
 | `spatial_mixer.py` | `SpatialMixer`: the drop-in replacement for GAB+attention. Runs a shared Mamba scan per line family, both directions, plus the knight graph mixer. |
 | `temporal_mixer.py` | `TemporalHistoryMamba`: Mamba over the ply axis for unbounded game history. |
 | `model.py` | `ChessMamba`: full model — embedding, stacked blocks, from-to policy head, HL-Gauss-style value head. |
-| `benchmark.py` | Honest speed check against plain attention at board scale. |
+| `benchmark.py` | Honest speed check against plain attention at board scale, on CPU and GPU. |
 
 ## Honest benchmark result
 
-At `d_model=128`, batch 8, sequence length 64 (one board), on CPU:
+At `d_model=128`, batch 8, sequence length 64 (one board), measured on an
+AMD RX 7900 XTX (ROCm) and its host CPU:
 
 ```
-SpatialMixer (SSM, ours):   760.85 ms / fwd+bwd   (1,101,952 params)
-Plain multi-head attention:   4.91 ms / fwd+bwd      (66,048 params)
-SSM is ~155x the wall-clock time of plain attention at this scale.
+[cpu]  SpatialMixer (SSM, ours):  84.32 ms / fwd+bwd  (1,101,952 params)
+[cpu]  Plain multi-head attn:      0.87 ms / fwd+bwd     (66,048 params)
+[cpu]  SSM is 96.8x the wall-clock time of plain attention at L=64.
+
+[cuda] SpatialMixer (SSM, ours):  11.11 ms / fwd+bwd  (1,101,952 params)
+[cuda] Plain multi-head attn:      0.31 ms / fwd+bwd     (66,048 params)
+[cuda] SSM is 36.4x the wall-clock time of plain attention at L=64.
 ```
 
-This is expected, not a bug: attention over 64 tokens is already about as
-cheap as an operation gets, and this implementation runs a Python-level
-sequential scan over many small (≤8-step) line-batches, which has real
-per-call overhead that a fused kernel wouldn't. **The pitch for this
-architecture is inductive bias (explicit line-of-sight), not speed.** If
-you want to pursue this seriously:
+Still slower than plain attention, as expected: attention over 64 tokens
+is already about as cheap as an operation gets, and each ray scan is only
+4-8 steps — too short to amortize any implementation's per-call overhead.
+The parallel-scan backend (`mambapy.pscan`, replacing a naive Python-loop
+scan) roughly halves the gap versus a sequential loop, and the GPU
+closes it further (36x vs 97x on CPU), but doesn't erase it. **The pitch
+for this architecture stays inductive bias (explicit line-of-sight), not
+speed.**
 
-- swap `mamba_core.MambaBlock` for the official `mamba_ssm.Mamba` CUDA
-  block (drop-in shape-compatible) and re-benchmark on GPU — it will
-  close some of this gap, though a 4-8 step scan is still short enough
-  that it may never beat attention on raw speed;
-- or accept the speed cost and evaluate purely on whether the inductive
-  bias improves puzzle accuracy / sample efficiency versus GAB at equal
-  parameter count, which is the actual open question here, not throughput.
+The official `mamba_ssm.Mamba` CUDA kernel (what you'd reach for on
+Nvidia) is not a realistic option here: it requires custom CUDA/HIP
+kernels that do not build on RDNA3/gfx1100 consumer cards (RX 7900-class)
+as of 2026 — confirmed via multiple open upstream build failures — only
+on datacenter Instinct cards (MI200/MI300). `mambapy`'s pure-PyTorch
+parallel scan is the pragmatic ROCm-safe choice instead, at some
+throughput cost versus a fused kernel.
+
+The actual open question is whether the inductive bias improves puzzle
+accuracy / sample efficiency versus GAB at equal parameter count — see
+`CHESSMAMBA_PLAN.md` Phase 6/7 for the controlled comparison that would
+answer that.
 
 ## Wiring this up to real training
 
@@ -81,12 +101,13 @@ This repo only has the model — you'd still need to:
    scaffolded); train the policy head with cross-entropy over the
    flattened `(64*64)` from-to logits against the oracle's UCI move.
 
-## Known limitations of this prototype
+## Known limitations
 
-- Pure-Python sequential scan — fine for correctness, bad for throughput
-  (see benchmark above).
+- `mambapy.pscan` is a parallel scan but still not a fused kernel — see
+  benchmark above for the honest cost of that versus plain attention.
 - `TemporalHistoryMamba.step()` is a stub — real incremental single-ply
   inference needs Mamba's actual recurrent state API, not the batched
   `forward()` used here for clarity.
-- Nothing here has been trained. All tests are shape/gradient/masking
-  sanity checks, not chess-strength evaluation.
+- Nothing here has been trained. All tests (`tests/chess_mamba/`) are
+  shape/gradient/masking/locality sanity checks, not chess-strength
+  evaluation.

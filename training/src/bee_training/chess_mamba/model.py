@@ -20,10 +20,10 @@ Two output heads, matching what's already been validated to work well:
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
-from spatial_mixer import SpatialMixer
+from bee_training.chess_mamba.spatial_mixer import SpatialMixer
 
 N_PIECE_TYPES = 12  # 6 piece types x 2 colors
 N_SQUARES = 64

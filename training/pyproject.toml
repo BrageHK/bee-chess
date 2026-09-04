@@ -6,6 +6,8 @@ requires-python = ">=3.14"
 dependencies = [
     "torch>=2.14.0",
     "torchvision>=0.29.0",
+    "mambapy>=1.2.0",
+    "triton-rocm>=3.8.0,<3.9 ; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
@@ -20,3 +22,13 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 100
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-rocm" }]
+torchvision = [{ index = "pytorch-rocm" }]
+triton-rocm = [{ index = "pytorch-rocm" }]
