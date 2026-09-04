@@ -112,7 +112,7 @@ export default function App() {
   };
 
   return (
-    <main style={{ display: "grid", placeItems: "center", gap: 8, padding: 24 }}>
+    <main style={{ display: "grid", placeItems: "center", gap: 8, padding: 24, textAlign: "center" }}>
       <h1>
         {whiteEngine.name} (white) vs {blackEngine.name} (black)
       </h1>

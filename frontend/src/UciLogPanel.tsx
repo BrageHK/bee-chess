@@ -38,7 +38,7 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
   }, [lines]);
 
   return (
-    <section style={{ display: "grid", gap: 4, minWidth: 320 }}>
+    <section style={{ display: "grid", gap: 4, minWidth: 320, textAlign: "left" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <strong>{name}</strong>
         <button type="button" onClick={() => setLines([])}>
@@ -64,6 +64,7 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
           padding: 8,
           borderRadius: 4,
           whiteSpace: "pre-wrap",
+          textAlign: "left",
         }}
       >
         {lines.length === 0 && <div style={{ color: "#777" }}>(no traffic yet)</div>}
