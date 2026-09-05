@@ -11,11 +11,14 @@
 /training/data/
 /training/books/
 /training/checkpoints/
+/training/logs/
 /bridge/.venv/
 /bridge/.pytest_cache/
 /bridge/.ruff_cache/
 __pycache__/
 *.pyc
+
+# Trainign
 
 # Node
 node_modules/

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { formatCount, formatNps, formatScore, parseUciInfo } from "./uciInfo";
+import {
+  evalBarFraction,
+  formatCount,
+  formatNps,
+  formatScore,
+  parseUciInfo,
+  toWhitePerspective,
+} from "./uciInfo";
 
 describe("parseUciInfo", () => {
   it("parses the issue's example line", () => {
@@ -105,6 +112,65 @@ describe("formatScore", () => {
 
   it("returns undefined when neither is present", () => {
     expect(formatScore({})).toBeUndefined();
+  });
+});
+
+describe("toWhitePerspective", () => {
+  it("passes a white engine's score through unchanged", () => {
+    expect(toWhitePerspective({ scoreCp: 31 }, "white")).toEqual({
+      scoreCp: 31,
+      scoreMate: undefined,
+    });
+  });
+
+  it("negates a black engine's score", () => {
+    expect(toWhitePerspective({ scoreCp: 31 }, "black")).toEqual({
+      scoreCp: -31,
+      scoreMate: undefined,
+    });
+  });
+
+  it("negates a black engine's mate score", () => {
+    expect(toWhitePerspective({ scoreMate: 4 }, "black")).toEqual({
+      scoreCp: undefined,
+      scoreMate: -4,
+    });
+  });
+
+  it("leaves undefined fields undefined regardless of color", () => {
+    expect(toWhitePerspective({}, "black")).toEqual({ scoreCp: undefined, scoreMate: undefined });
+  });
+});
+
+describe("evalBarFraction", () => {
+  it("is neutral (0.5) when there is no score yet", () => {
+    expect(evalBarFraction({}, 3)).toBe(0.5);
+  });
+
+  it("is 0.5 at an exactly even score", () => {
+    expect(evalBarFraction({ scoreCp: 0 }, 3)).toBe(0.5);
+  });
+
+  it("grows toward 1 as white's advantage grows, up to the clamp", () => {
+    expect(evalBarFraction({ scoreCp: 150 }, 3)).toBeCloseTo(0.75);
+    expect(evalBarFraction({ scoreCp: 300 }, 3)).toBe(1);
+  });
+
+  it("clamps beyond the given range instead of overflowing", () => {
+    expect(evalBarFraction({ scoreCp: 800 }, 3)).toBe(1);
+    expect(evalBarFraction({ scoreCp: -800 }, 3)).toBe(0);
+  });
+
+  it("shrinks toward 0 as black's advantage grows", () => {
+    expect(evalBarFraction({ scoreCp: -150 }, 3)).toBeCloseTo(0.25);
+  });
+
+  it("pins fully to 1 for a positive (white) mate score regardless of the clamp", () => {
+    expect(evalBarFraction({ scoreMate: 12 }, 3)).toBe(1);
+  });
+
+  it("pins fully to 0 for a negative (black) mate score regardless of the clamp", () => {
+    expect(evalBarFraction({ scoreMate: -1 }, 3)).toBe(0);
   });
 });
 

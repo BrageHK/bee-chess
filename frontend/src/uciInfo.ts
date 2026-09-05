@@ -118,6 +118,41 @@ export function formatScore(info: Pick<UciInfo, "scoreCp" | "scoreMate">): strin
   return undefined;
 }
 
+/**
+ * Converts a score from the reporting engine's own perspective (UCI
+ * convention: positive favors whoever it's currently searching for)
+ * to white's perspective (positive favors white), given which color
+ * that engine is playing. Needed for anything that must read
+ * consistently regardless of which side the engine is on -- e.g. an
+ * eval bar, which always fills from the bottom for a white advantage.
+ */
+export function toWhitePerspective(
+  info: Pick<UciInfo, "scoreCp" | "scoreMate">,
+  engineColor: "white" | "black",
+): Pick<UciInfo, "scoreCp" | "scoreMate"> {
+  const sign = engineColor === "white" ? 1 : -1;
+  return {
+    scoreCp: info.scoreCp !== undefined ? info.scoreCp * sign : undefined,
+    scoreMate: info.scoreMate !== undefined ? info.scoreMate * sign : undefined,
+  };
+}
+
+/** An eval bar's fill, as white's share in [0, 1] (0.5 is neutral).
+ * Clamped to +-`clampPawns` for `scoreCp`; a `scoreMate` pins fully to
+ * whichever side is mating (0 or 1) regardless of the clamp. Expects
+ * `info` already converted to white's perspective (see
+ * `toWhitePerspective`) -- unlike `formatScore`, which shows a score
+ * as-is from whatever perspective it's given. */
+export function evalBarFraction(
+  info: Pick<UciInfo, "scoreCp" | "scoreMate">,
+  clampPawns: number,
+): number {
+  if (info.scoreMate !== undefined) return info.scoreMate >= 0 ? 1 : 0;
+  if (info.scoreCp === undefined) return 0.5;
+  const pawns = Math.max(-clampPawns, Math.min(clampPawns, info.scoreCp / 100));
+  return 0.5 + pawns / (2 * clampPawns);
+}
+
 /** Formats a node/count value with thousands separators: 42122 -> "42,122". */
 export function formatCount(n: number): string {
   return n.toLocaleString("en-US");
