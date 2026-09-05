@@ -83,6 +83,7 @@ export function UciLogPanel({ name, subscribe }: UciLogPanelProps) {
           padding: 8,
           borderRadius: 4,
           textAlign: "left",
+          userSelect: "text",
         }}
       >
         {lines.length === 0 && <div style={{ color: "#777" }}>(no traffic yet)</div>}

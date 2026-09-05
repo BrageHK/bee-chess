@@ -29,6 +29,12 @@ export default function App() {
         gap: 8,
         padding: 24,
         textAlign: "center",
+        // Nothing here is meant to be copy-pasted, so a drag anywhere
+        // on the page (e.g. overshooting a piece drag past the board's
+        // edge) shouldn't fan out into a multi-element text selection
+        // (#52). UciLogPanel opts back in locally -- its raw traffic is
+        // worth copying for debugging.
+        userSelect: "none",
       }}
     >
       <h1>Bee Chess</h1>
