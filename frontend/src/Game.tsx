@@ -247,24 +247,32 @@ export function Game({
       <h1>
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
-      <Chessground
-        config={{
-          fen,
-          lastMove,
-          // Default `coordinates: true` floats rank/file labels a few px
-          // inside the board's own edge, overlapping back-rank pieces on
-          // our fixed 480x480 board (#51). on-square labels avoid that.
-          coordinatesOnSquares: true,
-          viewOnly: canMoveColor === null,
-          turnColor: turn,
-          movable: {
-            free: false,
-            color: canMoveColor ?? undefined,
-            dests: canMoveColor ? dests : new Map(),
-            events: { after: onHumanMove },
-          },
-        }}
-      />
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        {clientFor("white") && (
+          <EvalBar color="white" subscribe={(l) => clientFor("white")!.onLog(l)} />
+        )}
+        <Chessground
+          config={{
+            fen,
+            lastMove,
+            // Default `coordinates: true` floats rank/file labels a few px
+            // inside the board's own edge, overlapping back-rank pieces on
+            // our fixed 480x480 board (#51). on-square labels avoid that.
+            coordinatesOnSquares: true,
+            viewOnly: canMoveColor === null,
+            turnColor: turn,
+            movable: {
+              free: false,
+              color: canMoveColor ?? undefined,
+              dests: canMoveColor ? dests : new Map(),
+              events: { after: onHumanMove },
+            },
+          }}
+        />
+        {clientFor("black") && (
+          <EvalBar color="black" subscribe={(l) => clientFor("black")!.onLog(l)} />
+        )}
+      </div>
       <p>{status}</p>
       {finished && <button onClick={onBackToSetup}>New game</button>}
       <BotPanels color="white" participant={white} client={clientFor("white")} />
