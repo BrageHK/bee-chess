@@ -1,12 +1,11 @@
-//! Negamax alpha-beta search, fixed-depth and time-bounded iterative
-//! deepening, plus a quiescence search at the leaves: the first three
-//! slices of #6 (6a, 6c's iterative deepening pulled forward to be
-//! time- rather than depth-driven, and now quiescence).
+//! Negamax alpha-beta/PVS search with iterative deepening, quiescence,
+//! move ordering (TT move, MVV-LVA, killers, and history), a bounded
+//! transposition table, and repetition/fifty-move draw scoring.
 //!
-//! Deliberately still excludes (see later #6 PRs): a transposition
-//! table, move ordering, aspiration windows, and PVS. None of those
-//! affect correctness; they only affect speed. Get the tree itself
-//! correct first.
+//! Iterative deepening deliberately keeps a full root window rather than
+//! adding aspiration windows: PVS already supplies narrow windows below the
+//! root, while a full root window avoids deadline-expensive fail-high/low
+//! re-searches when the score changes sharply between depths.
 //!
 //! There is also no threading/cancellation infrastructure yet (that's
 //! #7's territory) -- time-bounded search instead polls a `Deadline`
@@ -16,11 +15,68 @@
 //! so a score produced after bailing out partway through one is not
 //! trustworthy the way a fully-completed depth's score is.
 
-use crate::chess::{Move, MoveFlag, Position};
+use std::collections::HashMap;
+
+use crate::chess::{Move, MoveFlag, PieceKind, Position};
 use crate::eval::Evaluator;
 
 use super::deadline::Deadline;
 use super::{Score, SearchResult, SCORE_INF, SCORE_MATE};
+
+const MAX_TT_ENTRIES: usize = 1 << 20;
+
+#[derive(Clone, Copy)]
+enum Bound {
+    Exact,
+    Lower,
+    Upper,
+}
+
+#[derive(Clone, Copy)]
+struct TtEntry {
+    depth: u32,
+    score: Score,
+    bound: Bound,
+    best_move: Option<Move>,
+}
+
+struct SearchState {
+    table: HashMap<(u64, u32, u8), TtEntry>,
+    killers: Vec<[Option<Move>; 2]>,
+    history: [i32; 64 * 64],
+    root_best: Option<Move>,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            table: HashMap::new(),
+            killers: Vec::new(),
+            history: [0; 64 * 64],
+            root_best: None,
+        }
+    }
+}
+
+fn normalized_history(position: &Position, history: &[u64]) -> Vec<u64> {
+    let current = position.zobrist_hash();
+    let mut path = history.to_vec();
+    if path.last().copied() != Some(current) {
+        path.push(current);
+    }
+    path
+}
+
+fn repetition_count(path: &[u64], hash: u64) -> u8 {
+    path.iter()
+        .filter(|&&seen| seen == hash)
+        .count()
+        .min(u8::MAX as usize) as u8
+}
+
+fn is_rule_draw(position: &Position, path: &[u64]) -> bool {
+    position.halfmove_clock() >= 100 || repetition_count(path, position.zobrist_hash()) >= 3
+}
 
 /// Searches `position` to exactly `depth` plies using negamax
 /// alpha-beta, scoring leaves with `evaluator`. Returns the best move
@@ -38,11 +94,33 @@ use super::{Score, SearchResult, SCORE_INF, SCORE_MATE};
 /// each completed depth, see `search_iterative`.
 #[must_use]
 pub fn search(position: &mut Position, depth: u32, evaluator: &impl Evaluator) -> SearchResult {
+    let history = [position.zobrist_hash()];
+    search_with_history(position, depth, evaluator, &history)
+}
+
+/// Fixed-depth search with the hashes that led to `position`, used to score
+/// threefold repetition inside the tree. The final hash should be the current
+/// position; it is added defensively if the caller omits it.
+pub fn search_with_history(
+    position: &mut Position,
+    depth: u32,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+) -> SearchResult {
+    let mut state = SearchState::default();
+    let mut path = normalized_history(position, history);
     // A fixed-depth search never times out: same code path as
     // search_iterative's per-depth search, just with an unlimited
     // deadline, so a single implementation serves both.
-    search_to_depth(position, depth, evaluator, &Deadline::none())
-        .expect("Deadline::none() never expires, so this can't be an incomplete search")
+    search_to_depth(
+        position,
+        depth,
+        evaluator,
+        &Deadline::none(),
+        &mut state,
+        &mut path,
+    )
+    .expect("Deadline::none() never expires, so this can't be an incomplete search")
 }
 
 /// Searches `position` with iterative deepening (depth 1, then 2, then
@@ -62,13 +140,33 @@ pub fn search_iterative(
     position: &mut Position,
     budget: std::time::Duration,
     evaluator: &impl Evaluator,
+    on_depth_complete: impl FnMut(&SearchResult),
+) -> SearchResult {
+    let history = [position.zobrist_hash()];
+    search_iterative_with_history(position, budget, evaluator, &history, on_depth_complete)
+}
+
+pub fn search_iterative_with_history(
+    position: &mut Position,
+    budget: std::time::Duration,
+    evaluator: &impl Evaluator,
+    history: &[u64],
     mut on_depth_complete: impl FnMut(&SearchResult),
 ) -> SearchResult {
     let deadline = Deadline::from_now(budget);
+    let mut state = SearchState::default();
+    let mut path = normalized_history(position, history);
 
     let mut depth = 1;
-    let mut last_completed = search_to_depth(position, depth, evaluator, &Deadline::none())
-        .expect("depth 1 always completes: Deadline::none() never expires");
+    let mut last_completed = search_to_depth(
+        position,
+        depth,
+        evaluator,
+        &Deadline::none(),
+        &mut state,
+        &mut path,
+    )
+    .expect("depth 1 always completes: Deadline::none() never expires");
     on_depth_complete(&last_completed);
 
     // If depth 1 already found a forced mate, searching deeper cannot
@@ -81,7 +179,7 @@ pub fn search_iterative(
 
     loop {
         depth += 1;
-        match search_to_depth(position, depth, evaluator, &deadline) {
+        match search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
                 last_completed = result;
@@ -110,9 +208,11 @@ fn search_to_depth(
     depth: u32,
     evaluator: &impl Evaluator,
     deadline: &Deadline,
+    state: &mut SearchState,
+    path: &mut Vec<u64>,
 ) -> Option<SearchResult> {
     let mut nodes = 0u64;
-    let moves = position.generate_legal_moves();
+    let mut moves = position.generate_legal_moves();
 
     if moves.is_empty() {
         // Root is checkmate or stalemate: nothing to play, but still a
@@ -127,6 +227,21 @@ fn search_to_depth(
         });
     }
 
+    // Checkmate/stalemate above take precedence; otherwise a claimable
+    // repetition or fifty-move draw is an exact zero even though UCI still
+    // needs a legal move to return.
+    if is_rule_draw(position, path) {
+        let best_move = moves[0];
+        return Some(SearchResult {
+            best_move: Some(best_move),
+            score: 0,
+            nodes: 1,
+            depth,
+            pv: vec![best_move],
+        });
+    }
+
+    order_moves(position, &mut moves, state, 0, state.root_best);
     let mut best_move = moves[0];
     let mut best_score = -SCORE_INF;
     let mut best_pv: Vec<Move> = Vec::new();
@@ -135,6 +250,7 @@ fn search_to_depth(
 
     for mv in moves {
         let undo = position.make_move(mv);
+        path.push(position.zobrist_hash());
         let outcome = negamax(
             position,
             depth - 1,
@@ -144,7 +260,10 @@ fn search_to_depth(
             evaluator,
             &mut nodes,
             deadline,
+            state,
+            path,
         );
+        path.pop();
         position.unmake_move(mv, undo);
 
         let Some((score, mut child_pv)) = outcome.map(|(s, pv)| (-s, pv)) else {
@@ -163,6 +282,7 @@ fn search_to_depth(
         // that some move is "good enough."
     }
 
+    state.root_best = Some(best_move);
     Some(SearchResult {
         best_move: Some(best_move),
         score: best_score,
@@ -192,11 +312,13 @@ fn negamax(
     position: &mut Position,
     depth: u32,
     mut alpha: Score,
-    beta: Score,
+    mut beta: Score,
     ply: u32,
     evaluator: &impl Evaluator,
     nodes: &mut u64,
     deadline: &Deadline,
+    state: &mut SearchState,
+    path: &mut Vec<u64>,
 ) -> Option<(Score, Vec<Move>)> {
     if deadline.is_expired(*nodes) {
         return None;
@@ -204,48 +326,146 @@ fn negamax(
 
     *nodes += 1;
 
-    let moves = position.generate_legal_moves();
+    if is_rule_draw(position, path) {
+        return Some((0, Vec::new()));
+    }
+
+    let original_alpha = alpha;
+    let original_beta = beta;
+    let repetition = repetition_count(path, position.zobrist_hash());
+    let tt_key = (
+        position.zobrist_hash(),
+        position.halfmove_clock(),
+        repetition,
+    );
+    let tt_move = state.table.get(&tt_key).and_then(|entry| entry.best_move);
+    if let Some(entry) = state
+        .table
+        .get(&tt_key)
+        .copied()
+        .filter(|entry| entry.depth >= depth)
+    {
+        let score = score_from_tt(entry.score, ply);
+        match entry.bound {
+            Bound::Exact => return Some((score, entry.best_move.into_iter().collect())),
+            Bound::Lower => alpha = alpha.max(score),
+            Bound::Upper => beta = beta.min(score),
+        }
+        if alpha >= beta {
+            return Some((score, Vec::new()));
+        }
+    }
+
+    let mut moves = position.generate_legal_moves();
     if moves.is_empty() {
         return Some((terminal_score(position, ply), Vec::new()));
     }
 
     if depth == 0 {
-        let score = quiescence(position, alpha, beta, ply, ply, evaluator, nodes, deadline)?;
+        let score = quiescence(
+            position, alpha, beta, ply, ply, evaluator, nodes, deadline, path,
+        )?;
         return Some((score, Vec::new()));
     }
 
+    order_moves(position, &mut moves, state, ply as usize, tt_move);
     let mut best = -SCORE_INF;
     let mut best_pv: Vec<Move> = Vec::new();
+    let mut best_move = None;
 
-    for mv in moves {
+    for (move_index, mv) in moves.into_iter().enumerate() {
         let undo = position.make_move(mv);
-        let outcome = negamax(
-            position,
-            depth - 1,
-            -beta,
-            -alpha,
-            ply + 1,
-            evaluator,
-            nodes,
-            deadline,
-        );
+        path.push(position.zobrist_hash());
+        let mut outcome = if move_index == 0 {
+            negamax(
+                position,
+                depth - 1,
+                -beta,
+                -alpha,
+                ply + 1,
+                evaluator,
+                nodes,
+                deadline,
+                state,
+                path,
+            )
+        } else {
+            // Principal Variation Search: prove later moves fail low with a
+            // null window, then re-search only an unexpected improvement.
+            let scout = negamax(
+                position,
+                depth - 1,
+                -alpha - 1,
+                -alpha,
+                ply + 1,
+                evaluator,
+                nodes,
+                deadline,
+                state,
+                path,
+            );
+            match scout {
+                Some((child_score, _)) if -child_score > alpha && -child_score < beta => negamax(
+                    position,
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    evaluator,
+                    nodes,
+                    deadline,
+                    state,
+                    path,
+                ),
+                other => other,
+            }
+        };
+        path.pop();
         position.unmake_move(mv, undo);
 
-        let (score, mut child_pv) = match outcome {
+        let (score, mut child_pv) = match outcome.take() {
             Some((s, pv)) => (-s, pv),
             None => return None,
         };
 
         if score > best {
             best = score;
+            best_move = Some(mv);
             child_pv.insert(0, mv);
             best_pv = child_pv;
         }
         alpha = alpha.max(score);
 
         if alpha >= beta {
+            record_cutoff(position, state, mv, ply as usize, depth);
             break; // beta cutoff: the opponent won't allow this line
         }
+    }
+
+    let bound = if best <= original_alpha {
+        Bound::Upper
+    } else if best >= original_beta {
+        Bound::Lower
+    } else {
+        Bound::Exact
+    };
+    let should_replace = state
+        .table
+        .get(&tt_key)
+        .is_none_or(|entry| depth >= entry.depth);
+    if should_replace {
+        if state.table.len() >= MAX_TT_ENTRIES {
+            state.table.clear();
+        }
+        state.table.insert(
+            tt_key,
+            TtEntry {
+                depth,
+                score: score_to_tt(best, ply),
+                bound,
+                best_move,
+            },
+        );
     }
 
     Some((best, best_pv))
@@ -304,12 +524,17 @@ fn quiescence(
     evaluator: &impl Evaluator,
     nodes: &mut u64,
     deadline: &Deadline,
+    path: &mut Vec<u64>,
 ) -> Option<Score> {
     if deadline.is_expired(*nodes) {
         return None;
     }
 
     *nodes += 1;
+
+    if is_rule_draw(position, path) {
+        return Some(0);
+    }
 
     // Checkmate/stalemate must still be detected even inside
     // quiescence: a position with no legal moves at all has no stand-pat
@@ -333,12 +558,14 @@ fn quiescence(
         return Some(best); // safety valve -- see MAX_QUIESCENCE_PLY's docs
     }
 
-    let captures: Vec<Move> = moves
+    let mut captures: Vec<Move> = moves
         .into_iter()
         .filter(|&mv| is_capture(position, mv))
         .collect();
+    captures.sort_unstable_by_key(|&mv| std::cmp::Reverse(capture_order_score(position, mv)));
     for mv in captures {
         let undo = position.make_move(mv);
+        path.push(position.zobrist_hash());
         let outcome = quiescence(
             position,
             -beta,
@@ -348,7 +575,9 @@ fn quiescence(
             evaluator,
             nodes,
             deadline,
+            path,
         );
+        path.pop();
         position.unmake_move(mv, undo);
 
         let score = -outcome?;
@@ -364,6 +593,102 @@ fn quiescence(
     }
 
     Some(best)
+}
+
+fn order_moves(
+    position: &Position,
+    moves: &mut [Move],
+    state: &SearchState,
+    ply: usize,
+    tt_move: Option<Move>,
+) {
+    moves.sort_unstable_by_key(|&mv| {
+        let score = if Some(mv) == tt_move {
+            2_000_000
+        } else if is_capture(position, mv) || mv.flag().promotion_kind().is_some() {
+            1_000_000 + capture_order_score(position, mv)
+        } else if state
+            .killers
+            .get(ply)
+            .is_some_and(|killers| killers[0] == Some(mv))
+        {
+            900_000
+        } else if state
+            .killers
+            .get(ply)
+            .is_some_and(|killers| killers[1] == Some(mv))
+        {
+            800_000
+        } else {
+            state.history[history_index(mv)]
+        };
+        std::cmp::Reverse(score)
+    });
+}
+
+fn record_cutoff(position: &Position, state: &mut SearchState, mv: Move, ply: usize, depth: u32) {
+    if is_capture(position, mv) || mv.flag().promotion_kind().is_some() {
+        return;
+    }
+    if state.killers.len() <= ply {
+        state.killers.resize(ply + 1, [None; 2]);
+    }
+    if state.killers[ply][0] != Some(mv) {
+        state.killers[ply][1] = state.killers[ply][0];
+        state.killers[ply][0] = Some(mv);
+    }
+    let bonus = (depth * depth).min(i32::MAX as u32) as i32;
+    state.history[history_index(mv)] = state.history[history_index(mv)].saturating_add(bonus);
+}
+
+const fn history_index(mv: Move) -> usize {
+    mv.from().index() as usize * 64 + mv.to().index() as usize
+}
+
+fn capture_order_score(position: &Position, mv: Move) -> i32 {
+    let attacker = position
+        .piece_at(mv.from())
+        .map_or(0, |piece| ordering_piece_value(piece.kind));
+    let victim = if mv.flag() == MoveFlag::EnPassant {
+        ordering_piece_value(PieceKind::Pawn)
+    } else {
+        position
+            .piece_at(mv.to())
+            .map_or(0, |piece| ordering_piece_value(piece.kind))
+    };
+    let promotion = mv.flag().promotion_kind().map_or(0, ordering_piece_value);
+    victim * 16 - attacker + promotion
+}
+
+const fn ordering_piece_value(kind: PieceKind) -> i32 {
+    match kind {
+        PieceKind::Pawn => 100,
+        PieceKind::Knight => 320,
+        PieceKind::Bishop => 330,
+        PieceKind::Rook => 500,
+        PieceKind::Queen => 900,
+        PieceKind::King => 20_000,
+    }
+}
+
+fn score_to_tt(score: Score, ply: u32) -> Score {
+    if score >= SCORE_MATE - 1_000 {
+        score + ply as Score
+    } else if score <= -SCORE_MATE + 1_000 {
+        score - ply as Score
+    } else {
+        score
+    }
+}
+
+fn score_from_tt(score: Score, ply: u32) -> Score {
+    if score >= SCORE_MATE - 1_000 {
+        score - ply as Score
+    } else if score <= -SCORE_MATE + 1_000 {
+        score + ply as Score
+    } else {
+        score
+    }
 }
 
 /// Whether `mv` captures a piece in `position`. Not carried on `Move`
@@ -659,5 +984,74 @@ mod tests {
         let result = search(&mut position, 1, &MaterialEvaluator);
 
         assert_eq!(result.score, MaterialEvaluator.evaluate(&position));
+    }
+
+    #[test]
+    fn fifty_move_rule_scores_as_a_draw() {
+        let mut position = Position::from_fen("4k3/8/8/8/8/8/8/Q3K3 w - - 100 1").unwrap();
+        let result = search(&mut position, 3, &MaterialEvaluator);
+        assert_eq!(result.score, 0);
+        assert!(
+            result.best_move.is_some(),
+            "UCI still requires a legal move"
+        );
+    }
+
+    #[test]
+    fn third_occurrence_scores_as_a_draw() {
+        let mut position = Position::startpos();
+        let hash = position.zobrist_hash();
+        let result = search_with_history(&mut position, 3, &MaterialEvaluator, &[hash, hash, hash]);
+        assert_eq!(result.score, 0);
+    }
+
+    #[test]
+    fn mvv_lva_orders_a_queen_capture_before_quiet_moves() {
+        let position = Position::from_fen("4k3/8/8/q7/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mut moves = position.generate_legal_moves();
+        order_moves(&position, &mut moves, &SearchState::default(), 0, None);
+        assert_eq!(moves[0].from(), "a1".parse().unwrap());
+        assert_eq!(moves[0].to(), "a5".parse().unwrap());
+    }
+
+    #[test]
+    fn transposition_table_reuses_a_completed_search() {
+        let mut position = Position::startpos();
+        let mut state = SearchState::default();
+        let mut path = vec![position.zobrist_hash()];
+        let mut nodes = 0;
+        let first = negamax(
+            &mut position,
+            3,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+        )
+        .unwrap();
+        let first_nodes = nodes;
+        let second = negamax(
+            &mut position,
+            3,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+        )
+        .unwrap();
+        assert_eq!(second.0, first.0);
+        assert_eq!(
+            nodes - first_nodes,
+            1,
+            "the second search should hit the TT at its root"
+        );
     }
 }

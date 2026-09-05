@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { checkLabAvailable } from "./labClient";
 import {
   MAX_STOCKFISH_ELO,
+  ENGINE_SETTING_DEFINITIONS,
   MIN_MOVE_TIME_MS,
   MIN_STOCKFISH_ELO,
   PARTICIPANT_LABELS,
@@ -9,6 +10,8 @@ import {
   validateParticipant,
   type Participant,
   type ParticipantKind,
+  type EngineSettingDefinition,
+  type EngineSettingValue,
 } from "./participant";
 
 const PARTICIPANT_KINDS: ParticipantKind[] = ["human", "stockfish", "bee", "bee-mamba"];
@@ -173,6 +176,95 @@ function ParticipantFields({
           Debug logging
         </label>
       )}
+      {"settings" in participant && (
+        <AdvancedEngineSettings
+          definitions={ENGINE_SETTING_DEFINITIONS[participant.kind] ?? []}
+          values={participant.settings}
+          onChange={(key, value) =>
+            onChange({ ...participant, settings: { ...participant.settings, [key]: value } })
+          }
+        />
+      )}
     </div>
+  );
+}
+
+/** Generic renderer for engine-specific options. The engine schema owns the
+ * labels, help text and input types; this component only edits an option map. */
+function AdvancedEngineSettings({
+  definitions,
+  values,
+  onChange,
+}: {
+  definitions: EngineSettingDefinition[];
+  values: Record<string, EngineSettingValue>;
+  onChange: (key: string, value: EngineSettingValue) => void;
+}) {
+  if (definitions.length === 0) return null;
+
+  return (
+    <details
+      open
+      style={{
+        width: "100%",
+        boxSizing: "border-box",
+        padding: 10,
+        border: "1px solid var(--border)",
+        borderRadius: 8,
+        textAlign: "left",
+      }}
+    >
+      <summary style={{ cursor: "pointer", color: "var(--text-h)", fontWeight: 600 }}>
+        Advanced settings
+      </summary>
+      <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
+        {definitions.map((definition) => (
+          <EngineSettingField
+            key={definition.key}
+            definition={definition}
+            value={values[definition.key]}
+            onChange={(value) => onChange(definition.key, value)}
+          />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function EngineSettingField({
+  definition,
+  value,
+  onChange,
+}: {
+  definition: EngineSettingDefinition;
+  value: EngineSettingValue | undefined;
+  onChange: (value: EngineSettingValue) => void;
+}) {
+  const control = definition.control;
+  return (
+    <label style={{ display: "grid", gap: 4 }}>
+      <span>{definition.label}</span>
+      {control.type === "select" && (
+        <select value={String(value ?? "")} onChange={(e) => onChange(e.target.value)}>
+          {control.options.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      )}
+      {control.type === "number" && (
+        <input
+          type="number"
+          value={typeof value === "number" ? value : ""}
+          min={control.min}
+          max={control.max}
+          step={control.step}
+          onChange={(e) => onChange(Number(e.target.value))}
+        />
+      )}
+      {control.type === "boolean" && (
+        <input type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
+      )}
+      <small style={{ color: "var(--text)", lineHeight: 1.35 }}>{definition.description}</small>
+    </label>
   );
 }

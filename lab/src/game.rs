@@ -518,7 +518,7 @@ pub struct EngineSpec {
 /// One engine-driven side's full configuration: which binary to spawn
 /// (`EngineSpec`), plus the `setoption`s and debug flag a UCI client
 /// could set directly -- e.g. Stockfish's `UCI_LimitStrength`/
-/// `UCI_Elo`, or Bee's debug diagnostics. Applied once, right after
+/// `UCI_Elo`, or Bee's evaluator selection/debug diagnostics. Applied once, right after
 /// the process's `uci`/`isready` handshake, before any `go` -- see
 /// `run_engine_loop`.
 #[derive(Debug, Clone)]

@@ -24,7 +24,12 @@ describe("defaultParticipant", () => {
   });
 
   it("bee defaults to 100ms, debug off", () => {
-    expect(defaultParticipant("bee")).toMatchObject({ kind: "bee", moveTimeMs: 100, debug: false });
+    expect(defaultParticipant("bee")).toMatchObject({
+      kind: "bee",
+      moveTimeMs: 100,
+      debug: false,
+      settings: { Evaluator: "Positional" },
+    });
   });
 
   it("bee-mamba defaults to 500ms", () => {
@@ -34,14 +39,24 @@ describe("defaultParticipant", () => {
 
 describe("validateParticipant", () => {
   it("rejects zero or negative move time for every bot kind", () => {
-    const zero: Participant = { kind: "bee", moveTimeMs: 0, debug: false };
+    const zero: Participant = {
+      kind: "bee",
+      moveTimeMs: 0,
+      debug: false,
+      settings: { Evaluator: "Positional" },
+    };
     const negative: Participant = { kind: "bee-mamba", moveTimeMs: -1 };
     expect(validateParticipant(zero)).not.toBeNull();
     expect(validateParticipant(negative)).not.toBeNull();
   });
 
   it("rejects a non-integer move time", () => {
-    const p: Participant = { kind: "bee", moveTimeMs: 50.5, debug: false };
+    const p: Participant = {
+      kind: "bee",
+      moveTimeMs: 50.5,
+      debug: false,
+      settings: { Evaluator: "Positional" },
+    };
     expect(validateParticipant(p)).not.toBeNull();
   });
 
@@ -82,5 +97,15 @@ describe("validateParticipant", () => {
   it("bee-mamba has no elo/debug field to validate beyond move time", () => {
     const p: Participant = { kind: "bee-mamba", moveTimeMs: 250 };
     expect(validateParticipant(p)).toBeNull();
+  });
+
+  it("rejects an unknown Bee evaluator", () => {
+    const p: Participant = {
+      kind: "bee",
+      moveTimeMs: 100,
+      debug: false,
+      settings: { Evaluator: "Unknown" },
+    };
+    expect(validateParticipant(p)).toMatch(/valid Bee evaluator/);
   });
 });

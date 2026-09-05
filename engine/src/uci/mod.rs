@@ -4,18 +4,17 @@
 //! stdin lines into typed commands and writes typed responses back to
 //! stdout. Per ADR 0001, no UCI strings may leak below this module.
 //!
-//! The bootstrap PR implements only the minimal handshake (`uci`,
-//! `isready`, `quit`) needed for a real, talkable-to engine process. The
-//! full asynchronous state machine (`setoption`, `ucinewgame`, `position`,
-//! `go`, `stop`, `ponderhit`, concurrent input handling while searching)
-//! lands in a follow-up PR (`feat/uci-state-machine`).
+//! The engine supports the handshake, evaluator selection via `setoption`,
+//! position setup, and synchronous searches. The remaining pieces of a
+//! full asynchronous state machine (`stop`, `ponderhit`, and concurrent
+//! input handling while searching) land in a follow-up milestone.
 
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
-use crate::engine::Engine;
+use crate::engine::{Engine, EvaluatorKind};
 use crate::search::mate_in_plies;
 
 pub const ENGINE_NAME: &str = "bee-chess";
@@ -206,6 +205,7 @@ pub enum UciCommand {
     Uci,
     IsReady,
     Debug(bool),
+    SetOption { name: String, value: String },
     NewGame,
     Position(PositionCommand),
     Go(GoCommand),
@@ -234,11 +234,24 @@ impl UciCommand {
                 match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["debug", "on"] => UciCommand::Debug(true),
                     ["debug", "off"] => UciCommand::Debug(false),
-                    _ => UciCommand::Unknown(line.to_string()),
+                    _ => parse_setoption(line)
+                        .unwrap_or_else(|| UciCommand::Unknown(line.to_string())),
                 }
             }
         }
     }
+}
+
+fn parse_setoption(line: &str) -> Option<UciCommand> {
+    let rest = line.strip_prefix("setoption name ")?;
+    let (name, value) = rest.split_once(" value ")?;
+    if name.trim().is_empty() || value.trim().is_empty() {
+        return None;
+    }
+    Some(UciCommand::SetOption {
+        name: name.trim().to_string(),
+        value: value.trim().to_string(),
+    })
 }
 
 /// Formats a move as UCI long algebraic notation, e.g. `e2e4` or
@@ -317,6 +330,7 @@ pub fn run<R: BufRead, W: Write>(
             UciCommand::Uci => {
                 writeln!(output, "id name {ENGINE_NAME}")?;
                 writeln!(output, "id author {ENGINE_AUTHOR}")?;
+                writeln!(output, "option name Evaluator type combo default Positional var Positional var Material")?;
                 writeln!(output, "uciok")?;
             }
             UciCommand::IsReady => {
@@ -324,6 +338,23 @@ pub fn run<R: BufRead, W: Write>(
             }
             UciCommand::Debug(on) => {
                 engine.set_debug(on);
+            }
+            UciCommand::SetOption { name, value } => {
+                if name.eq_ignore_ascii_case("Evaluator") {
+                    if let Some(evaluator) = EvaluatorKind::parse(&value) {
+                        engine.set_evaluator(evaluator);
+                    } else {
+                        engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid Evaluator value: {value}"),
+                        );
+                    }
+                } else {
+                    engine.emit_diagnostic(
+                        DiagnosticLevel::Info,
+                        format!("ignored unknown UCI option: {name}"),
+                    );
+                }
             }
             UciCommand::NewGame => {
                 engine.new_game();
@@ -643,6 +674,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_setoption_with_multiword_name_and_value() {
+        assert_eq!(
+            UciCommand::parse("setoption name Future Evaluator value Some Model"),
+            UciCommand::SetOption {
+                name: "Future Evaluator".to_string(),
+                value: "Some Model".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn uci_handshake_produces_expected_output() {
         let input = b"uci\nisready\nquit\n".as_slice();
         let mut output = Vec::new();
@@ -651,8 +693,27 @@ mod tests {
         let text = String::from_utf8(output).expect("output should be valid utf8");
         assert!(text.contains(&format!("id name {ENGINE_NAME}")));
         assert!(text.contains(&format!("id author {ENGINE_AUTHOR}")));
+        assert!(text.contains("option name Evaluator type combo default Positional"));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
+    }
+
+    #[test]
+    fn setoption_changes_the_evaluator() {
+        let input = b"setoption name Evaluator value Material\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.evaluator(), EvaluatorKind::Material);
+    }
+
+    #[test]
+    fn invalid_evaluator_keeps_the_current_evaluator() {
+        let input = b"setoption name Evaluator value Unknown\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.evaluator(), EvaluatorKind::Positional);
     }
 
     #[test]
