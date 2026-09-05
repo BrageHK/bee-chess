@@ -36,6 +36,7 @@ def make_handler(argv, cwd):
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
         )
 
@@ -43,13 +44,34 @@ def make_handler(argv, cwd):
             while line := await proc.stdout.readline():
                 await ws.send(line.decode().rstrip())
 
-        task = asyncio.create_task(pump())
+        async def watch_for_exit():
+            """If the process dies (e.g. a missing Python module, a bad
+            checkpoint path) -- especially right away, before ever
+            printing a UCI reply -- neither `pump()` (its readline()
+            just returns empty) nor the `async for msg in ws` loop
+            below notices on their own: the browser is left waiting
+            forever for a reply that will never come, and the socket
+            never closes to tell it otherwise. This actively closes
+            the socket once the process exits, after relaying whatever
+            it printed to stderr as one diagnostic line so the reason
+            is visible instead of a silent disconnect."""
+            returncode = await proc.wait()
+            stderr = (await proc.stderr.read()).decode(errors="replace").strip()
+            reason = stderr.splitlines()[-1] if stderr else f"exited with code {returncode}"
+            with contextlib.suppress(Exception):
+                await ws.send(f"info string engine process exited: {reason}")
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+        pump_task = asyncio.create_task(pump())
+        watch_task = asyncio.create_task(watch_for_exit())
         try:
             async for msg in ws:
                 proc.stdin.write((msg + "\n").encode())
                 await proc.stdin.drain()
         finally:
-            task.cancel()
+            pump_task.cancel()
+            watch_task.cancel()
             proc.kill()
 
     return handle
