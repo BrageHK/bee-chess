@@ -9,12 +9,16 @@ development/visualization only. See
 [`docs/adr/0001-v1-engine-architecture.md`](docs/adr/0001-v1-engine-architecture.md)
 for the full architecture decision.
 
-Two things currently connect the frontend to engine processes over
-WebSockets: `bridge/` (Python, the original, still what `./scripts/dev.sh`
-uses) and `lab/` (Rust, newer -- see #67/#68). `lab/` is being built out
-to eventually replace `bridge/` and become authoritative for game state
-too, not just a dumb relay; until that migration is further along, both
-exist and either works standalone. See [`lab/README.md`](lab/README.md).
+The frontend talks to `lab/` (Rust -- see #67), which serves the UI,
+owns authoritative game state (position, moves, status, and which
+engine or human plays each side -- see #69), and supervises Stockfish/
+Bee as subprocesses. `bridge/` (Python) was the original, dumber
+WebSocket relay this replaced; the frontend no longer uses it at all
+as of #69's migration (`./scripts/dev.sh` starts `lab/`, not
+`bridge/`). It's still in the repo, not yet deleted -- see #68 -- but
+is legacy at this point, kept only until its remaining open threads
+(Bee-Mamba's integration, #66/#70) are resolved through `lab/` instead.
+See [`lab/README.md`](lab/README.md).
 
 ## Repository layout
 
@@ -24,8 +28,8 @@ bee-chess/
 ├── chess/             Canonical chess-domain crate (Position/Move/legality/FEN/Zobrist), shared by engine/ and lab/
 ├── engine/            Rust UCI engine (competition hot path)
 ├── training/          Python training and dataset generation
-├── bridge/            Development-only WebSocket <-> UCI bridge (Python)
-├── lab/               Development/orchestration server (Rust), replacing bridge/ -- see #67
+├── bridge/            Legacy WebSocket <-> UCI bridge (Python), superseded by lab/ -- see #67/#69
+├── lab/               Orchestration server (Rust): serves the UI, owns game state, supervises engines
 ├── frontend/          React development/visualization client
 ├── scripts/           Repo-level setup/dev/check/test entry points
 └── .github/workflows  CI
@@ -40,28 +44,37 @@ server-side (#69).
 
 ```bash
 ./scripts/setup.sh  # one-time: creates every subproject's environment
-./scripts/dev.sh    # build the engines, start the bridge and the UI
+./scripts/dev.sh    # build the engines, start Bee Lab and the UI
 ./scripts/check.sh  # everything CI checks, run locally
 ./scripts/test.sh   # just the test suites
+```
+
+`./scripts/dev.sh` starts Bee Lab on `:8080` by default; if something
+else already has that port (Docker Desktop commonly does), override it
+for both sides at once:
+
+```bash
+LAB_PORT=8081 ./scripts/dev.sh
 ```
 
 Each subproject also works with its own native tooling directly:
 
 ```bash
 # Engine
-cd engine && cargo run --release --bin bee
+cargo run --release -p bee-engine --bin bee
 
 # Training
 cd training && uv sync && uv run pytest
 
-# Bridge (development WebSocket <-> UCI adapter, Python)
-cd bridge && uv sync && uv run python server.py
-
-# Lab (development/orchestration server, Rust -- see lab/README.md)
+# Lab (orchestration server, Rust -- see lab/README.md)
 cargo run -p bee-lab
+# or, if :8080 is taken:
+PORT=8081 cargo run -p bee-lab
 
-# Frontend
-cd frontend && npm install && npm run build
+# Frontend (talks to Lab on :8080 by default -- see labClient.ts)
+cd frontend && npm install && npm run dev
+# or, matching a non-default Lab port:
+VITE_LAB_PORT=8081 npm run dev
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development rules and branch
@@ -74,6 +87,7 @@ git submodule update --init --recursive
 ./scripts/dev.sh
 ```
 
-This builds Stockfish and Bee (first run only takes a few minutes for
-Stockfish), starts the WebSocket bridge, and opens the frontend dev
-server, which plays the two engines against each other.
+This builds Stockfish, Bee, and Bee Lab (first run only takes a few
+minutes for Stockfish), starts Lab, and opens the frontend dev server --
+pick Stockfish vs Bee on the setup screen and Lab plays them against
+each other, driving both engine processes itself.

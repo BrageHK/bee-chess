@@ -20,7 +20,12 @@ fi
 echo "==> training: syncing Python environment (training/.venv)"
 (cd training && uv sync)
 
-echo "==> bridge: syncing Python environment (bridge/.venv)"
+# bridge/server.py (Python) is the pre-#67 UCI bridge, superseded by
+# lab/ (Rust) as of #69's frontend migration -- the frontend no longer
+# talks to it at all. Still synced here since the code hasn't been
+# deleted yet (see #68's explicit "not deleted in this PR" decision),
+# but ./scripts/dev.sh no longer starts it.
+echo "==> bridge: syncing Python environment (bridge/.venv, legacy -- see lab/)"
 (cd bridge && uv sync)
 
 echo "==> frontend: installing npm dependencies"
@@ -33,5 +38,5 @@ fi
 
 echo
 echo "Setup complete. Open bee-chess.code-workspace in VS Code, then:"
-echo "  ./scripts/dev.sh    # build engines, start the bridge and the UI"
+echo "  ./scripts/dev.sh    # build engines, start Bee Lab and the UI"
 echo "  ./scripts/check.sh  # run every subproject's lint/format/test checks"
