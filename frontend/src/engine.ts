@@ -178,3 +178,4 @@ export class UciClient {
 
 export const whiteEngine = new UciClient("ws://localhost:8765", "stockfish");
 export const blackEngine = new UciClient("ws://localhost:8766", "bee");
+export const mambaEngine = new UciClient("ws://localhost:8767", "bee-mamba");
