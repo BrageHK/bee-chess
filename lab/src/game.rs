@@ -140,19 +140,37 @@ pub enum GameResult {
     Draw,
 }
 
+/// Which kind of participant plays one side, and enough about it for
+/// a client to reconstruct its own UI after a refresh without needing
+/// to have remembered anything itself -- see `GameSnapshot`'s docs on
+/// why this belongs in the authoritative snapshot rather than
+/// something the frontend persists on its own (e.g. in the URL or
+/// `sessionStorage`): "who is playing this side" is part of what the
+/// game *is*, exactly like its position or move list, not incidental
+/// client-side routing state.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParticipantInfo {
+    Human,
+    Engine {
+        /// The name this engine was requested by (e.g. `"stockfish"`,
+        /// `"bee"`) -- see `api::EngineRegistry`/`ParticipantRequest`.
+        name: String,
+        debug: bool,
+    },
+}
+
 /// One game: the authoritative position, its full move list (UCI long
-/// algebraic, e.g. `"e2e4"`/`"e7e8q"`), and lifecycle status.
-///
-/// Deliberately does not story any engine/process handles yet -- 69b
-/// adds those. This slice only needs `Game` to be a correct state
-/// machine over moves, provable independently of anything about
-/// engines.
+/// algebraic, e.g. `"e2e4"`/`"e7e8q"`), lifecycle status, and which
+/// kind of participant plays each side.
 #[derive(Debug, Clone)]
 pub struct Game {
     pub id: GameId,
     position: Position,
     moves: Vec<String>,
     status: GameStatus,
+    white_participant: ParticipantInfo,
+    black_participant: ParticipantInfo,
 }
 
 /// Why `Game::apply_move` refused a move -- carries enough detail for
@@ -165,20 +183,26 @@ pub enum ApplyMoveError {
 }
 
 impl Game {
-    /// Starts a new game from the standard starting position.
-    pub fn new() -> Self {
+    /// Starts a new game from the standard starting position, with
+    /// `white`/`black` recorded as this game's participants (see
+    /// `ParticipantInfo`).
+    pub fn new(white: ParticipantInfo, black: ParticipantInfo) -> Self {
         Game {
             id: GameId::new(),
             position: Position::startpos(),
             moves: Vec::new(),
             status: GameStatus::Running,
+            white_participant: white,
+            black_participant: black,
         }
     }
 
     /// Test-only: starts a game from an arbitrary position, so
     /// terminal-status handling (checkmate/stalemate) can be tested
     /// directly against a hand-picked FEN instead of needing a real
-    /// legal move sequence that happens to reach one.
+    /// legal move sequence that happens to reach one. Participants
+    /// default to human/human -- irrelevant to what this constructor
+    /// exists to test.
     #[cfg(test)]
     fn from_position(position: Position) -> Self {
         let mut game = Game {
@@ -186,6 +210,8 @@ impl Game {
             position,
             moves: Vec::new(),
             status: GameStatus::Running,
+            white_participant: ParticipantInfo::Human,
+            black_participant: ParticipantInfo::Human,
         };
         game.update_status_after_move();
         game
@@ -201,6 +227,14 @@ impl Game {
 
     pub fn moves(&self) -> &[String] {
         &self.moves
+    }
+
+    pub fn white_participant(&self) -> &ParticipantInfo {
+        &self.white_participant
+    }
+
+    pub fn black_participant(&self) -> &ParticipantInfo {
+        &self.black_participant
     }
 
     /// Whose turn it currently is, independent of `status` -- callers
@@ -276,12 +310,6 @@ impl Game {
     }
 }
 
-impl Default for Game {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Parses a UCI move token (`"e2e4"` or `"e7e8q"`) into (from, to,
 /// promotion), not checking legality -- same shape as
 /// `bee_engine::uci::UciMove::parse`, kept small and local here rather
@@ -312,12 +340,21 @@ fn parse_uci_move(s: &str) -> Option<(Square, Square, Option<PieceKind>)> {
 /// A complete, self-sufficient snapshot of one game -- the shape
 /// `GET /api/games/:id` returns. The primary resync mechanism per #69:
 /// a client that just (re)connected renders this directly, with no
-/// need to have seen any prior event.
+/// need to have seen any prior event *or remembered anything about the
+/// game itself*. That last part is why `white`/`black` are included:
+/// "who is playing this side" is authoritative game configuration, not
+/// client-side routing state -- a browser resuming a game after a
+/// refresh (by persisting only the game id, e.g. in the URL) needs
+/// this to reconstruct its own UI (is this side a human who can drag
+/// pieces? which engine's eval bar is this?) without the frontend
+/// having separately remembered `Participant` configuration on its own.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GameSnapshot {
     pub id: GameId,
     pub fen: String,
     pub moves: Vec<String>,
+    pub white: ParticipantInfo,
+    pub black: ParticipantInfo,
     #[serde(flatten)]
     pub status: GameStatus,
 }
@@ -328,6 +365,8 @@ impl From<&Game> for GameSnapshot {
             id: game.id,
             fen: game.fen(),
             moves: game.moves().to_vec(),
+            white: game.white_participant().clone(),
+            black: game.black_participant().clone(),
             status: game.status().clone(),
         }
     }
@@ -355,9 +394,10 @@ impl GameStore {
         Self::default()
     }
 
-    /// Creates a new game and returns its snapshot.
-    pub fn create(&self) -> GameSnapshot {
-        let game = Game::new();
+    /// Creates a new game with `white`/`black` as its participants
+    /// (see `ParticipantInfo`) and returns its snapshot.
+    pub fn create(&self, white: ParticipantInfo, black: ParticipantInfo) -> GameSnapshot {
+        let game = Game::new(white, black);
         let snapshot = GameSnapshot::from(&game);
         let id = game.id;
         self.games
@@ -645,7 +685,7 @@ mod tests {
 
     #[test]
     fn new_game_starts_at_the_standard_position() {
-        let game = Game::new();
+        let game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         assert_eq!(game.fen(), Position::startpos().to_fen());
         assert!(game.moves().is_empty());
         assert_eq!(game.status(), &GameStatus::Running);
@@ -653,7 +693,7 @@ mod tests {
 
     #[test]
     fn legal_move_updates_position_and_move_list() {
-        let mut game = Game::new();
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         game.apply_move("e2e4")
             .expect("e2e4 should be legal from startpos");
 
@@ -664,7 +704,7 @@ mod tests {
 
     #[test]
     fn illegal_move_is_rejected_and_state_is_unchanged() {
-        let mut game = Game::new();
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         let before_fen = game.fen();
 
         let result = game.apply_move("e2e5"); // not a legal pawn move
@@ -676,7 +716,7 @@ mod tests {
 
     #[test]
     fn malformed_move_text_is_rejected() {
-        let mut game = Game::new();
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         let result = game.apply_move("not a move");
         assert_eq!(result, Err(ApplyMoveError::NotAWellFormedMove));
     }
@@ -684,7 +724,7 @@ mod tests {
     #[test]
     fn checkmate_finishes_the_game_with_the_mating_sides_win() {
         // Fool's mate: fastest possible checkmate, White gets mated.
-        let mut game = Game::new();
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         for mv in ["f2f3", "e7e5", "g2g4", "d8h4"] {
             game.apply_move(mv)
                 .expect("scholar/fool's mate setup should be legal");
@@ -700,7 +740,7 @@ mod tests {
 
     #[test]
     fn a_move_after_the_game_is_finished_is_rejected() {
-        let mut game = Game::new();
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
         for mv in ["f2f3", "e7e5", "g2g4", "d8h4"] {
             game.apply_move(mv).expect("setup move should be legal");
         }
@@ -733,7 +773,7 @@ mod tests {
     #[test]
     fn game_store_create_then_snapshot_round_trips() {
         let store = GameStore::new();
-        let created = store.create();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
 
         let snapshot = store
             .snapshot(created.id)
@@ -741,6 +781,30 @@ mod tests {
         assert_eq!(snapshot.id, created.id);
         assert_eq!(snapshot.fen, Position::startpos().to_fen());
         assert!(snapshot.moves.is_empty());
+    }
+
+    #[test]
+    fn game_snapshot_carries_participant_info_for_both_sides() {
+        // This is what lets a client resume a game after a refresh by
+        // persisting only the game id (e.g. in the URL): the snapshot
+        // alone must be enough to reconstruct "who is playing this
+        // side," not something the client has to have remembered
+        // itself -- see GameSnapshot's own docs.
+        let store = GameStore::new();
+        let white = ParticipantInfo::Engine {
+            name: "stockfish".to_string(),
+            debug: false,
+        };
+        let black = ParticipantInfo::Human;
+
+        let created = store.create(white.clone(), black.clone());
+
+        assert_eq!(created.white, white);
+        assert_eq!(created.black, black);
+
+        let refetched = store.snapshot(created.id).unwrap();
+        assert_eq!(refetched.white, white);
+        assert_eq!(refetched.black, black);
     }
 
     #[test]
@@ -752,7 +816,7 @@ mod tests {
     #[test]
     fn game_store_apply_move_updates_the_stored_game() {
         let store = GameStore::new();
-        let created = store.create();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
 
         let snapshot = store
             .apply_move(created.id, "e2e4")
@@ -775,7 +839,7 @@ mod tests {
     #[test]
     fn game_store_apply_move_illegal_is_err_some() {
         let store = GameStore::new();
-        let created = store.create();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
         let result = store.apply_move(created.id, "e2e5");
         assert_eq!(result, Err(Some(ApplyMoveError::IllegalMove)));
     }

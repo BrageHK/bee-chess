@@ -30,7 +30,9 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::game::{ApplyMoveError, EngineConfig, EngineSlots, GameEvent, GameSnapshot, GameStore};
+use crate::game::{
+    ApplyMoveError, EngineConfig, EngineSlots, GameEvent, GameSnapshot, GameStore, ParticipantInfo,
+};
 use crate::uci_process::UciDirection;
 use crate::uci_relay::EngineSpec;
 
@@ -182,7 +184,16 @@ async fn create_game(
         }
     };
 
-    let snapshot = state.store.create();
+    // Derived from the request directly (not from `white`/`black`
+    // above) so a game's recorded participant info reflects what was
+    // actually asked for even independent of engine-name resolution --
+    // moot in practice since an unknown name already returned 400
+    // above, but keeps this derivation simple and total rather than
+    // needing to unwrap an `Option<EngineConfig>` back into a name.
+    let white_info = participant_info(&request.white);
+    let black_info = participant_info(&request.black);
+
+    let snapshot = state.store.create(white_info, black_info);
     let slots = EngineSlots { white, black };
     if slots.any_engine() {
         let move_time_ms = request.move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS);
@@ -195,6 +206,16 @@ async fn create_game(
     }
 
     (StatusCode::CREATED, Json(snapshot)).into_response()
+}
+
+fn participant_info(participant: &Option<ParticipantRequest>) -> ParticipantInfo {
+    match participant {
+        None => ParticipantInfo::Human,
+        Some(participant) => ParticipantInfo::Engine {
+            name: participant.engine_name().to_string(),
+            debug: participant.debug(),
+        },
+    }
 }
 
 async fn get_game(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -400,6 +421,40 @@ mod tests {
         assert_eq!(body["status"], "running");
         assert_eq!(body["moves"], serde_json::json!([]));
         assert!(body["fen"].as_str().unwrap().starts_with("rnbqkbnr/"));
+        assert_eq!(body["white"], serde_json::json!({"kind": "human"}));
+        assert_eq!(body["black"], serde_json::json!({"kind": "human"}));
+    }
+
+    #[tokio::test]
+    async fn post_games_snapshot_carries_engine_participant_info() {
+        // What lets a client resume a game after a refresh (persisting
+        // only the game id) reconstruct which side is engine-driven
+        // and with what config, without having remembered it itself.
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"white": {"engine": "fake", "debug": true}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["white"],
+            serde_json::json!({"kind": "engine", "name": "fake", "debug": true})
+        );
+        assert_eq!(body["black"], serde_json::json!({"kind": "human"}));
     }
 
     #[tokio::test]
@@ -740,7 +795,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
         let store = GameStore::new();
-        let created = store.create();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
         let base_url = spawn_real_server(store.clone(), EngineRegistry::new()).await;
 
         let (mut ws, _) =
