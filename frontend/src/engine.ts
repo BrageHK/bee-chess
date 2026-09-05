@@ -193,6 +193,13 @@ export class UciClient {
     this.logSent(cmd);
     this.ws?.send(cmd);
   }
+
+  /** Closes the underlying WebSocket, ending the bridge's engine
+   * process for this connection. Safe to call even if `init` was
+   * never called. */
+  close(): void {
+    this.ws?.close();
+  }
 }
 
 /** The bots the bridge can spawn a process for. Excludes "human", which

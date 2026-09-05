@@ -8,6 +8,7 @@ import { Chessground } from "./Chessground";
 import { createBotClient, type UciClient } from "./engine";
 import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
+import { EvalBar } from "./EvalBar";
 import type { Participant } from "./participant";
 
 /** Claim a draw once the fifty-move counter is full; chessops does not. */
@@ -158,8 +159,11 @@ export function Game({
   // checked before ever touching shared refs/state and at every
   // meaningful await boundary, so a StrictMode-aborted first run's
   // continuations become no-ops instead of a second, racing game loop.
+  // `createdClients` lets the cleanup close every client this run
+  // opened, even ones aborted before `runBotTurns` ever started.
   useEffect(() => {
     let cancelled = false;
+    const createdClients: UciClient[] = [];
 
     void (async () => {
       setStatus("connecting to the bridge…");
@@ -169,6 +173,7 @@ export function Game({
         const participant = participantFor(color);
         if (participant.kind === "human") continue;
         const client = createBotClient(participant.kind);
+        createdClients.push(client);
         if (cancelled) return; // aborted before this slot's client could be tracked
         clientsRef.current[color] = client;
         pending.push(client.init());
@@ -192,6 +197,7 @@ export function Game({
         setFinished(true);
         return;
       }
+      if (cancelled) return;
 
       if (cancelled) return;
       syncBoardState();
@@ -200,6 +206,7 @@ export function Game({
 
     return () => {
       cancelled = true;
+      for (const client of createdClients) client.close();
     };
     // Intentionally empty deps: white/black/onBackToSetup are fixed
     // for this component's lifetime (a new game remounts it via a
@@ -240,24 +247,32 @@ export function Game({
       <h1>
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
-      <Chessground
-        config={{
-          fen,
-          lastMove,
-          // Default `coordinates: true` floats rank/file labels a few px
-          // inside the board's own edge, overlapping back-rank pieces on
-          // our fixed 480x480 board (#51). on-square labels avoid that.
-          coordinatesOnSquares: true,
-          viewOnly: canMoveColor === null,
-          turnColor: turn,
-          movable: {
-            free: false,
-            color: canMoveColor ?? undefined,
-            dests: canMoveColor ? dests : new Map(),
-            events: { after: onHumanMove },
-          },
-        }}
-      />
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+        {clientFor("white") && (
+          <EvalBar color="white" subscribe={(l) => clientFor("white")!.onLog(l)} />
+        )}
+        <Chessground
+          config={{
+            fen,
+            lastMove,
+            // Default `coordinates: true` floats rank/file labels a few px
+            // inside the board's own edge, overlapping back-rank pieces on
+            // our fixed 480x480 board (#51). on-square labels avoid that.
+            coordinatesOnSquares: true,
+            viewOnly: canMoveColor === null,
+            turnColor: turn,
+            movable: {
+              free: false,
+              color: canMoveColor ?? undefined,
+              dests: canMoveColor ? dests : new Map(),
+              events: { after: onHumanMove },
+            },
+          }}
+        />
+        {clientFor("black") && (
+          <EvalBar color="black" subscribe={(l) => clientFor("black")!.onLog(l)} />
+        )}
+      </div>
       <p>{status}</p>
       {finished && <button onClick={onBackToSetup}>New game</button>}
       <BotPanels color="white" participant={white} client={clientFor("white")} />

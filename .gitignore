@@ -11,6 +11,7 @@
 /training/data/
 /training/books/
 /training/checkpoints/
+/training/logs/
 /bridge/.venv/
 /bridge/.pytest_cache/
 /bridge/.ruff_cache/
