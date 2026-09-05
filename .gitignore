@@ -5,6 +5,10 @@
 /training/.venv/
 /training/.pytest_cache/
 /training/.ruff_cache/
+/training/.cache/
+/training/data/
+/training/books/
+/training/checkpoints/
 /bridge/.venv/
 /bridge/.pytest_cache/
 /bridge/.ruff_cache/

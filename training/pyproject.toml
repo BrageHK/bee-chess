@@ -2,8 +2,19 @@
 name = "bee-training"
 version = "0.1.0"
 description = "Bee Chess training and dataset generation"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "chess>=1.11.0",
+    "httpx>=0.28.0",
+    "tqdm>=4.66.0",
+    "mambapy>=1.2.0",
+    "triton-rocm>=3.8.0,<3.9 ; sys_platform == 'linux'",
+]
+
+[project.scripts]
+bee-training = "bee_training.cli:main"
 
 [dependency-groups]
 dev = [
@@ -17,3 +28,13 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 100
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-rocm" }]
+torchvision = [{ index = "pytorch-rocm" }]
+triton-rocm = [{ index = "pytorch-rocm" }]
