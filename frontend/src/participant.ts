@@ -1,9 +1,10 @@
 /**
  * One board slot's participant: a human, or one of the bots, each with
  * its own per-slot config. Independent per slot -- picking the same
- * bot kind for both slots creates two separate engine instances (see
- * `createBotClient` in engine.ts), each with its own move-time/Elo/
- * debug settings, not a shared one.
+ * bot kind for both slots creates two separate Bee Lab-driven engine
+ * instances (`Game.tsx`'s `toParticipantRequest`, one per side, see
+ * #69/67b), each with its own move-time/Elo/debug settings, not a
+ * shared one.
  */
 
 export const MIN_MOVE_TIME_MS = 1;
