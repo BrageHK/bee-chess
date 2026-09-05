@@ -19,6 +19,17 @@ pub struct Engine {
     debug: bool,
     position: Position,
     diagnostics: DiagnosticBuffer,
+    /// Zobrist hash of every position reached so far in the current
+    /// game, in order, including the current position as the last
+    /// entry -- what `is_threefold_repetition` checks against. Reset
+    /// (not appended to) by `set_position`, since a UCI `position`
+    /// command always resends the *entire* move list from a base
+    /// position rather than incrementally extending the previous one
+    /// (see `uci::PositionCommand::resolve`), so replaying it here
+    /// would double-count. Only hashes are kept, not full `Position`
+    /// clones, since a repetition check only needs "was this exact
+    /// position reached before," not the position itself.
+    position_history: Vec<u64>,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -28,10 +39,13 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Self {
+        let position = Position::startpos();
+        let position_history = vec![position.zobrist_hash()];
         Self {
             debug: false,
-            position: Position::startpos(),
+            position,
             diagnostics: DiagnosticBuffer::new(),
+            position_history,
         }
     }
 
@@ -54,12 +68,35 @@ impl Engine {
         self.diagnostics.drain()
     }
 
+    /// Replaces the current position and resets game history to just
+    /// this one position -- see `position_history`'s docs on why this
+    /// resets rather than appends. A `position` command with a `moves`
+    /// suffix rebuilds the rest of that history one `apply_move` call
+    /// at a time after this.
     pub fn set_position(&mut self, position: Position) {
+        self.position_history = vec![position.zobrist_hash()];
         self.position = position;
     }
 
     pub fn position(&self) -> &Position {
         &self.position
+    }
+
+    /// Whether the current position has now occurred for the third
+    /// (or more) time in the game so far, per FIDE's threefold
+    /// repetition rule -- a draw either side can claim. Compares
+    /// Zobrist hashes, not full positions: two positions with the same
+    /// hash are treated as the same position, which is what the hash
+    /// is for (see `Position::zobrist_hash`'s docs on its very small
+    /// false-positive surface around unusable en passant squares).
+    #[must_use]
+    pub fn is_threefold_repetition(&self) -> bool {
+        let current = self.position.zobrist_hash();
+        self.position_history
+            .iter()
+            .filter(|&&hash| hash == current)
+            .count()
+            >= 3
     }
 
     pub fn set_debug(&mut self, debug: bool) {
@@ -70,14 +107,15 @@ impl Engine {
         self.debug
     }
 
-    /// Resets game/search-specific engine state (search history, TT
-    /// generation, and similar, once those exist) for a new game. This
-    /// does **not** set the board to the starting position -- UCI's
-    /// `ucinewgame` is always followed by a `position` command that
-    /// establishes the actual position, so doing that here too would
-    /// just be redundant with (and potentially race) that follow-up
-    /// command. For now, with no such state yet to reset, this is a
-    /// deliberate no-op.
+    /// Resets game/search-specific engine state (TT generation and
+    /// similar, once that exists) for a new game. This does **not**
+    /// reset `position_history` or set the board to the starting
+    /// position -- UCI's `ucinewgame` is always followed by a
+    /// `position` command that establishes the actual position (and,
+    /// via `set_position`, resets history to just that position), so
+    /// doing either here too would just be redundant with (and
+    /// potentially race) that follow-up command. For now, with no other
+    /// such state yet to reset, this is a deliberate no-op.
     pub fn new_game(&mut self) {}
 
     /// Applies a single move to the current position, given as UCI-style
@@ -104,6 +142,7 @@ impl Engine {
         match matching_move {
             Some(mv) => {
                 self.position.make_move(mv);
+                self.position_history.push(self.position.zobrist_hash());
                 Ok(())
             }
             None => Err(IllegalMoveError {
@@ -368,5 +407,98 @@ mod tests {
             "should complete more than one depth in 200ms"
         );
         assert_eq!(depths_seen.first(), Some(&1));
+    }
+
+    #[test]
+    fn new_engine_is_not_a_repetition() {
+        // Startpos has only occurred once so far -- nowhere close to
+        // threefold.
+        let engine = Engine::new();
+        assert!(!engine.is_threefold_repetition());
+    }
+
+    #[test]
+    fn shuffling_knights_back_to_the_same_position_three_times_is_a_repetition() {
+        // Nf3 Nf6 Ng1 Ng8, repeated twice more: each full four-move
+        // cycle returns to the exact starting position (same board,
+        // same side to move, same castling rights -- nobody's king or
+        // rook moved, so rights are untouched -- and no pawn move/
+        // capture ever happens, so this is legal repetition, not just a
+        // hash coincidence). Startpos itself is occurrence 1; two more
+        // cycles bring it to 3.
+        let mut engine = Engine::new();
+
+        for _ in 0..2 {
+            engine
+                .apply_move(
+                    Square::from_file_rank(6, 0),
+                    Square::from_file_rank(5, 2),
+                    None,
+                ) // Ng1-f3
+                .expect("Nf3 should be legal");
+            engine
+                .apply_move(
+                    Square::from_file_rank(6, 7),
+                    Square::from_file_rank(5, 5),
+                    None,
+                ) // Ng8-f6
+                .expect("Nf6 should be legal");
+            engine
+                .apply_move(
+                    Square::from_file_rank(5, 2),
+                    Square::from_file_rank(6, 0),
+                    None,
+                ) // Nf3-g1
+                .expect("Ng1 should be legal");
+            engine
+                .apply_move(
+                    Square::from_file_rank(5, 5),
+                    Square::from_file_rank(6, 7),
+                    None,
+                ) // Nf6-g8
+                .expect("Ng8 should be legal");
+        }
+
+        // Board/side-to-move/castling-rights/en-passant match startpos
+        // exactly -- the fields Zobrist hashing (and so repetition)
+        // actually cares about. `halfmove_clock`/`fullmove_number`
+        // correctly do *not* match (eight non-pawn, non-capture moves
+        // were played, and four full moves elapsed): those are real
+        // FIDE-rule counters, not part of what makes two positions "the
+        // same" for repetition purposes, so `Position`'s own
+        // `PartialEq` -- which does compare them -- is the wrong check
+        // here; `zobrist_hash` is the one that matters.
+        assert_eq!(
+            engine.position().zobrist_hash(),
+            Position::startpos().zobrist_hash()
+        );
+        assert!(engine.is_threefold_repetition());
+    }
+
+    #[test]
+    fn set_position_resets_repetition_history() {
+        // A `position` command always resends the whole move list from
+        // a base position (see `position_history`'s docs) -- a fresh
+        // `set_position` call must not let history from a previous
+        // `position` command linger and cause a false repetition match.
+        let mut engine = Engine::new();
+        engine
+            .apply_move(
+                Square::from_file_rank(6, 0),
+                Square::from_file_rank(5, 2),
+                None,
+            ) // Nf3
+            .expect("Nf3 should be legal");
+        engine
+            .apply_move(
+                Square::from_file_rank(6, 7),
+                Square::from_file_rank(5, 5),
+                None,
+            ) // Nf6
+            .expect("Nf6 should be legal");
+
+        engine.set_position(Position::startpos());
+
+        assert!(!engine.is_threefold_repetition());
     }
 }
