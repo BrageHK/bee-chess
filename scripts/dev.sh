@@ -9,17 +9,48 @@
 # bridge here instead would start the wrong backend entirely: the UI would
 # load, but every request would go to a port nothing is listening on.
 #
-# Override the port with LAB_PORT if :8080 is already taken on this
-# machine (Docker Desktop commonly claims it) -- this passes the same
-# value to both Bee Lab (its own PORT env var) and the frontend
-# (VITE_LAB_PORT), which otherwise aren't linked automatically:
+# :8080 is commonly already taken on a dev machine (Docker Desktop claims
+# it by default) -- rather than failing outright (a raw port-bind panic
+# out of Bee Lab, with no indication *why* the UI then shows "Bee Lab
+# doesn't seem to be running"), this script itself checks :8080 first and
+# picks the next free port automatically if it's busy, no LAB_PORT needed.
+# Set LAB_PORT explicitly to force a specific port instead (still passed
+# to both Bee Lab's own PORT env var and the frontend's VITE_LAB_PORT,
+# which otherwise aren't linked automatically):
 #   LAB_PORT=8081 ./scripts/dev.sh
 set -euo pipefail
 
-LAB_PORT="${LAB_PORT:-8080}"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Whether `port` looks free: nothing accepts a TCP connection on it right
+# now. Not perfectly race-free (something could grab it between this
+# check and Bee Lab actually binding a moment later), but good enough to
+# avoid the common case (a long-running unrelated service already using
+# :8080) without needing a human to notice and pick a port themselves.
+port_is_free() {
+  ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+if [ -n "${LAB_PORT:-}" ]; then
+  echo "==> using LAB_PORT=$LAB_PORT (explicitly set)"
+elif port_is_free 8080; then
+  LAB_PORT=8080
+else
+  echo "==> :8080 is already in use on this machine -- looking for a free port instead"
+  LAB_PORT=""
+  for candidate in 8081 8082 8083 8084 8085 8086 8087 8088 8089 8090; do
+    if port_is_free "$candidate"; then
+      LAB_PORT="$candidate"
+      break
+    fi
+  done
+  if [ -z "$LAB_PORT" ]; then
+    echo "no free port found in 8080-8090 -- set LAB_PORT explicitly, e.g. LAB_PORT=9000 ./scripts/dev.sh" >&2
+    exit 1
+  fi
+  echo "==> using :$LAB_PORT instead"
+fi
 
 if [ ! -f external/stockfish/src/Makefile ]; then
   echo "==> fetching the Stockfish submodule"

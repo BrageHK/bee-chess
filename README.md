@@ -49,9 +49,10 @@ server-side (#69).
 ./scripts/test.sh   # just the test suites
 ```
 
-`./scripts/dev.sh` starts Bee Lab on `:8080` by default; if something
-else already has that port (Docker Desktop commonly does), override it
-for both sides at once:
+`./scripts/dev.sh` starts Bee Lab on `:8080` by default, and picks the
+next free port automatically if something else already has it (Docker
+Desktop commonly does) -- no flags needed either way. Set `LAB_PORT`
+yourself only to force a specific port:
 
 ```bash
 LAB_PORT=8081 ./scripts/dev.sh
