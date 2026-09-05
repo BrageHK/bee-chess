@@ -18,8 +18,6 @@
 __pycache__/
 *.pyc
 
-# Trainign
-
 # Node
 node_modules/
 dist/
