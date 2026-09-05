@@ -1,7 +1,7 @@
 /// Engine
 use crate::chess::{PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
-use crate::eval::MaterialEvaluator;
+use crate::eval::{MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, SearchResult};
 
 /// A move given as `(from, to, promotion)` could not be matched against
@@ -17,6 +17,7 @@ pub struct IllegalMoveError {
 
 pub struct Engine {
     debug: bool,
+    evaluator: EvaluatorKind,
     position: Position,
     diagnostics: DiagnosticBuffer,
     /// Zobrist hash of every position reached so far in the current
@@ -37,12 +38,37 @@ pub struct Engine {
     // options: EngineOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvaluatorKind {
+    Material,
+    #[default]
+    Positional,
+}
+
+impl EvaluatorKind {
+    pub const fn uci_name(self) -> &'static str {
+        match self {
+            Self::Material => "Material",
+            Self::Positional => "Positional",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "material" => Some(Self::Material),
+            "positional" => Some(Self::Positional),
+            _ => None,
+        }
+    }
+}
+
 impl Engine {
     pub fn new() -> Self {
         let position = Position::startpos();
         let position_history = vec![position.zobrist_hash()];
         Self {
             debug: false,
+            evaluator: EvaluatorKind::default(),
             position,
             diagnostics: DiagnosticBuffer::new(),
             position_history,
@@ -107,6 +133,14 @@ impl Engine {
         self.debug
     }
 
+    pub const fn evaluator(&self) -> EvaluatorKind {
+        self.evaluator
+    }
+
+    pub fn set_evaluator(&mut self, evaluator: EvaluatorKind) {
+        self.evaluator = evaluator;
+    }
+
     /// Resets game/search-specific engine state (TT generation and
     /// similar, once that exists) for a new game. This does **not**
     /// reset `position_history` or set the board to the starting
@@ -155,17 +189,24 @@ impl Engine {
 
     /// Searches the current position to exactly `depth` plies using
     /// fixed-depth negamax alpha-beta (see `crate::search::alpha_beta`)
-    /// with a material-only evaluator, and returns the result. Does
+    /// with a tapered positional evaluator, and returns the result. Does
     /// not mutate the current position -- `search::search` restores it
     /// fully via make/unmake on every path, including cut-off branches.
     ///
-    /// No quiescence, no transposition table, no move ordering, no
-    /// real cancellation. `depth` is searched to completion
+    /// No transposition table, move ordering, or real cancellation.
+    /// `depth` is searched to completion
     /// synchronously. See `search_for_time` for time-bounded iterative
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
-        search::search(&mut self.position, depth, &MaterialEvaluator)
+        match self.evaluator {
+            EvaluatorKind::Material => {
+                search::search(&mut self.position, depth, &MaterialEvaluator)
+            }
+            EvaluatorKind::Positional => {
+                search::search(&mut self.position, depth, &PositionalEvaluator)
+            }
+        }
     }
 
     /// Searches the current position with iterative deepening (depth
@@ -180,12 +221,20 @@ impl Engine {
         budget: std::time::Duration,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
-        search::search_iterative(
-            &mut self.position,
-            budget,
-            &MaterialEvaluator,
-            on_depth_complete,
-        )
+        match self.evaluator {
+            EvaluatorKind::Material => search::search_iterative(
+                &mut self.position,
+                budget,
+                &MaterialEvaluator,
+                on_depth_complete,
+            ),
+            EvaluatorKind::Positional => search::search_iterative(
+                &mut self.position,
+                budget,
+                &PositionalEvaluator,
+                on_depth_complete,
+            ),
+        }
     }
 }
 
