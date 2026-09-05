@@ -1,17 +1,24 @@
-//! Authoritative game state: `Game`, its lifecycle, and an in-memory
-//! store keyed by `GameId` -- see #69 (67b).
+//! Authoritative game state: `Game`, its lifecycle, an in-memory store
+//! keyed by `GameId`, and (slice 69b) the automatic engine-vs-engine
+//! play loop -- see #69 (67b).
 //!
-//! This is slice 69a: the game-state model and its HTTP surface
-//! (`POST /api/games`, `GET /api/games/:id`). Moves are applied here
-//! via `Game::apply_move`, validated against `bee_chess_core`'s legal
-//! move generator -- the same canonical chess-rules implementation
+//! 69a's game-state model and HTTP surface (`POST /api/games`,
+//! `GET /api/games/:id`) are unchanged: moves are applied via
+//! `Game::apply_move`, validated against `bee_chess_core`'s legal move
+//! generator -- the same canonical chess-rules implementation
 //! `bee-engine` itself uses (see `chess/src/lib.rs`'s docs for why that
 //! sharing matters: a server that disagreed with Bee about what's legal
-//! would be its own class of bug). Nothing here spawns an engine
-//! process or drives a `go`/`bestmove` cycle automatically yet --
-//! that's 69b. For now, `apply_move` is called directly (by a human
-//! move via the API, or by a test), the same shape 69b's engine loop
-//! will call it from once it exists.
+//! would be its own class of bug).
+//!
+//! 69b adds `run_engine_loop`: spawned as a background task per game
+//! that has one or two engine-driven sides, it repeatedly asks whichever
+//! engine is on move for a `bestmove` (via `uci_process::UciProcess`)
+//! and applies it through the exact same `Game::apply_move` a human's
+//! `POST /api/games/:id/moves` call goes through -- there is no second,
+//! engine-only code path for legality/status. A side with no
+//! `EngineSpec` is a human slot: the loop simply waits (polling
+//! `GameStore` until that side's move shows up via the API) rather than
+//! trying to move for them.
 //!
 //! The API is deliberately game-ID-shaped even though only one
 //! concurrent game is supported for now (`GameStore` is just a
@@ -20,10 +27,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use bee_chess_core::{PieceKind, Position, Square};
+use bee_chess_core::{Color, PieceKind, Position, Square};
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::uci_process::UciProcess;
+use crate::uci_relay::EngineSpec;
 
 /// Opaque game identifier, serialized as a plain string over the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -63,11 +74,7 @@ pub enum GameStatus {
     /// An engine failed, or some other condition stopped the game
     /// short of a real chess result. Distinct from `Finished` so a
     /// client never mistakes an error state for a legitimate
-    /// win/loss/draw. Not constructed anywhere yet -- 69b is what
-    /// introduces the engine-failure paths that would produce this;
-    /// it's part of the API shape now so 69b doesn't need to change
-    /// the snapshot's serialized shape when it lands.
-    #[allow(dead_code)]
+    /// win/loss/draw. Set via `Game::abort` -- see 69b's engine loop.
     Aborted {
         reason: String,
     },
@@ -142,6 +149,29 @@ impl Game {
 
     pub fn moves(&self) -> &[String] {
         &self.moves
+    }
+
+    /// Whose turn it currently is, independent of `status` -- callers
+    /// (the engine loop) still need this to know which side to ask for
+    /// a move even after checking `status` is `Running` themselves.
+    pub fn side_to_move(&self) -> Color {
+        self.position.side_to_move()
+    }
+
+    /// Marks the game aborted with `reason` -- called when the engine
+    /// loop can't continue (a process failed to spawn, died mid-game,
+    /// or replied with something that isn't actually legal here despite
+    /// being the engine's own choice, which would itself be a serious
+    /// bug worth surfacing distinctly from a normal chess result).
+    /// A no-op if the game already has a terminal status, since an
+    /// already-finished/aborted game shouldn't be re-aborted out from
+    /// under whatever ended it first.
+    pub fn abort(&mut self, reason: impl Into<String>) {
+        if self.status == GameStatus::Running {
+            self.status = GameStatus::Aborted {
+                reason: reason.into(),
+            };
+        }
     }
 
     /// Applies `uci` (e.g. `"e2e4"`, `"e7e8q"`) to the current
@@ -288,6 +318,18 @@ impl GameStore {
             .map(GameSnapshot::from)
     }
 
+    /// `id`'s current side to move, straight from `Game::side_to_move`
+    /// (the authoritative source) rather than derived from a
+    /// snapshot's move-list length -- see `run_engine_loop`, the only
+    /// caller.
+    fn side_to_move(&self, id: GameId) -> Option<Color> {
+        self.games
+            .lock()
+            .expect("game store mutex poisoned")
+            .get(&id)
+            .map(Game::side_to_move)
+    }
+
     /// Applies `uci` to `id`'s game. `Err(None)` means no such game
     /// exists; `Err(Some(_))` means the game exists but the move was
     /// refused (see `ApplyMoveError`).
@@ -300,6 +342,145 @@ impl GameStore {
         let game = games.get_mut(&id).ok_or(None)?;
         game.apply_move(uci).map_err(Some)?;
         Ok(GameSnapshot::from(&*game))
+    }
+
+    /// Marks `id`'s game aborted with `reason`, if it still exists and
+    /// is still running -- see `Game::abort`. Silently does nothing if
+    /// the game doesn't exist (it may have been created and then this
+    /// process restarted, though there's no persistence yet to make
+    /// that a real scenario in practice -- still, the engine loop
+    /// shouldn't panic over it).
+    fn abort(&self, id: GameId, reason: impl Into<String>) {
+        let mut games = self.games.lock().expect("game store mutex poisoned");
+        if let Some(game) = games.get_mut(&id) {
+            game.abort(reason);
+        }
+    }
+}
+
+/// Which side, if any, an engine plays as automated -- `None` is a
+/// human slot: the automatic loop below simply waits for that side's
+/// move to arrive via `POST /api/games/:id/moves` instead of ever
+/// trying to move for it.
+#[derive(Debug, Clone)]
+pub struct EngineSlots {
+    pub white: Option<EngineSpec>,
+    pub black: Option<EngineSpec>,
+}
+
+impl EngineSlots {
+    /// Whether at least one side is engine-driven -- if neither is,
+    /// there's nothing for the automatic loop to do at all, and the
+    /// caller shouldn't bother spawning it.
+    pub fn any_engine(&self) -> bool {
+        self.white.is_some() || self.black.is_some()
+    }
+
+    fn spec_for(&self, color: Color) -> Option<&EngineSpec> {
+        match color {
+            Color::White => self.white.as_ref(),
+            Color::Black => self.black.as_ref(),
+        }
+    }
+}
+
+/// Drives `id`'s game to completion automatically, asking whichever
+/// engine-controlled side is on move for a `bestmove` (with a
+/// `move_time_ms` budget per move) and applying it via
+/// `GameStore::apply_move` -- the same path a human's API call goes
+/// through, so there is exactly one place legality/status is decided,
+/// regardless of who's moving.
+///
+/// A side with no `EngineSpec` in `slots` is a human slot: the loop
+/// polls (checking back every `HUMAN_MOVE_POLL_INTERVAL`) until that
+/// side's move shows up in the game's move list, applied by someone
+/// else calling the API, rather than ever trying to move for them.
+///
+/// Spawns one `UciProcess` per engine-controlled side, once, and reuses
+/// it for the rest of the game rather than respawning per move --
+/// mirrors how a real UCI GUI drives an engine across a whole game
+/// (`position` + `go` repeated on the same process), not a fresh
+/// process per ply.
+///
+/// Ends (returns) once the game reaches any terminal status --
+/// `Finished` (checkmate/stalemate, detected the same way 69a already
+/// did) or `Aborted` (a process failed to spawn or died mid-game, or
+/// the store says the game no longer exists at all -- e.g. this
+/// process restarted, though there's no persistence yet to make that
+/// likely in practice).
+pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, move_time_ms: u64) {
+    const HUMAN_MOVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+    let mut white_process = None;
+    let mut black_process = None;
+
+    loop {
+        let Some(snapshot) = store.snapshot(id) else {
+            return; // game no longer exists -- nothing left to drive
+        };
+        if !matches!(snapshot.status, GameStatus::Running) {
+            return; // finished or aborted, by this loop or otherwise
+        }
+
+        let Some(side_to_move) = store.side_to_move(id) else {
+            return; // game vanished between the snapshot above and now
+        };
+
+        let Some(spec) = slots.spec_for(side_to_move) else {
+            // Human slot: wait for their move to show up via the API
+            // instead of polling tighter than a human can plausibly
+            // move anyway.
+            tokio::time::sleep(HUMAN_MOVE_POLL_INTERVAL).await;
+            continue;
+        };
+
+        let process_slot = match side_to_move {
+            Color::White => &mut white_process,
+            Color::Black => &mut black_process,
+        };
+
+        if process_slot.is_none() {
+            match UciProcess::spawn(&spec.argv, &spec.cwd).await {
+                Ok(process) => *process_slot = Some(process),
+                Err(err) => {
+                    store.abort(id, format!("engine failed to start: {err}"));
+                    return;
+                }
+            }
+        }
+        let process = process_slot.as_mut().expect("just ensured Some above");
+
+        let mv = match process.best_move(&snapshot.moves, move_time_ms).await {
+            Ok(Some(mv)) => mv,
+            Ok(None) => {
+                // The engine itself says no legal move (bestmove
+                // 0000) -- it agrees the game is over. Our own
+                // checkmate/stalemate detection should have already
+                // caught this on the *previous* apply_move and
+                // returned above; reaching here anyway would mean our
+                // legality view and the engine's disagree, worth
+                // surfacing distinctly rather than silently looping.
+                store.abort(
+                    id,
+                    "engine reported no legal move for a position we think is still playable",
+                );
+                return;
+            }
+            Err(err) => {
+                store.abort(id, format!("engine error: {err}"));
+                return;
+            }
+        };
+
+        if let Err(err) = store.apply_move(id, &mv) {
+            // The engine's own chosen move wasn't legal by our
+            // canonical rules -- since both sides share
+            // bee-chess-core, this should never happen; treat it as
+            // the serious bug it would be rather than silently
+            // dropping the move.
+            store.abort(id, format!("engine played an illegal move {mv}: {err:?}"));
+            return;
+        }
     }
 }
 

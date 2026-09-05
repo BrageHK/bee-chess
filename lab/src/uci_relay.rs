@@ -28,7 +28,7 @@ use tokio::process::{Child, Command};
 /// One engine this server knows how to spawn a process for: `argv[0]`
 /// plus any fixed arguments (e.g. `["/path/to/stockfish"]`), and the
 /// working directory to spawn it in.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EngineSpec {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
