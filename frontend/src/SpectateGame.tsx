@@ -6,6 +6,7 @@ import type { Key } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
 import { whiteEngine, blackEngine } from "./engine";
 import { UciLogPanel } from "./UciLogPanel";
+import { SearchStatsPanel } from "./SearchStatsPanel";
 import {
   DEFAULT_GAME_CONFIG,
   MAX_STOCKFISH_ELO,
@@ -59,6 +60,10 @@ export function SpectateGame() {
 
     try {
       await Promise.all([whiteEngine.init(), blackEngine.init()]);
+      await Promise.all([
+        whiteEngine.setDebug(gameConfig.debug),
+        blackEngine.setDebug(gameConfig.debug),
+      ]);
       await whiteEngine.setOption("UCI_LimitStrength", true);
       await whiteEngine.setOption("UCI_Elo", gameConfig.stockfishElo);
     } catch (err) {
@@ -145,6 +150,18 @@ export function SpectateGame() {
             two things that made width depend on content.
           */}
           <div style={{ display: "flex", gap: 16, width: "100%", maxWidth: 900 }}>
+            <SearchStatsPanel
+              key={`white-stats-${gameSeq}`}
+              name={whiteEngine.name}
+              subscribe={(l) => whiteEngine.onLog(l)}
+            />
+            <SearchStatsPanel
+              key={`black-stats-${gameSeq}`}
+              name={blackEngine.name}
+              subscribe={(l) => blackEngine.onLog(l)}
+            />
+          </div>
+          <div style={{ display: "flex", gap: 16, width: "100%", maxWidth: 900 }}>
             <UciLogPanel
               key={`white-${gameSeq}`}
               name={whiteEngine.name}
@@ -173,10 +190,12 @@ function GameConfigForm({
   // or mid-edit (e.g. "16") without snapping back to a number.
   const [eloText, setEloText] = useState(String(initial.stockfishElo));
   const [moveTimeText, setMoveTimeText] = useState(String(initial.moveTimeMs));
+  const [debug, setDebugField] = useState(initial.debug);
 
   const config: GameConfig = {
     stockfishElo: Number(eloText),
     moveTimeMs: Number(moveTimeText),
+    debug,
   };
   const error = validateGameConfig(config);
 
@@ -208,6 +227,14 @@ function GameConfigForm({
           step={1}
           onChange={(e) => setMoveTimeText(e.target.value)}
         />
+      </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={debug}
+          onChange={(e) => setDebugField(e.target.checked)}
+        />
+        Debug logging (sends <code>debug on</code> to both engines)
       </label>
       {error && <p style={{ color: "crimson", margin: 0 }}>{error}</p>}
       <button type="submit" disabled={error !== null}>

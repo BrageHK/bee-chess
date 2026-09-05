@@ -108,6 +108,30 @@ export class UciClient {
   }
 
   /**
+   * Sends `debug on`/`debug off` and waits for the engine to confirm
+   * it's still ready, so a caller can rely on it being applied before
+   * the next `go`. Safe to call again before a new game to change the
+   * setting without reconnecting. This only affects the engine's own
+   * diagnostic output (see #42/#44 on the Bee side); it has no bearing
+   * on whether raw traffic appears in the log panel, which always
+   * shows everything regardless.
+   */
+  async setDebug(on: boolean): Promise<void> {
+    await this.init();
+
+    return new Promise<void>((resolve) => {
+      const listener = (line: string) => {
+        if (line !== "readyok") return;
+        this.listeners.delete(listener);
+        resolve();
+      };
+      this.listeners.add(listener);
+      this.send(on ? "debug on" : "debug off");
+      this.send("isready");
+    });
+  }
+
+  /**
    * Asks for a move in the position reached by `moves` from the start
    * position, thinking for exactly `moveTimeMs` (a fixed move-time
    * budget, not a chess clock -- see GameConfig).

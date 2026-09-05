@@ -9,11 +9,22 @@
 export interface GameConfig {
   stockfishElo: number;
   moveTimeMs: number;
+  /**
+   * Sends `debug on`/`debug off` to both engines before the game
+   * starts. Off by default, matching each engine's own UCI default --
+   * see the engine-side debug/diagnostics work (#42/#44). This only
+   * controls each engine's own diagnostic output (e.g. Bee's `info
+   * string ignored unknown UCI command: ...`); it has no effect on
+   * the raw send/receive log panel, which always shows all traffic
+   * regardless of this setting.
+   */
+  debug: boolean;
 }
 
 export const DEFAULT_GAME_CONFIG: GameConfig = {
   stockfishElo: 1600,
   moveTimeMs: 100,
+  debug: false,
 };
 
 /** Stockfish's own supported range for `UCI_Elo` (`go docs`/UCI option range). */
