@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { UciClient, type UciLogLine } from "./engine";
+import { checkBotAvailable, createBotClient, UciClient, type UciLogLine } from "./engine";
 
 /**
  * A minimal fake WebSocket good enough to drive UciClient's handshake
@@ -186,5 +186,91 @@ describe("UciClient.setDebug", () => {
     ws.receive("readyok");
     await setDebugPromise;
     expect(resolved).toBe(true);
+  });
+});
+
+describe("createBotClient", () => {
+  it("creates a client pointed at the right URL for each kind", () => {
+    expect(createBotClient("stockfish")).toMatchObject({ name: "stockfish" });
+    expect(createBotClient("bee")).toMatchObject({ name: "bee" });
+    expect(createBotClient("bee-mamba")).toMatchObject({ name: "bee-mamba" });
+  });
+
+  it("returns a fresh instance every call, not a shared singleton", () => {
+    const a = createBotClient("bee");
+    const b = createBotClient("bee");
+    expect(a).not.toBe(b);
+  });
+});
+
+/** A fake WebSocket that can simulate either a successful open or a
+ * failed/errored connection, for checkBotAvailable's probe. */
+class ProbeWebSocket {
+  static instances: ProbeWebSocket[] = [];
+  static behavior: "open" | "error" = "open";
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  closed = false;
+  readonly url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    ProbeWebSocket.instances.push(this);
+    queueMicrotask(() => {
+      if (ProbeWebSocket.behavior === "open") this.onopen?.();
+      else this.onerror?.();
+    });
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+describe("checkBotAvailable", () => {
+  beforeEach(() => {
+    ProbeWebSocket.instances = [];
+    ProbeWebSocket.behavior = "open";
+    vi.stubGlobal("WebSocket", ProbeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("resolves true when the socket opens", async () => {
+    ProbeWebSocket.behavior = "open";
+    await expect(checkBotAvailable("bee")).resolves.toBe(true);
+  });
+
+  it("resolves false when the socket errors", async () => {
+    ProbeWebSocket.behavior = "error";
+    await expect(checkBotAvailable("bee-mamba")).resolves.toBe(false);
+  });
+
+  it("closes the probe connection either way", async () => {
+    ProbeWebSocket.behavior = "open";
+    await checkBotAvailable("bee");
+    expect(ProbeWebSocket.instances[0].closed).toBe(true);
+  });
+
+  it("resolves false if nothing happens before the timeout", async () => {
+    vi.useFakeTimers();
+    // Never fire onopen/onerror -- simulates a connection attempt that
+    // just hangs (e.g. nothing listening, no immediate refusal).
+    class HangingWebSocket {
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", HangingWebSocket);
+
+    const resultPromise = checkBotAvailable("stockfish", 100);
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(resultPromise).resolves.toBe(false);
+
+    vi.useRealTimers();
   });
 });
