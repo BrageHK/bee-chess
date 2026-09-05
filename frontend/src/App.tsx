@@ -6,6 +6,7 @@ import type { Key } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
 import { whiteEngine, blackEngine } from "./engine";
 import { UciLogPanel } from "./UciLogPanel";
+import { SearchStatsPanel } from "./SearchStatsPanel";
 import {
   DEFAULT_GAME_CONFIG,
   MAX_STOCKFISH_ELO,
@@ -155,6 +156,18 @@ export default function App() {
             minWidth: 0 so it can't grow past that share) removes the
             two things that made width depend on content.
           */}
+          <div style={{ display: "flex", gap: 16, width: "100%", maxWidth: 900 }}>
+            <SearchStatsPanel
+              key={`white-stats-${gameSeq}`}
+              name={whiteEngine.name}
+              subscribe={(l) => whiteEngine.onLog(l)}
+            />
+            <SearchStatsPanel
+              key={`black-stats-${gameSeq}`}
+              name={blackEngine.name}
+              subscribe={(l) => blackEngine.onLog(l)}
+            />
+          </div>
           <div style={{ display: "flex", gap: 16, width: "100%", maxWidth: 900 }}>
             <UciLogPanel
               key={`white-${gameSeq}`}
