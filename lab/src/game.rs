@@ -20,6 +20,22 @@
 //! `GameStore` until that side's move shows up via the API) rather than
 //! trying to move for them.
 //!
+//! 69c-1a adds a per-game live event stream (`GameEvent`, `GameStore::
+//! subscribe`), so a WebSocket client (69c-1a's `api::game_events_ws`)
+//! can mirror the exact raw UCI traffic a direct browser connection to
+//! the engine used to see (`GameEvent::Uci`), plus `GameEvent::Updated`
+//! whenever the authoritative snapshot changes (a move played, or the
+//! game reaching a terminal status) -- deliberately *not* a structured
+//! `SearchInfo` type parsed server-side: the frontend already has a
+//! working raw-UCI-line parser (`uciInfo.ts`), so there is no reason to
+//! duplicate that parsing in Rust just because the lines now originate
+//! from a server-owned process instead of a directly-browser-connected
+//! one. The snapshot returned by `GET /api/games/:id` stays the
+//! authoritative resync mechanism regardless of events -- a client that
+//! missed some events (or never subscribed at all) is never wrong about
+//! the game's real state, only possibly a little stale on live search
+//! telemetry, which is expected to matter far less.
+//!
 //! The API is deliberately game-ID-shaped even though only one
 //! concurrent game is supported for now (`GameStore` is just a
 //! `HashMap`, nothing stops it holding more) -- see #69's "avoids an
@@ -31,10 +47,46 @@ use std::time::Duration;
 
 use bee_chess_core::{Color, PieceKind, Position, Square};
 use serde::Serialize;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::uci_process::UciProcess;
+use crate::uci_process::{UciDirection, UciProcess};
 use crate::uci_relay::EngineSpec;
+
+/// How many events a slow (or absent) subscriber can lag behind before
+/// the broadcast channel starts dropping its oldest ones. Deliberately
+/// generous for the volume one game's UCI traffic realistically
+/// produces (a handful of `info` lines a second at most); this only
+/// matters at all for a subscriber that's connected but not reading,
+/// and dropped events are just transient telemetry (see this module's
+/// docs) -- never the authoritative snapshot -- so a lagging
+/// subscriber missing some history is an acceptable, self-healing
+/// (on their next receive) condition, not a correctness bug.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// A live event about one game, broadcast to every current subscriber
+/// (see `GameStore::subscribe`). Not persisted or replayed -- a client
+/// that connects late (or misses some) just relies on its next
+/// `GET /api/games/:id` for the authoritative picture; see the module
+/// docs for why events and the snapshot have deliberately different
+/// jobs.
+#[derive(Debug, Clone)]
+pub enum GameEvent {
+    /// One raw line of UCI traffic to/from one side's engine process --
+    /// mirrors exactly what a direct browser connection to that engine
+    /// would have seen (id/uciok/isready/readyok/info/bestmove, all of
+    /// it, not just the lines this crate's own code acts on).
+    Uci {
+        color: Color,
+        direction: UciDirection,
+        line: String,
+    },
+    /// The authoritative snapshot changed -- a move was applied
+    /// (human or engine) or the game reached a terminal status.
+    /// Carries the new snapshot directly so a subscriber doesn't need
+    /// a separate `GET` just to find out what changed.
+    Updated(GameSnapshot),
+}
 
 /// Opaque game identifier, serialized as a plain string over the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -286,9 +338,16 @@ impl From<&Game> for GameSnapshot {
 /// request volume are both tiny for this development/orchestration
 /// server (see #67's module docs), so a plain mutex is simplest and
 /// correct; revisit only if it's ever shown to matter.
+///
+/// Event channels (`events`) live in their own map, separate from
+/// `games`, since a channel needs to be cheaply cloneable out to a
+/// WebSocket handler independent of (and without holding) the games
+/// mutex, and outlives no particular lock scope -- a `broadcast::
+/// Sender` is itself just a cheap `Arc`-backed handle.
 #[derive(Clone, Default)]
 pub struct GameStore {
     games: Arc<Mutex<HashMap<GameId, Game>>>,
+    events: Arc<Mutex<HashMap<GameId, broadcast::Sender<GameEvent>>>>,
 }
 
 impl GameStore {
@@ -300,10 +359,16 @@ impl GameStore {
     pub fn create(&self) -> GameSnapshot {
         let game = Game::new();
         let snapshot = GameSnapshot::from(&game);
+        let id = game.id;
         self.games
             .lock()
             .expect("game store mutex poisoned")
-            .insert(game.id, game);
+            .insert(id, game);
+        let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        self.events
+            .lock()
+            .expect("event channel map mutex poisoned")
+            .insert(id, sender);
         snapshot
     }
 
@@ -332,16 +397,22 @@ impl GameStore {
 
     /// Applies `uci` to `id`'s game. `Err(None)` means no such game
     /// exists; `Err(Some(_))` means the game exists but the move was
-    /// refused (see `ApplyMoveError`).
+    /// refused (see `ApplyMoveError`). Broadcasts `GameEvent::Updated`
+    /// on success -- see the module docs on why events carry the new
+    /// snapshot directly.
     pub fn apply_move(
         &self,
         id: GameId,
         uci: &str,
     ) -> Result<GameSnapshot, Option<ApplyMoveError>> {
-        let mut games = self.games.lock().expect("game store mutex poisoned");
-        let game = games.get_mut(&id).ok_or(None)?;
-        game.apply_move(uci).map_err(Some)?;
-        Ok(GameSnapshot::from(&*game))
+        let snapshot = {
+            let mut games = self.games.lock().expect("game store mutex poisoned");
+            let game = games.get_mut(&id).ok_or(None)?;
+            game.apply_move(uci).map_err(Some)?;
+            GameSnapshot::from(&*game)
+        };
+        self.publish(id, GameEvent::Updated(snapshot.clone()));
+        Ok(snapshot)
     }
 
     /// Marks `id`'s game aborted with `reason`, if it still exists and
@@ -349,11 +420,47 @@ impl GameStore {
     /// the game doesn't exist (it may have been created and then this
     /// process restarted, though there's no persistence yet to make
     /// that a real scenario in practice -- still, the engine loop
-    /// shouldn't panic over it).
+    /// shouldn't panic over it). Broadcasts `GameEvent::Updated` if the
+    /// game existed.
     fn abort(&self, id: GameId, reason: impl Into<String>) {
-        let mut games = self.games.lock().expect("game store mutex poisoned");
-        if let Some(game) = games.get_mut(&id) {
+        let snapshot = {
+            let mut games = self.games.lock().expect("game store mutex poisoned");
+            let Some(game) = games.get_mut(&id) else {
+                return;
+            };
             game.abort(reason);
+            GameSnapshot::from(&*game)
+        };
+        self.publish(id, GameEvent::Updated(snapshot));
+    }
+
+    /// Subscribes to `id`'s live event stream. Returns `None` if no
+    /// such game exists (never created, or already gone -- there is no
+    /// persistence yet). A subscription outlives the call that created
+    /// it; drop the returned receiver to unsubscribe.
+    pub fn subscribe(&self, id: GameId) -> Option<broadcast::Receiver<GameEvent>> {
+        self.events
+            .lock()
+            .expect("event channel map mutex poisoned")
+            .get(&id)
+            .map(broadcast::Sender::subscribe)
+    }
+
+    /// Publishes `event` to `id`'s subscribers, if any and if the game
+    /// still has a channel (see `create`/`subscribe`). A
+    /// `SendError` (no receivers currently subscribed) is expected and
+    /// silently ignored -- nobody is listening right now, which is
+    /// fine; it isn't this store's job to guarantee delivery, only to
+    /// deliver to whoever happens to be subscribed at the time (see
+    /// the module docs on events being transient, not replayed).
+    fn publish(&self, id: GameId, event: GameEvent) {
+        if let Some(sender) = self
+            .events
+            .lock()
+            .expect("event channel map mutex poisoned")
+            .get(&id)
+        {
+            let _ = sender.send(event);
         }
     }
 }
@@ -440,7 +547,21 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
         };
 
         if process_slot.is_none() {
-            match UciProcess::spawn(&spec.argv, &spec.cwd).await {
+            let store_for_events = store.clone();
+            let on_line = Box::new(move |direction: UciDirection, line: &str| {
+                // Best-effort: `publish` already silently no-ops if
+                // nobody's subscribed or the game's gone, so nothing
+                // here needs its own error handling.
+                store_for_events.publish(
+                    id,
+                    GameEvent::Uci {
+                        color: side_to_move,
+                        direction,
+                        line: line.to_string(),
+                    },
+                );
+            });
+            match UciProcess::spawn(&spec.argv, &spec.cwd, Some(on_line)).await {
                 Ok(process) => *process_slot = Some(process),
                 Err(err) => {
                     store.abort(id, format!("engine failed to start: {err}"));

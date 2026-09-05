@@ -11,20 +11,27 @@
 //! side is engine-driven (69b's automatic loop, see `game::
 //! run_engine_loop`) or another human.
 //!
-//! No WebSocket event stream yet -- that's 69c's territory (a client
-//! can already poll `GET /api/games/:id` to see the effect of every
-//! move, engine or human).
+//! `GET /ws/games/:id` (WebSocket) streams `game::GameEvent`s as JSON
+//! -- live UCI traffic per side, and the new snapshot whenever a move
+//! is applied or the game reaches a terminal status. Transient
+//! telemetry only: `GET /api/games/:id` stays the authoritative resync
+//! mechanism (see `game`'s module docs), so a client reconnecting after
+//! a dropped WebSocket only needs to re-fetch the snapshot, never to
+//! replay missed events.
 
 use std::collections::HashMap;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
-use crate::game::{ApplyMoveError, EngineSlots, GameStore};
+use crate::game::{ApplyMoveError, EngineSlots, GameEvent, GameSnapshot, GameStore};
+use crate::uci_process::UciDirection;
 use crate::uci_relay::EngineSpec;
 
 /// The engine binaries this server knows how to spawn for a game,
@@ -64,6 +71,7 @@ pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
         .route("/api/games", post(create_game))
         .route("/api/games/{id}", get(get_game))
         .route("/api/games/{id}/moves", post(apply_move))
+        .route("/ws/games/{id}", get(game_events_ws))
         .with_state(ApiState { store, engines })
 }
 
@@ -181,6 +189,108 @@ async fn apply_move(
         )
             .into_response(),
     }
+}
+
+/// The JSON shape a `GameEvent` is sent over `/ws/games/:id` as.
+/// `#[serde(tag = "type")]` gives each variant a `"type"` discriminator
+/// field the frontend can switch on (`"uci"` / `"updated"`), rather
+/// than an untagged shape that would force it to guess from which
+/// fields happen to be present.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum GameEventWire {
+    Uci {
+        color: WireColor,
+        direction: WireDirection,
+        line: String,
+    },
+    Updated {
+        snapshot: GameSnapshot,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireColor {
+    White,
+    Black,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireDirection {
+    Sent,
+    Received,
+}
+
+impl From<GameEvent> for GameEventWire {
+    fn from(event: GameEvent) -> Self {
+        match event {
+            GameEvent::Uci {
+                color,
+                direction,
+                line,
+            } => GameEventWire::Uci {
+                color: match color {
+                    bee_chess_core::Color::White => WireColor::White,
+                    bee_chess_core::Color::Black => WireColor::Black,
+                },
+                direction: match direction {
+                    UciDirection::Sent => WireDirection::Sent,
+                    UciDirection::Received => WireDirection::Received,
+                },
+                line,
+            },
+            GameEvent::Updated(snapshot) => GameEventWire::Updated { snapshot },
+        }
+    }
+}
+
+/// Upgrades to a WebSocket and streams `id`'s live `GameEvent`s as
+/// JSON (see `GameEventWire`) until either side closes or the game's
+/// event channel is gone (the game never existed, or -- there's no
+/// persistence yet -- this process restarted since it was created).
+/// Closes the socket immediately, with no error frame, if `id` has no
+/// event channel at all: this is a "nothing to stream," not a
+/// malformed-request condition worth a different close code for.
+async fn game_events_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Ok(id) = id.parse() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new("malformed game id")),
+        )
+            .into_response();
+    };
+    let Some(mut receiver) = state.store.subscribe(id) else {
+        return (StatusCode::NOT_FOUND, Json(ErrorBody::new("no such game"))).into_response();
+    };
+
+    ws.on_upgrade(move |mut socket: WebSocket| async move {
+        loop {
+            let event = tokio::select! {
+                event = receiver.recv() => event,
+                _ = socket.recv() => return, // browser closed its side
+            };
+            match event {
+                Ok(event) => {
+                    let wire = GameEventWire::from(event);
+                    let Ok(text) = serde_json::to_string(&wire) else {
+                        continue; // should never fail for this shape; skip rather than panic
+                    };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return; // browser side gone
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue, // see EVENT_CHANNEL_CAPACITY's docs
+                Err(broadcast::error::RecvError::Closed) => return,      // game's channel is gone
+            }
+        }
+    })
+    .into_response()
 }
 
 #[derive(serde::Serialize)]
@@ -475,5 +585,140 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Binds `router(store, engines)` on an ephemeral local port and
+    /// returns its base `ws://` URL -- WebSocket upgrades don't work
+    /// through axum's `oneshot` the way plain HTTP requests do (see the
+    /// other tests above), so these need a real bound server, same
+    /// pattern as `uci_relay.rs`'s own WebSocket tests.
+    async fn spawn_real_server(store: GameStore, engines: EngineRegistry) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let app = router(store, engines);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn ws_games_streams_an_updated_event_when_a_move_is_applied() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let store = GameStore::new();
+        let created = store.create();
+        let base_url = spawn_real_server(store.clone(), EngineRegistry::new()).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{base_url}/ws/games/{}", created.id))
+                .await
+                .expect("connect");
+
+        // Apply the move directly through the store (equivalent to a
+        // POST from another client) after subscribing, so the event
+        // is guaranteed to be published after this socket is already
+        // listening.
+        store
+            .apply_move(created.id, "e2e4")
+            .expect("e2e4 should be legal");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("should receive an event within the timeout")
+            .expect("stream should not end")
+            .expect("should not be a websocket error");
+        let ClientMessage::Text(text) = msg else {
+            panic!("expected a text frame, got {msg:?}");
+        };
+        let event: serde_json::Value = serde_json::from_str(&text).expect("valid JSON event");
+
+        assert_eq!(event["type"], "updated");
+        assert_eq!(event["snapshot"]["moves"], serde_json::json!(["e2e4"]));
+    }
+
+    #[tokio::test]
+    async fn ws_games_on_unknown_id_rejects_the_upgrade_with_404() {
+        // No such game -- there's nothing to stream, and the handler
+        // checks for a channel *before* upgrading, so the connection
+        // attempt itself fails with a plain HTTP 404 rather than
+        // upgrading and then immediately closing. tokio_tungstenite
+        // surfaces that as a connect error carrying the response.
+        let base_url = spawn_real_server(GameStore::new(), EngineRegistry::new()).await;
+
+        let result = tokio_tungstenite::connect_async(format!(
+            "{base_url}/ws/games/{}",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+
+        let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = result else {
+            panic!("expected an HTTP error rejecting the upgrade, got {result:?}");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ws_games_streams_uci_events_from_an_engine_driven_game() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let store = GameStore::new();
+        let base_url = spawn_real_server(store.clone(), registry.clone()).await;
+
+        let app = router(store, registry);
+        let created = body_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"white": "fake", "move_time_ms": 50}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base_url}/ws/games/{id}"))
+            .await
+            .expect("connect");
+
+        // The fake engine's very first line is "uciok" (received), so
+        // waiting for any "uci" event with the expected shape confirms
+        // raw engine traffic -- not just the final Updated snapshot --
+        // is actually flowing over this socket.
+        let saw_uci_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let msg = ws
+                    .next()
+                    .await
+                    .expect("stream should not end")
+                    .expect("no ws error");
+                let ClientMessage::Text(text) = msg else {
+                    continue;
+                };
+                let event: serde_json::Value =
+                    serde_json::from_str(&text).expect("valid JSON event");
+                if event["type"] == "uci" {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            saw_uci_event.is_ok(),
+            "should have seen at least one raw UCI event from the engine-driven game"
+        );
     }
 }
