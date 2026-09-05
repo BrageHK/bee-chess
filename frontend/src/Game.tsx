@@ -212,6 +212,10 @@ export function Game({
         config={{
           fen,
           lastMove,
+          // Default `coordinates: true` floats rank/file labels a few px
+          // inside the board's own edge, overlapping back-rank pieces on
+          // our fixed 480x480 board (#51). on-square labels avoid that.
+          coordinatesOnSquares: true,
           viewOnly: canMoveColor === null,
           turnColor: turn,
           movable: {
