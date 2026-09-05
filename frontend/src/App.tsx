@@ -8,7 +8,12 @@ import "@lichess-org/chessground/assets/chessground.cburnett.css";
 type Mode = "play" | "spectate";
 
 export default function App() {
-  const [mode, setMode] = useState<Mode>("play");
+  // Spectate (Stockfish vs Bee) works out of the box on any bridge;
+  // Play vs Bee-Mamba needs a trained checkpoint most clones won't
+  // have (see bridge/server.py), so it's opt-in rather than the
+  // default -- landing on it by default would greet a fresh clone
+  // with a mode that fails to connect.
+  const [mode, setMode] = useState<Mode>("spectate");
 
   return (
     <main
