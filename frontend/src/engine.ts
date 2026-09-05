@@ -58,13 +58,32 @@ export class UciClient {
 
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    let opened = false;
 
     this.ready = new Promise<void>((resolve, reject) => {
+      // Two different failures look the same from here (no
+      // uciok/readyok ever arrives) but mean different things: the
+      // socket itself never opening means the bridge process isn't
+      // running at all, while opening and then closing mid-handshake
+      // means the bridge is up but the engine process behind this
+      // port crashed (see bridge/server.py's watch_for_exit -- it
+      // sends an `info string` with the reason, already visible via
+      // onLog, before closing). Distinguishing them here avoids
+      // telling someone to start a bridge that's already running.
       const fail = () =>
-        reject(new Error(`no bridge on ${this.url} — is bridge/server.py running?`));
+        reject(
+          new Error(
+            opened
+              ? `${this.name} on ${this.url} disconnected before finishing the UCI handshake — see the log panel for why`
+              : `no bridge on ${this.url} — is bridge/server.py running?`,
+          ),
+        );
       ws.onerror = fail;
       ws.onclose = fail;
-      ws.onopen = () => this.send("uci");
+      ws.onopen = () => {
+        opened = true;
+        this.send("uci");
+      };
       // One `onmessage` for the life of the socket: `bestMove` and
       // `setOption` subscribe through `listeners` instead of replacing
       // this handler, so nothing clobbers the handshake or a concurrent

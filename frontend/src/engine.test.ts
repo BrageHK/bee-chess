@@ -137,6 +137,58 @@ async function completeHandshake(client: UciClient): Promise<FakeWebSocket> {
   return ws;
 }
 
+/** A fake WebSocket whose `open` never fires on its own -- for
+ * distinguishing "the bridge itself isn't running" (connection never
+ * opens) from "the bridge is up but the engine process behind it died
+ * mid-handshake" (connection opens, then closes). */
+class ManualWebSocket {
+  static instances: ManualWebSocket[] = [];
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  readonly url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    ManualWebSocket.instances.push(this);
+  }
+
+  send() {}
+}
+
+describe("UciClient.init error messages", () => {
+  beforeEach(() => {
+    ManualWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", ManualWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("says the bridge isn't running when the socket never opens", async () => {
+    const client = new UciClient("ws://test", "engine");
+    const initPromise = client.init();
+
+    const ws = ManualWebSocket.instances[0];
+    ws.onclose?.();
+
+    await expect(initPromise).rejects.toThrow(/is bridge\/server\.py running/);
+  });
+
+  it("says the handshake was interrupted when the socket opens then closes", async () => {
+    const client = new UciClient("ws://test", "engine");
+    const initPromise = client.init();
+
+    const ws = ManualWebSocket.instances[0];
+    ws.onopen?.();
+    ws.onclose?.();
+
+    await expect(initPromise).rejects.toThrow(/disconnected before finishing the UCI handshake/);
+  });
+});
+
 describe("UciClient.setDebug", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
