@@ -1,9 +1,8 @@
 //! A typed UCI client speaking directly to a spawned engine
-//! subprocess's stdin/stdout -- the server-side counterpart to
-//! `uci_relay` (which only relays raw bytes to a browser). This is
-//! what lets `Game`'s automatic play loop (#69/67b, slice 69b) ask an
-//! engine for a move itself, instead of requiring a human to relay one
-//! in via `POST /api/games/:id/moves`.
+//! subprocess's stdin/stdout. This is what lets `Game`'s automatic
+//! play loop (#69/67b, slice 69b) ask an engine for a move itself,
+//! instead of requiring a human to relay one in via
+//! `POST /api/games/:id/moves`.
 //!
 //! Deliberately minimal: just enough of the UCI protocol to run one
 //! engine through one game (`uci`/`isready` handshake, `setoption`,
@@ -36,10 +35,10 @@ pub enum UciDirection {
 /// `on_line`, if set, is called with every line sent to or received
 /// from the process -- `info` telemetry included, not just the lines
 /// this type's own methods act on (`uciok`/`readyok`/`bestmove`). This
-/// is what lets a caller mirror the exact same raw UCI traffic a
-/// direct browser connection to the engine would see (`uci_relay`'s
-/// job for the old bridge/lab relay), now that the server itself is
-/// the one actually talking to the process.
+/// is what lets a caller (see `game::run_engine_loop`) mirror that raw
+/// UCI traffic out over `GET /ws/games/:id` (`GameEvent::Uci`),
+/// exactly what a direct browser connection to the engine used to see
+/// before the frontend stopped connecting to engines directly (#89).
 pub struct UciProcess {
     child: Child,
     stdin: ChildStdin,

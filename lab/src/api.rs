@@ -31,10 +31,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::game::{
-    ApplyMoveError, EngineConfig, EngineSlots, GameEvent, GameSnapshot, GameStore, ParticipantInfo,
+    ApplyMoveError, EngineConfig, EngineSlots, EngineSpec, GameEvent, GameSnapshot, GameStore,
+    ParticipantInfo,
 };
 use crate::uci_process::UciDirection;
-use crate::uci_relay::EngineSpec;
 
 /// The engine binaries this server knows how to spawn for a game,
 /// keyed by the name a `CreateGameRequest` names them with (e.g.
@@ -775,8 +775,7 @@ mod tests {
     /// Binds `router(store, engines)` on an ephemeral local port and
     /// returns its base `ws://` URL -- WebSocket upgrades don't work
     /// through axum's `oneshot` the way plain HTTP requests do (see the
-    /// other tests above), so these need a real bound server, same
-    /// pattern as `uci_relay.rs`'s own WebSocket tests.
+    /// other tests above), so these need a real bound server instead.
     async fn spawn_real_server(store: GameStore, engines: EngineRegistry) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

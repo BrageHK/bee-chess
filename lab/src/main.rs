@@ -1,32 +1,38 @@
-//! Bee Lab: static frontend hosting + a UCI process relay over
-//! WebSocket, replacing `bridge/server.py` for Stockfish and Bee (see
-//! #68 / #67a). Serves everything from one process on one port,
-//! instead of the Python bridge's three separate ports plus Vite's own
-//! dev server port.
+//! Bee Lab: static frontend hosting plus an authoritative game-state
+//! HTTP+WebSocket API under `/api/games`/`/ws/games` (see `api`/`game`
+//! -- #67/#69). `POST /api/games` (optionally naming `white`/`black`
+//! engines by name to drive them automatically, see
+//! `api::CreateGameRequest`), `GET /api/games/:id`, `POST
+//! /api/games/:id/moves` (still the way a human move, or a game with
+//! no engine side at all, reaches the server), and `GET
+//! /ws/games/:id` (live UCI traffic + snapshot updates). The frontend
+//! (`frontend/src/labClient.ts`, `Game.tsx`) uses exactly this API and
+//! never talks to an engine process directly -- it doesn't own
+//! position/clocks/legality/result itself either (#69). The permissive
+//! `CorsLayer` below exists specifically for that: `npm run dev`'s
+//! Vite server (`:5173`) and this server (`:8080`, by default) are
+//! different origins, and only plain HTTP fetches need CORS at all
+//! (WebSocket connections never did).
+//!
+//! Serves everything from one process on one port, replacing
+//! `bridge/server.py`'s three separate ports plus Vite's own dev
+//! server port for Stockfish/Bee (see #68/#67a). There used to also be
+//! a raw per-engine WebSocket relay here (`/ws/stockfish`, `/ws/bee`,
+//! `uci_relay.rs`), mirroring the Python bridge's dumb-relay ports --
+//! removed once the frontend stopped using it at all (#89): every game
+//! now goes through the authoritative API above, and its
+//! `GET /ws/games/:id` stream already carries the same raw UCI
+//! visibility (`GameEvent::Uci`, see #80) that the old relay routes
+//! existed for.
 //!
 //! Run as (from the repo root, after `npm --prefix frontend run build`):
 //!   cargo run -p bee-lab
-//!
-//! Also serves an authoritative game-state HTTP+WebSocket API under
-//! `/api/games`/`/ws/games` (see `api`/`game` -- #69/67b): `POST
-//! /api/games` (optionally naming `white`/`black` engines by name to
-//! drive them automatically, see `api::CreateGameRequest`), `GET
-//! /api/games/:id`, `POST /api/games/:id/moves` (still the way a human
-//! move, or a game with no engine side at all, reaches the server),
-//! and `GET /ws/games/:id` (live UCI traffic + snapshot updates). As
-//! of 69c-1b, the frontend (`frontend/src/labClient.ts`, `Game.tsx`)
-//! uses exactly this API and no longer talks to any engine process
-//! directly -- it doesn't own position/clocks/legality/result itself
-//! anymore either. The permissive `CorsLayer` below exists specifically
-//! for that: `npm run dev`'s Vite server (`:5173`) and this server
-//! (`:8080`, by default) are different origins, and only plain HTTP
-//! fetches need CORS at all (WebSocket connections never did).
 //!
 //! Bee-Mamba (the Python/PyTorch engine) is intentionally not served
 //! here -- see #68's "out of scope." It stays on the old Python bridge
 //! for now; its fate (ported here too, or left as a standalone process
 //! this server doesn't know about, pending #66's model-integration
-//! design) is a follow-up decision once this slice is stable.
+//! design) is a follow-up decision.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,10 +43,8 @@ use tower_http::services::ServeDir;
 mod api;
 mod game;
 mod uci_process;
-mod uci_relay;
 
-use game::GameStore;
-use uci_relay::EngineSpec;
+use game::{EngineSpec, GameStore};
 
 const DEFAULT_PORT: u16 = 8080;
 
@@ -75,12 +79,10 @@ async fn main() {
     // needing a binary path.
     let mut registry = api::EngineRegistry::new();
     registry
-        .insert("stockfish", stockfish_spec.clone())
-        .insert("bee", bee_spec.clone());
+        .insert("stockfish", stockfish_spec)
+        .insert("bee", bee_spec);
 
-    let app = uci_relay::route("/ws/stockfish", stockfish_spec)
-        .merge(uci_relay::route("/ws/bee", bee_spec))
-        .merge(api::router(GameStore::new(), registry))
+    let app = api::router(GameStore::new(), registry)
         .fallback_service(ServeDir::new(&frontend_dist))
         // See the module docs above for why -- permissive (`Any`)
         // since this is a development/orchestration server (#67), not
@@ -102,7 +104,7 @@ async fn main() {
         .await
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
 
-    println!("bee-lab listening on http://{addr}  (stockfish + bee over /ws/*)");
+    println!("bee-lab listening on http://{addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -110,9 +112,9 @@ async fn main() {
         .expect("server error");
 }
 
-/// Stockfish and Bee are mandatory: without them there's nothing for
-/// this server to usefully relay, so refuse to start -- same reasoning
-/// as `bridge/server.py`'s `require`.
+/// Stockfish and Bee are mandatory: without them there's no engine for
+/// `POST /api/games` to actually drive, so refuse to start -- same
+/// reasoning as `bridge/server.py`'s `require`.
 fn require(path: &Path, build_cmd: &str) {
     if !path.exists() {
         eprintln!(
