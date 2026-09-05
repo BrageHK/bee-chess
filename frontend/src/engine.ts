@@ -176,6 +176,56 @@ export class UciClient {
   }
 }
 
-export const whiteEngine = new UciClient("ws://localhost:8765", "stockfish");
-export const blackEngine = new UciClient("ws://localhost:8766", "bee");
-export const mambaEngine = new UciClient("ws://localhost:8767", "bee-mamba");
+/** The bots the bridge can spawn a process for. Excludes "human", which
+ * has no UciClient at all -- see `Participant` in `participant.ts`. */
+export type BotKind = "stockfish" | "bee" | "bee-mamba";
+
+const BOT_URLS: Record<BotKind, string> = {
+  stockfish: "ws://localhost:8765",
+  bee: "ws://localhost:8766",
+  "bee-mamba": "ws://localhost:8767",
+};
+
+/**
+ * Creates a fresh `UciClient` for `kind`. Each call makes a new
+ * WebSocket connection (and so a new engine process on the bridge
+ * side, per bridge/server.py's docs) -- this is what lets the same bot
+ * kind be picked for both board slots in the same game as two
+ * independent instances, each with its own position/config, rather
+ * than sharing one connection between them.
+ */
+export function createBotClient(kind: BotKind): UciClient {
+  return new UciClient(BOT_URLS[kind], kind);
+}
+
+/**
+ * Briefly checks whether `kind`'s bridge WebSocket accepts a
+ * connection at all, without running a real UCI handshake through it
+ * -- just enough to warn "this bot looks unavailable" before the user
+ * picks it and hits Start, rather than after (e.g. Bee-Mamba with no
+ * trained checkpoint: see bridge/server.py's graceful-degradation
+ * docs). The probe connection is always closed before returning, so
+ * it never competes with the real connection a game will open later.
+ */
+export function checkBotAvailable(kind: BotKind, timeoutMs = 1500): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const ws = new WebSocket(BOT_URLS[kind]);
+
+    const finish = (available: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ws.onopen = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      ws.close();
+      resolve(available);
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    ws.onopen = () => finish(true);
+    ws.onerror = () => finish(false);
+    ws.onclose = () => finish(false);
+  });
+}
