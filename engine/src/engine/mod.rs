@@ -1,5 +1,6 @@
 /// Engine
 use crate::chess::{PieceKind, Position, Square};
+use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 
 /// A move given as `(from, to, promotion)` could not be matched against
 /// any currently legal move. Carries the inputs back so the caller
@@ -15,6 +16,7 @@ pub struct IllegalMoveError {
 pub struct Engine {
     debug: bool,
     position: Position,
+    diagnostics: DiagnosticBuffer,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -27,7 +29,27 @@ impl Engine {
         Self {
             debug: false,
             position: Position::startpos(),
+            diagnostics: DiagnosticBuffer::new(),
         }
+    }
+
+    /// Emits a diagnostic. Engine/search code should call this instead
+    /// of ever constructing UCI text directly (`info string ...`,
+    /// `println!`, etc.) -- see `crate::diagnostics` for what belongs
+    /// here versus in real UCI `info` fields. Whether (and how) this
+    /// becomes visible is entirely up to whatever drains
+    /// `take_diagnostics` later, typically the UCI adapter gated on
+    /// `debug on`/`off`.
+    pub fn emit_diagnostic(&mut self, level: DiagnosticLevel, message: impl Into<String>) {
+        self.diagnostics.emit(level, message);
+    }
+
+    /// Removes and returns every diagnostic emitted since the last
+    /// call, in emission order. Intended to be drained by the UCI
+    /// adapter after each command, so diagnostics never pile up
+    /// unboundedly if nothing is reading them.
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        self.diagnostics.drain()
     }
 
     pub fn set_position(&mut self, position: Position) {
@@ -112,6 +134,50 @@ mod tests {
     fn new_engine_debug_is_off_by_default() {
         let engine = Engine::new();
         assert!(!engine.debug());
+    }
+
+    #[test]
+    fn new_engine_has_no_diagnostics() {
+        let mut engine = Engine::new();
+        assert_eq!(engine.take_diagnostics(), Vec::new());
+    }
+
+    #[test]
+    fn emit_diagnostic_then_take_returns_it() {
+        let mut engine = Engine::new();
+        engine.emit_diagnostic(DiagnosticLevel::Info, "position set to startpos");
+
+        assert_eq!(
+            engine.take_diagnostics(),
+            vec![Diagnostic {
+                level: DiagnosticLevel::Info,
+                message: "position set to startpos".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn take_diagnostics_drains_so_a_second_call_is_empty() {
+        let mut engine = Engine::new();
+        engine.emit_diagnostic(DiagnosticLevel::Debug, "one");
+        engine.take_diagnostics();
+
+        assert_eq!(engine.take_diagnostics(), Vec::new());
+    }
+
+    #[test]
+    fn diagnostics_are_returned_in_emission_order() {
+        let mut engine = Engine::new();
+        engine.emit_diagnostic(DiagnosticLevel::Info, "first");
+        engine.emit_diagnostic(DiagnosticLevel::Warn, "second");
+        engine.emit_diagnostic(DiagnosticLevel::Error, "third");
+
+        let messages: Vec<String> = engine
+            .take_diagnostics()
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(messages, vec!["first", "second", "third"]);
     }
 
     #[test]

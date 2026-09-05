@@ -13,6 +13,7 @@
 use std::io::{BufRead, Write};
 
 use crate::chess::{Move, PieceKind, Position, Square};
+use crate::diagnostics::DiagnosticLevel;
 use crate::engine::Engine;
 
 pub const ENGINE_NAME: &str = "bee-chess";
@@ -246,6 +247,14 @@ fn format_uci_move(mv: Move) -> String {
 
 /// Runs the UCI loop, reading commands from `input` and writing responses
 /// to `output`, until `quit` is received or input ends.
+///
+/// Diagnostics: engine/search code never writes UCI text directly (see
+/// `crate::diagnostics`); this is the one place that turns whatever
+/// `Engine::emit_diagnostic` accumulated into `info string ...` lines,
+/// and it only does so while `debug on` is in effect. With debug off,
+/// diagnostics are still drained (so they never pile up unboundedly)
+/// but simply discarded rather than written -- unknown commands and
+/// other diagnostics stay silent, per normal UCI behavior.
 pub fn run<R: BufRead, W: Write>(
     input: R,
     mut output: W,
@@ -255,7 +264,7 @@ pub fn run<R: BufRead, W: Write>(
         let line = line?;
 
         if engine.debug() {
-            writeln!(output, "info string received: {line}")?;
+            engine.emit_diagnostic(DiagnosticLevel::Debug, format!("received: {line}"));
         }
 
         match UciCommand::parse(&line) {
@@ -275,9 +284,7 @@ pub fn run<R: BufRead, W: Write>(
             }
             UciCommand::Position(command) => {
                 if let Err(error) = command.resolve(engine) {
-                    if engine.debug() {
-                        writeln!(output, "info string {error:?}")?;
-                    }
+                    engine.emit_diagnostic(DiagnosticLevel::Warn, format!("{error:?}"));
                 }
             }
             UciCommand::Go(_go_command) => {
@@ -297,8 +304,21 @@ pub fn run<R: BufRead, W: Write>(
             UciCommand::Quit => {
                 break;
             }
-            UciCommand::Unknown(_) => {
-                // Unrecognized commands are ignored, per UCI convention.
+            UciCommand::Unknown(ref command) => {
+                // Unrecognized commands are ignored, per UCI
+                // convention -- but worth a diagnostic when debug is
+                // on, since a silently-ignored typo (e.g. from a
+                // hand-typed test session) is otherwise invisible.
+                engine.emit_diagnostic(
+                    DiagnosticLevel::Info,
+                    format!("ignored unknown UCI command: {command}"),
+                );
+            }
+        }
+
+        for diagnostic in engine.take_diagnostics() {
+            if engine.debug() {
+                writeln!(output, "info string {}", diagnostic.message)?;
             }
         }
         output.flush()?;
@@ -565,6 +585,55 @@ mod tests {
         run(input, &mut output, &mut engine).expect("run should succeed");
         let text = String::from_utf8(output).expect("output should be valid utf8");
         assert!(!text.contains("info string"));
+    }
+
+    #[test]
+    fn unknown_command_produces_diagnostic_when_debug_is_on() {
+        let input = b"debug on\nbogus-command\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("info string ignored unknown UCI command: bogus-command"));
+    }
+
+    #[test]
+    fn unknown_command_is_silent_when_debug_is_off() {
+        let input = b"bogus-command\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(!text.contains("info string"));
+        assert!(!text.contains("bogus-command"));
+    }
+
+    #[test]
+    fn diagnostics_do_not_accumulate_unboundedly_when_debug_is_off() {
+        // Diagnostics are drained every line regardless of debug state
+        // (only *writing* them is gated), so nothing should pile up in
+        // the engine even across many silently-ignored commands.
+        let mut input = String::new();
+        for _ in 0..50 {
+            input.push_str("bogus-command\n");
+        }
+        input.push_str("quit\n");
+
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+
+        assert_eq!(engine.take_diagnostics(), Vec::new());
+    }
+
+    #[test]
+    fn invalid_position_command_emits_a_diagnostic_when_debug_is_on() {
+        let input = b"debug on\nposition startpos moves e2e4 e2e4\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("info string IllegalMove"));
     }
 
     /// Applies `mv` to `position` by looking it up among the position's
