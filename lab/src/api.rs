@@ -30,7 +30,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::game::{ApplyMoveError, EngineSlots, GameEvent, GameSnapshot, GameStore};
+use crate::game::{ApplyMoveError, EngineConfig, EngineSlots, GameEvent, GameSnapshot, GameStore};
 use crate::uci_process::UciDirection;
 use crate::uci_relay::EngineSpec;
 
@@ -81,15 +81,69 @@ pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
 /// clock at all yet -- see #69's still-open clocks scope).
 const DEFAULT_MOVE_TIME_MS: u64 = 200;
 
+/// One side's requested participant: either a bare engine name
+/// (`"stockfish"`) for its defaults, or an object naming the engine
+/// plus `setoption`s/debug -- e.g. `{"engine": "stockfish", "options":
+/// {"UCI_LimitStrength": true, "UCI_Elo": 1600}}`. `#[serde(untagged)]`
+/// so both shapes parse from the same field without the client needing
+/// a discriminator for the common case.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ParticipantRequest {
+    EngineName(String),
+    Engine {
+        engine: String,
+        #[serde(default)]
+        options: HashMap<String, serde_json::Value>,
+        #[serde(default)]
+        debug: bool,
+    },
+}
+
+impl ParticipantRequest {
+    fn engine_name(&self) -> &str {
+        match self {
+            ParticipantRequest::EngineName(name) => name,
+            ParticipantRequest::Engine { engine, .. } => engine,
+        }
+    }
+
+    /// `(name, value)` pairs for `EngineConfig::options`. UCI option
+    /// values are always sent as plain text regardless of their JSON
+    /// type (`UCI_Elo: 1600` and `UCI_LimitStrength: true` both become
+    /// `"1600"`/`"true"`) -- that's what `setoption name X value Y`
+    /// expects on the wire either way; a JSON string in the request is
+    /// passed through as-is rather than re-quoted.
+    fn options(&self) -> Vec<(String, String)> {
+        let ParticipantRequest::Engine { options, .. } = self else {
+            return Vec::new();
+        };
+        options
+            .iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    fn debug(&self) -> bool {
+        matches!(self, ParticipantRequest::Engine { debug: true, .. })
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct CreateGameRequest {
-    /// Engine name (must be in the server's `EngineRegistry`) to drive
-    /// White automatically, or omitted/`null` for a human-controlled
-    /// White (moves arrive via `POST /api/games/:id/moves` instead).
+    /// Participant driving White automatically, or omitted/`null` for
+    /// a human-controlled White (moves arrive via
+    /// `POST /api/games/:id/moves` instead).
     #[serde(default)]
-    white: Option<String>,
+    white: Option<ParticipantRequest>,
     #[serde(default)]
-    black: Option<String>,
+    black: Option<ParticipantRequest>,
     #[serde(default)]
     move_time_ms: Option<u64>,
 }
@@ -100,24 +154,29 @@ async fn create_game(
 ) -> impl IntoResponse {
     let request = body.map(|Json(r)| r).unwrap_or_default();
 
-    let resolve = |name: &Option<String>| -> Result<Option<EngineSpec>, String> {
-        match name {
-            None => Ok(None),
-            Some(name) => state
+    let resolve =
+        |participant: &Option<ParticipantRequest>| -> Result<Option<EngineConfig>, String> {
+            let Some(participant) = participant else {
+                return Ok(None);
+            };
+            let spec = state
                 .engines
-                .get(name)
-                .map(Some)
-                .ok_or_else(|| format!("unknown engine {name:?}")),
-        }
-    };
+                .get(participant.engine_name())
+                .ok_or_else(|| format!("unknown engine {:?}", participant.engine_name()))?;
+            Ok(Some(EngineConfig {
+                spec,
+                options: participant.options(),
+                debug: participant.debug(),
+            }))
+        };
     let white = match resolve(&request.white) {
-        Ok(spec) => spec,
+        Ok(config) => config,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(ErrorBody::new(message))).into_response()
         }
     };
     let black = match resolve(&request.black) {
-        Ok(spec) => spec,
+        Ok(config) => config,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(ErrorBody::new(message))).into_response()
         }
@@ -585,6 +644,77 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn post_games_with_engine_options_and_debug_applies_them_before_any_go() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let store = GameStore::new();
+        let app = router(store.clone(), registry);
+
+        let created = body_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "white": {
+                                "engine": "fake",
+                                "options": {"UCI_LimitStrength": true, "UCI_Elo": 1600},
+                                "debug": true
+                            },
+                            "move_time_ms": 50
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let id: crate::game::GameId = created["id"].as_str().unwrap().parse().unwrap();
+
+        let mut events = store.subscribe(id).expect("game should have a channel");
+        let sent_lines = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut sent = Vec::new();
+            loop {
+                if let Ok(GameEvent::Uci {
+                    direction: crate::uci_process::UciDirection::Sent,
+                    line,
+                    ..
+                }) = events.recv().await
+                {
+                    let is_go = line.starts_with("go");
+                    sent.push(line);
+                    if is_go {
+                        return sent;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("should see a 'go' within the timeout");
+
+        assert!(
+            sent_lines
+                .iter()
+                .any(|line| line == "setoption name UCI_LimitStrength value true"),
+            "should have sent UCI_LimitStrength before 'go': {sent_lines:?}"
+        );
+        assert!(
+            sent_lines
+                .iter()
+                .any(|line| line == "setoption name UCI_Elo value 1600"),
+            "should have sent UCI_Elo before 'go': {sent_lines:?}"
+        );
+        assert!(
+            sent_lines.iter().any(|line| line == "debug on"),
+            "should have sent 'debug on' before 'go': {sent_lines:?}"
+        );
     }
 
     /// Binds `router(store, engines)` on an ephemeral local port and

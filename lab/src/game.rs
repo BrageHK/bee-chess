@@ -465,14 +465,29 @@ impl GameStore {
     }
 }
 
+/// One engine-driven side's full configuration: which binary to spawn,
+/// plus the `setoption`s and debug flag a direct browser connection to
+/// the same engine could already set (see `UciClient.setOption`/
+/// `setDebug` in the frontend's `engine.ts`) -- e.g. Stockfish's
+/// `UCI_LimitStrength`/`UCI_Elo`, or Bee's debug diagnostics. Applied
+/// once, right after the process's `uci`/`isready` handshake, before
+/// any `go` -- see `run_engine_loop`.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub spec: EngineSpec,
+    /// `(name, value)` pairs, sent in order via `setoption`.
+    pub options: Vec<(String, String)>,
+    pub debug: bool,
+}
+
 /// Which side, if any, an engine plays as automated -- `None` is a
 /// human slot: the automatic loop below simply waits for that side's
 /// move to arrive via `POST /api/games/:id/moves` instead of ever
 /// trying to move for it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EngineSlots {
-    pub white: Option<EngineSpec>,
-    pub black: Option<EngineSpec>,
+    pub white: Option<EngineConfig>,
+    pub black: Option<EngineConfig>,
 }
 
 impl EngineSlots {
@@ -483,7 +498,7 @@ impl EngineSlots {
         self.white.is_some() || self.black.is_some()
     }
 
-    fn spec_for(&self, color: Color) -> Option<&EngineSpec> {
+    fn config_for(&self, color: Color) -> Option<&EngineConfig> {
         match color {
             Color::White => self.white.as_ref(),
             Color::Black => self.black.as_ref(),
@@ -498,7 +513,7 @@ impl EngineSlots {
 /// through, so there is exactly one place legality/status is decided,
 /// regardless of who's moving.
 ///
-/// A side with no `EngineSpec` in `slots` is a human slot: the loop
+/// A side with no `EngineConfig` in `slots` is a human slot: the loop
 /// polls (checking back every `HUMAN_MOVE_POLL_INTERVAL`) until that
 /// side's move shows up in the game's move list, applied by someone
 /// else calling the API, rather than ever trying to move for them.
@@ -533,7 +548,7 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
             return; // game vanished between the snapshot above and now
         };
 
-        let Some(spec) = slots.spec_for(side_to_move) else {
+        let Some(config) = slots.config_for(side_to_move) else {
             // Human slot: wait for their move to show up via the API
             // instead of polling tighter than a human can plausibly
             // move anyway.
@@ -561,13 +576,32 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
                     },
                 );
             });
-            match UciProcess::spawn(&spec.argv, &spec.cwd, Some(on_line)).await {
-                Ok(process) => *process_slot = Some(process),
-                Err(err) => {
-                    store.abort(id, format!("engine failed to start: {err}"));
+            let mut process =
+                match UciProcess::spawn(&config.spec.argv, &config.spec.cwd, Some(on_line)).await {
+                    Ok(process) => process,
+                    Err(err) => {
+                        store.abort(id, format!("engine failed to start: {err}"));
+                        return;
+                    }
+                };
+
+            // Apply this side's configuration (Stockfish's Elo limit,
+            // Bee's debug flag, etc. -- see `EngineConfig`'s docs) once,
+            // right after the handshake, before any `go`.
+            for (name, value) in &config.options {
+                if let Err(err) = process.set_option(name, value).await {
+                    store.abort(id, format!("failed to set {name}={value}: {err}"));
                     return;
                 }
             }
+            if config.debug {
+                if let Err(err) = process.set_debug(true).await {
+                    store.abort(id, format!("failed to enable debug: {err}"));
+                    return;
+                }
+            }
+
+            *process_slot = Some(process);
         }
         let process = process_slot.as_mut().expect("just ensured Some above");
 

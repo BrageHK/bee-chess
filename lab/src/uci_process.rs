@@ -6,13 +6,14 @@
 //! in via `POST /api/games/:id/moves`.
 //!
 //! Deliberately minimal: just enough of the UCI protocol to run one
-//! engine through one game (`uci`/`isready` handshake, `position`,
-//! `go movetime`, read `bestmove`). No `setoption`, no `ponder`, no
-//! concurrent search cancellation -- those are real gaps (Stockfish's
-//! strength/Elo limiting in particular isn't wired up here the way the
-//! frontend's direct WebSocket connection already does it), noted as
+//! engine through one game (`uci`/`isready` handshake, `setoption`,
+//! `debug`, `position`, `go movetime`, read `bestmove`). Still no
+//! `ponder` or concurrent search cancellation -- real gaps, noted as
 //! follow-up work rather than solved now, since proving the automatic
-//! play loop itself is this slice's actual goal.
+//! play loop itself was this module's original goal (`setoption`/
+//! `debug` were added afterward, for #69's 69c-1b prerequisite, once a
+//! lab-driven game needed to configure Stockfish's Elo or Bee's debug
+//! output the way a direct browser connection already could).
 
 use std::path::Path;
 use std::process::Stdio;
@@ -115,6 +116,29 @@ impl UciProcess {
         process.wait_for("readyok").await?;
 
         Ok(process)
+    }
+
+    /// Sends `setoption name <name> value <value>` and waits for the
+    /// engine to confirm it's still ready, so a caller can rely on the
+    /// option being applied before the next `go` -- same shape as the
+    /// frontend's own `UciClient.setOption` (`engine.ts`), now needed
+    /// server-side too so a lab-driven game can configure Stockfish's
+    /// Elo or Bee's debug output the way a direct browser connection
+    /// already could (see #69's 69c-1b prerequisite).
+    pub async fn set_option(&mut self, name: &str, value: &str) -> Result<(), UciProcessError> {
+        self.send(&format!("setoption name {name} value {value}"))
+            .await?;
+        self.send("isready").await?;
+        self.wait_for("readyok").await
+    }
+
+    /// Sends `debug on`/`debug off` and waits for the engine to
+    /// confirm it's still ready. Same reasoning as `set_option`: this
+    /// mirrors `UciClient.setDebug` on the frontend.
+    pub async fn set_debug(&mut self, on: bool) -> Result<(), UciProcessError> {
+        self.send(if on { "debug on" } else { "debug off" }).await?;
+        self.send("isready").await?;
+        self.wait_for("readyok").await
     }
 
     /// Sets the position to `startpos` plus `moves` (UCI long
@@ -304,7 +328,24 @@ mod tests {
             .expect("handshake should succeed");
 
         let result = process.best_move(&[], 100).await;
-        assert!(matches!(result, Err(UciProcessError::ProcessExited)));
+        // Two distinct real races can both legitimately fire here,
+        // depending on exactly when the already-`exit 0`'d process's
+        // pipes actually close relative to our writes: `read_line`
+        // seeing stdout closed (`ProcessExited`), or `send`'s write to
+        // an already-closed stdin failing first (`Io`, e.g. a broken
+        // pipe). Both correctly mean "the process is gone" -- and
+        // `run_engine_loop`'s caller already treats every
+        // `UciProcessError` variant identically (see its `Err(err) =>
+        // store.abort(...)` catch-all) -- so asserting either is the
+        // right test, not just the one that happens to win the race
+        // under a given system load.
+        assert!(
+            matches!(
+                result,
+                Err(UciProcessError::ProcessExited) | Err(UciProcessError::Io(_))
+            ),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -357,6 +398,99 @@ mod tests {
                 .iter()
                 .any(|(dir, line)| *dir == UciDirection::Received && line == "bestmove e2e4"),
             "should have seen the received bestmove line: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_option_sends_setoption_and_waits_for_readyok() {
+        let argv = fake_engine_argv(
+            r#"
+            read _; echo "uciok"
+            read _; echo "readyok"
+            read line; echo "got: $line" >> /dev/null
+            read _; echo "readyok"
+            "#,
+        );
+        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
+            .await
+            .expect("handshake should succeed");
+
+        let result = process.set_option("UCI_Elo", "1600").await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn set_option_captures_the_exact_setoption_line_via_on_line() {
+        let argv = fake_engine_argv(
+            r#"
+            read _; echo "uciok"
+            read _; echo "readyok"
+            read _
+            read _; echo "readyok"
+            "#,
+        );
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_for_callback = lines.clone();
+        let mut process = UciProcess::spawn(
+            &argv,
+            std::env::temp_dir().as_path(),
+            Some(Box::new(move |direction, line: &str| {
+                lines_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((direction, line.to_string()));
+            })),
+        )
+        .await
+        .expect("handshake should succeed");
+
+        process
+            .set_option("UCI_LimitStrength", "true")
+            .await
+            .expect("set_option should succeed");
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured.iter().any(|(dir, line)| *dir == UciDirection::Sent
+                && line == "setoption name UCI_LimitStrength value true"),
+            "should have sent the exact setoption line: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_debug_sends_debug_on_and_waits_for_readyok() {
+        let argv = fake_engine_argv(
+            r#"
+            read _; echo "uciok"
+            read _; echo "readyok"
+            read _
+            read _; echo "readyok"
+            "#,
+        );
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_for_callback = lines.clone();
+        let mut process = UciProcess::spawn(
+            &argv,
+            std::env::temp_dir().as_path(),
+            Some(Box::new(move |direction, line: &str| {
+                lines_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((direction, line.to_string()));
+            })),
+        )
+        .await
+        .expect("handshake should succeed");
+
+        let result = process.set_debug(true).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|(dir, line)| *dir == UciDirection::Sent && line == "debug on"),
+            "should have sent 'debug on': {captured:?}"
         );
     }
 }
