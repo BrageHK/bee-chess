@@ -79,6 +79,32 @@ export async function getGame(id: string): Promise<GameSnapshot> {
   return parseJsonOrThrow(response, "get game");
 }
 
+/**
+ * Briefly checks whether Bee Lab itself is reachable at all --
+ * enough to warn "Lab doesn't seem to be running" on the setup screen
+ * before the user configures a whole game around it, rather than only
+ * failing once `createGame` is called. Lab `require()`s both Stockfish
+ * and Bee at startup (see `lab/src/main.rs`) and refuses to start
+ * without them, so unlike the old per-bot-port bridge probe this used
+ * to replace, a single "is Lab up" check covers every engine Lab
+ * currently supports -- there's no per-engine reachability question
+ * to ask separately anymore.
+ */
+export async function checkLabAvailable(timeoutMs = 1500): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(LAB_BASE_URL, { signal: controller.signal });
+      return response.ok;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
+}
+
 /** `POST /api/games/:id/moves`. Rejects (does not silently ignore) if
  * Lab refuses the move for any reason -- illegal, game not running, or
  * the game doesn't exist -- so a caller can't mistake a rejected move

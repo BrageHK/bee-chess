@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createGame, getGame, LabError, postMove, subscribeToGameEvents, type GameEvent } from "./labClient";
+import {
+  checkLabAvailable,
+  createGame,
+  getGame,
+  LabError,
+  postMove,
+  subscribeToGameEvents,
+  type GameEvent,
+} from "./labClient";
 
 function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 400): Response {
   return {
@@ -180,5 +188,47 @@ describe("subscribeToGameEvents", () => {
     unsubscribe();
 
     expect(FakeWebSocket.instances[0].closed).toBe(true);
+  });
+});
+
+describe("checkLabAvailable", () => {
+  beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("resolves true when Lab responds ok", async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: true } as Response);
+
+    await expect(checkLabAvailable()).resolves.toBe(true);
+  });
+
+  it("resolves false when Lab responds with an error status", async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: false } as Response);
+
+    await expect(checkLabAvailable()).resolves.toBe(false);
+  });
+
+  it("resolves false when the fetch itself rejects (Lab unreachable)", async () => {
+    vi.mocked(fetch).mockRejectedValue(new TypeError("Failed to fetch"));
+
+    await expect(checkLabAvailable()).resolves.toBe(false);
+  });
+
+  it("resolves false if nothing happens before the timeout", async () => {
+    vi.useFakeTimers();
+    // A fetch that never settles -- simulates a request that just
+    // hangs (e.g. a firewall silently dropping packets) rather than
+    // failing immediately the way a refused connection would.
+    vi.mocked(fetch).mockImplementation(
+      (_url, init) =>
+        new Promise((_resolve, reject) => {
+          (init?.signal as AbortSignal | undefined)?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const resultPromise = checkLabAvailable(100);
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(resultPromise).resolves.toBe(false);
+
+    vi.useRealTimers();
   });
 });

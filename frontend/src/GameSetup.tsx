@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { checkBotAvailable, type BotKind } from "./engine";
+import { checkLabAvailable } from "./labClient";
 import {
   MAX_STOCKFISH_ELO,
   MIN_MOVE_TIME_MS,
@@ -12,17 +12,22 @@ import {
 } from "./participant";
 
 const PARTICIPANT_KINDS: ParticipantKind[] = ["human", "stockfish", "bee", "bee-mamba"];
-const BOT_KINDS: BotKind[] = ["stockfish", "bee", "bee-mamba"];
 
 /**
  * Pick a participant (human or one of the bots) for each side, like
  * choosing teams before a match: two independent slot pickers side by
  * side, each showing that bot's own config (Elo, move time, debug)
- * once selected. A bot that fails a quick reachability check on
- * mount is still selectable (the bridge might start it by the time
- * Start is clicked) but shown with a warning, rather than only
- * failing after the user has already configured a whole game around
- * it -- see `checkBotAvailable`.
+ * once selected.
+ *
+ * Per #69/67b: every engine-driven game goes through Bee Lab now, so
+ * "is this bot available" reduces to "is Lab itself reachable" --
+ * Lab refuses to start without both Stockfish and Bee (see
+ * `checkLabAvailable`'s docs), so a single reachability check on
+ * mount covers both. Bee-Mamba has no Lab-side engine yet (#66/#70)
+ * and is always shown unavailable, regardless of Lab's own
+ * reachability -- picking it still isn't blocked here (the same "warn,
+ * don't block" philosophy as before Lab existed), but `Game.tsx`
+ * refuses to actually start a game with it.
  */
 export function GameSetup({
   onStart,
@@ -31,15 +36,13 @@ export function GameSetup({
 }) {
   const [white, setWhite] = useState<Participant>(defaultParticipant("bee"));
   const [black, setBlack] = useState<Participant>(defaultParticipant("stockfish"));
-  const [unavailable, setUnavailable] = useState<Partial<Record<BotKind, boolean>>>({});
+  const [labUnavailable, setLabUnavailable] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    for (const kind of BOT_KINDS) {
-      void checkBotAvailable(kind).then((available) => {
-        if (!cancelled) setUnavailable((prev) => ({ ...prev, [kind]: !available }));
-      });
-    }
+    void checkLabAvailable().then((available) => {
+      if (!cancelled) setLabUnavailable(!available);
+    });
     return () => {
       cancelled = true;
     };
@@ -58,18 +61,8 @@ export function GameSetup({
       }}
     >
       <div style={{ display: "flex", gap: 24, flexWrap: "wrap", justifyContent: "center" }}>
-        <SlotPicker
-          label="White"
-          participant={white}
-          onChange={setWhite}
-          unavailable={unavailable}
-        />
-        <SlotPicker
-          label="Black"
-          participant={black}
-          onChange={setBlack}
-          unavailable={unavailable}
-        />
+        <SlotPicker label="White" participant={white} onChange={setWhite} labUnavailable={labUnavailable} />
+        <SlotPicker label="Black" participant={black} onChange={setBlack} labUnavailable={labUnavailable} />
       </div>
       {error && <p style={{ color: "crimson", margin: 0 }}>{error}</p>}
       <button type="submit" disabled={error !== null}>
@@ -79,17 +72,27 @@ export function GameSetup({
   );
 }
 
+/** Whether `kind` is currently unavailable, given whether Lab itself
+ * responded -- see the component doc comment above. */
+function isUnavailable(kind: ParticipantKind, labUnavailable: boolean): boolean {
+  if (kind === "human") return false;
+  if (kind === "bee-mamba") return true;
+  return labUnavailable;
+}
+
 function SlotPicker({
   label,
   participant,
   onChange,
-  unavailable,
+  labUnavailable,
 }: {
   label: string;
   participant: Participant;
   onChange: (participant: Participant) => void;
-  unavailable: Partial<Record<BotKind, boolean>>;
+  labUnavailable: boolean;
 }) {
+  const unavailable = isUnavailable(participant.kind, labUnavailable);
+
   return (
     <fieldset
       style={{
@@ -109,15 +112,15 @@ function SlotPicker({
         {PARTICIPANT_KINDS.map((kind) => (
           <option key={kind} value={kind}>
             {PARTICIPANT_LABELS[kind]}
-            {kind !== "human" && unavailable[kind] ? " (unavailable?)" : ""}
+            {isUnavailable(kind, labUnavailable) ? " (unavailable?)" : ""}
           </option>
         ))}
       </select>
-      {participant.kind !== "human" && unavailable[participant.kind] && (
+      {unavailable && (
         <p style={{ color: "#b45309", margin: 0, fontSize: 13 }}>
-          {PARTICIPANT_LABELS[participant.kind]} doesn't seem to be running on the bridge.
-          {participant.kind === "bee-mamba" &&
-            " It needs a trained checkpoint (see bridge/server.py)."}{" "}
+          {participant.kind === "bee-mamba"
+            ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
+            : "Bee Lab doesn't seem to be running (see lab/README.md)."}{" "}
           You can still try to start the game.
         </p>
       )}
