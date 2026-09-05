@@ -16,6 +16,15 @@ echo "==> engine: cargo clippy"
 echo "==> engine: cargo test"
 (cd engine && cargo test)
 
+echo "==> lab: cargo fmt --check"
+cargo fmt --check --manifest-path lab/Cargo.toml
+
+echo "==> lab: cargo clippy"
+(cd lab && cargo clippy --all-targets -- -D warnings)
+
+echo "==> lab: cargo test"
+(cd lab && cargo test)
+
 echo "==> training: ruff check"
 (cd training && uv run ruff check .)
 

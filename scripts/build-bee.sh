@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Builds the Bee engine in release mode (engine/target/release/bee).
+# Builds the Bee engine in release mode (target/release/bee).
+#
+# Output lives at the repo root's target/, not engine/target/, since
+# engine/ is a member of the root Cargo workspace (see /Cargo.toml,
+# introduced by #68/lab/) -- Cargo shares one target/ directory across
+# all workspace members by default.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +31,6 @@ if [ "$(echo "$CARGO_VERSION" | cut -d. -f1)" -eq 1 ] && [ "$CARGO_MINOR" -lt 78
   exit 1
 fi
 
-cargo build --release --manifest-path "$ROOT/engine/Cargo.toml" --bin bee
+cargo build --release --manifest-path "$ROOT/Cargo.toml" -p bee-engine --bin bee
 
-echo "built: $ROOT/engine/target/release/bee"
+echo "built: $ROOT/target/release/bee"

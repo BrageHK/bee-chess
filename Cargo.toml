@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["engine", "lab"]
+
+# `bee` (in engine/) stays the competition binary with zero web/orchestration
+# dependencies -- see #67's architecture issue. `lab` is a separate crate for
+# exactly that reason: it can depend on tokio/axum/etc. without any of that
+# ever reaching the engine binary itself, since Cargo workspace members don't
+# share dependencies unless they actually depend on each other.

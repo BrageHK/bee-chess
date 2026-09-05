@@ -24,7 +24,10 @@ import websockets
 
 ROOT = Path(__file__).resolve().parent.parent
 STOCKFISH = ROOT / "external" / "stockfish" / "src" / "stockfish"
-BEE = ROOT / "engine" / "target" / "release" / "bee"
+# Not engine/target/ -- engine/ is a member of the root Cargo workspace
+# (see /Cargo.toml, introduced alongside lab/ by #68), so Cargo shares
+# one target/ directory across all workspace members by default.
+BEE = ROOT / "target" / "release" / "bee"
 TRAINING = ROOT / "training"
 MAMBA_PYTHON = TRAINING / ".venv" / "bin" / "python3"
 MAMBA_CHECKPOINT = TRAINING / "checkpoints" / "main-dawg" / "latest.pt"
