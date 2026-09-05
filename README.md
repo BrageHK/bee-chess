@@ -2,13 +2,19 @@
 
 This is a crazy Transformer based chess engine with cool stuff.
 
-Bee Chess is one monorepo with three products plus one development tool.
+Bee Chess is one monorepo with three products plus development tooling.
 The competition engine is written in Rust, training and dataset
 generation is owned by Python, and a React client is used for
-development/visualization only. `bridge/` is a small development-only
-tool that lets that client talk to engine processes over WebSockets. See
+development/visualization only. See
 [`docs/adr/0001-v1-engine-architecture.md`](docs/adr/0001-v1-engine-architecture.md)
 for the full architecture decision.
+
+Two things currently connect the frontend to engine processes over
+WebSockets: `bridge/` (Python, the original, still what `./scripts/dev.sh`
+uses) and `lab/` (Rust, newer -- see #67/#68). `lab/` is being built out
+to eventually replace `bridge/` and become authoritative for game state
+too, not just a dumb relay; until that migration is further along, both
+exist and either works standalone. See [`lab/README.md`](lab/README.md).
 
 ## Repository layout
 
@@ -17,7 +23,8 @@ bee-chess/
 ├── docs/adr/          Architecture decision records
 ├── engine/            Rust UCI engine (competition hot path)
 ├── training/          Python training and dataset generation
-├── bridge/            Development-only WebSocket <-> UCI bridge
+├── bridge/            Development-only WebSocket <-> UCI bridge (Python)
+├── lab/               Development/orchestration server (Rust), replacing bridge/ -- see #67
 ├── frontend/          React development/visualization client
 ├── scripts/           Repo-level setup/dev/check/test entry points
 └── .github/workflows  CI
@@ -41,8 +48,11 @@ cd engine && cargo run --release --bin bee
 # Training
 cd training && uv sync && uv run pytest
 
-# Bridge (development WebSocket <-> UCI adapter)
+# Bridge (development WebSocket <-> UCI adapter, Python)
 cd bridge && uv sync && uv run python server.py
+
+# Lab (development/orchestration server, Rust -- see lab/README.md)
+cargo run -p bee-lab
 
 # Frontend
 cd frontend && npm install && npm run build

@@ -1,5 +1,7 @@
 # Rust
-/engine/target/
+# One shared target/ at the repo root, not /engine/target/, since
+# engine/ and lab/ are both members of the root Cargo workspace.
+/target/
 
 # Python
 /training/.venv/

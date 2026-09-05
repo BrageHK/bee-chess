@@ -1,0 +1,22 @@
+[package]
+name = "bee-lab"
+version = "0.1.0"
+edition = "2021"
+description = "Bee Chess Lab: orchestration/dev server -- static frontend hosting plus a UCI process relay over WebSocket. See #67; kept as a separate crate from bee-engine so the competition engine binary never gains a web dependency."
+license = "MIT"
+
+[[bin]]
+name = "bee-lab"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.28"
