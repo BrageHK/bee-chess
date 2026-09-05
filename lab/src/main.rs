@@ -8,14 +8,15 @@
 //!   cargo run -p bee-lab
 //!
 //! Also serves an authoritative game-state HTTP API under `/api/games`
-//! (see `api`/`game` -- #69/67b, slice 69a: `POST /api/games`,
-//! `GET /api/games/:id`, `POST /api/games/:id/moves`). The frontend
-//! does not use this yet -- it still owns position/clocks/move
-//! application itself against the `/ws/*` relay above, exactly as it
-//! does against the Python bridge today. Wiring the frontend to this
-//! API instead, and having the server drive each side's engine
-//! automatically rather than requiring a manual `POST .../moves` for
-//! every ply, are 69b/69c.
+//! (see `api`/`game` -- #69/67b): `POST /api/games` (optionally naming
+//! `white`/`black` engines by name to drive them automatically, see
+//! `api::CreateGameRequest`), `GET /api/games/:id`, and
+//! `POST /api/games/:id/moves` (still the way a human move, or a game
+//! with no engine side at all, reaches the server). The frontend does
+//! not use this yet -- it still owns position/clocks/move application
+//! itself against the `/ws/*` relay above, exactly as it does against
+//! the Python bridge today. Wiring the frontend to this API instead is
+//! 69c.
 //!
 //! Bee-Mamba (the Python/PyTorch engine) is intentionally not served
 //! here -- see #68's "out of scope." It stays on the old Python bridge
@@ -30,6 +31,7 @@ use tower_http::services::ServeDir;
 
 mod api;
 mod game;
+mod uci_process;
 mod uci_relay;
 
 use game::GameStore;
@@ -62,9 +64,18 @@ async fn main() {
         cwd: bee_path.parent().unwrap().to_path_buf(),
     };
 
+    // Stopgap engine registry (see `api::EngineRegistry`'s docs -- #70
+    // is the real descriptor-based version) so `POST /api/games` can
+    // name an engine by "stockfish"/"bee" instead of every caller
+    // needing a binary path.
+    let mut registry = api::EngineRegistry::new();
+    registry
+        .insert("stockfish", stockfish_spec.clone())
+        .insert("bee", bee_spec.clone());
+
     let app = uci_relay::route("/ws/stockfish", stockfish_spec)
         .merge(uci_relay::route("/ws/bee", bee_spec))
-        .merge(api::router(GameStore::new()))
+        .merge(api::router(GameStore::new(), registry))
         .fallback_service(ServeDir::new(&frontend_dist));
 
     let port: u16 = std::env::var("PORT")
