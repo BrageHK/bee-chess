@@ -3,15 +3,17 @@
 //! These types are the shared vocabulary between the UCI adapter and the
 //! search implementation. Per ADR 0001, the v1 search algorithm is
 //! alpha-beta/PVS. Fixed-depth negamax alpha-beta with a material
-//! evaluator is the first slice (see `search::alpha_beta`); iterative
-//! deepening, quiescence, transposition tables, and move ordering are
-//! separate follow-up PRs -- see issue #6.
+//! evaluator is the first slice (see `search::alpha_beta`), with
+//! time-bounded iterative deepening (`search_iterative`) as the second;
+//! quiescence, transposition tables, and move ordering are separate
+//! follow-up PRs -- see issue #6.
 
 use crate::chess::{Move, Position};
 
 mod alpha_beta;
+mod deadline;
 
-pub use alpha_beta::search;
+pub use alpha_beta::{search, search_iterative};
 
 /// A search score in centipawns, always from the perspective of the
 /// side to move at the point the score was produced (i.e. what
@@ -91,19 +93,24 @@ pub struct BestMove {
     pub ponder: Option<Move>,
 }
 
-/// The outcome of a single fixed-depth search: the move to play (if
-/// any -- `None` for checkmate/stalemate at the root), the score of
-/// that line from the root side to move's perspective, and how many
-/// nodes were visited. This is intentionally separate from the
+/// The outcome of a completed search to some depth: the move to play
+/// (if any -- `None` for checkmate/stalemate at the root), the score
+/// and principal variation of that line from the root side to move's
+/// perspective, how many nodes were visited, and the depth actually
+/// completed (for a fixed-depth search, always the requested depth;
+/// for iterative deepening, the last depth that finished before the
+/// time budget ran out). This is intentionally separate from the
 /// `Search` trait below (which is the eventual UCI-facing shape, not
-/// yet wired up to a real implementation) -- it gives fixed-depth
-/// search somewhere to report diagnostics from day one without
-/// waiting for iterative deepening/PV/cancellation to exist.
+/// yet wired up to a real implementation) -- it gives search somewhere
+/// to report diagnostics from day one without waiting for
+/// cancellation/threading to exist.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub best_move: Option<Move>,
     pub score: Score,
     pub nodes: u64,
+    pub depth: u32,
+    pub pv: Vec<Move>,
 }
 
 /// A search algorithm. Implementations run to completion (bounded by
