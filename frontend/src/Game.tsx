@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { Chess } from "chessops/chess";
 import { makeFen } from "chessops/fen";
 import { chessgroundDests } from "chessops/compat";
@@ -298,9 +298,12 @@ export function Game({
         {clientFor("black") && (
           <EvalBar color="black" subscribe={(l) => clientFor("black")!.onLog(l)} />
         )}
+        <MoveNav
+          nav={nav}
+          status={status}
+          onSelect={(viewIndex) => setNav((prev) => ({ ...prev, viewIndex }))}
+        />
       </div>
-      <p>{status}</p>
-      <MoveNav nav={nav} onSelect={(viewIndex) => setNav((prev) => ({ ...prev, viewIndex }))} />
       {finished && <button onClick={onBackToSetup}>New game</button>}
       <BotPanels color="white" participant={white} client={clientFor("white")} />
       <BotPanels color="black" participant={black} client={clientFor("black")} />
@@ -310,54 +313,126 @@ export function Game({
 
 /** Move list (click any move to jump to the position right after it)
  * plus Prev/Next stepping and a way back to the live position -- the
- * board above always shows whatever ply is selected here, the arrow
- * keys step it, and the underlying game (and any bot replying) keeps
- * running regardless of what's currently on screen. */
-function MoveNav({ nav, onSelect }: { nav: Nav; onSelect: (viewIndex: number) => void }) {
+ * board always shows whatever ply is selected here, the arrow keys
+ * step it, and the underlying game (and any bot replying) keeps
+ * running regardless of what's currently on screen.
+ *
+ * Laid out lichess/chess.com-style: a boxed panel to the right of the
+ * board, same height as it, with a scrolling two-column move table on
+ * top and the step controls pinned to the bottom. */
+function MoveNav({
+  nav,
+  status,
+  onSelect,
+}: {
+  nav: Nav;
+  status: string;
+  onSelect: (viewIndex: number) => void;
+}) {
   const following = nav.viewIndex === nav.history.length - 1;
   const atStart = nav.viewIndex === 0;
 
+  // Pair up (white, black) plies per move number for the two-column
+  // table; a game ending mid-move leaves `black` undefined.
+  const moves = nav.history.slice(1);
+  const rows: { num: number; white: { ply: (typeof moves)[number]; viewIndex: number }; black?: { ply: (typeof moves)[number]; viewIndex: number } }[] = [];
+  for (let i = 0; i < moves.length; i += 2) {
+    rows.push({
+      num: i / 2 + 1,
+      white: { ply: moves[i], viewIndex: i + 1 },
+      black: moves[i + 1] ? { ply: moves[i + 1], viewIndex: i + 2 } : undefined,
+    });
+  }
+
+  const cellStyle = (viewIndex: number): CSSProperties => ({
+    padding: "2px 6px",
+    borderRadius: 4,
+    cursor: "pointer",
+    color: "var(--text-h)",
+    fontWeight: viewIndex === nav.viewIndex ? "bold" : "normal",
+    background: viewIndex === nav.viewIndex ? "var(--accent-bg)" : "transparent",
+  });
+
   return (
-    <div style={{ display: "grid", gap: 8, width: "100%", maxWidth: 900, justifyItems: "center" }}>
-      <div style={{ display: "flex", gap: 8 }}>
-        <button type="button" disabled={atStart} onClick={() => onSelect(0)}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        width: 260,
+        height: 480,
+        border: "1px solid var(--border)",
+        borderRadius: 6,
+        overflow: "hidden",
+        textAlign: "left",
+        background: "var(--code-bg)",
+        color: "var(--text)",
+      }}
+    >
+      <div style={{ padding: "6px 10px", borderBottom: "1px solid var(--border)", fontSize: 14 }}>
+        {status}
+      </div>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.num}>
+                <td style={{ padding: "2px 6px", color: "var(--text)", width: 32 }}>{row.num}.</td>
+                <td style={cellStyle(row.white.viewIndex)} onClick={() => onSelect(row.white.viewIndex)}>
+                  {row.white.ply.san}
+                </td>
+                <td
+                  style={row.black ? cellStyle(row.black.viewIndex) : undefined}
+                  onClick={row.black ? () => onSelect(row.black!.viewIndex) : undefined}
+                >
+                  {row.black?.ply.san ?? ""}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: "flex", borderTop: "1px solid var(--border)" }}>
+        <button type="button" disabled={atStart} onClick={() => onSelect(0)} style={navButtonStyle}>
           |◀
         </button>
-        <button type="button" disabled={atStart} onClick={() => onSelect(nav.viewIndex - 1)}>
-          ◀ Prev
+        <button
+          type="button"
+          disabled={atStart}
+          onClick={() => onSelect(nav.viewIndex - 1)}
+          style={navButtonStyle}
+        >
+          ◀
         </button>
         <button
           type="button"
           disabled={following}
           onClick={() => onSelect(nav.viewIndex + 1)}
+          style={navButtonStyle}
         >
-          Next ▶
+          ▶
         </button>
-        <button type="button" disabled={following} onClick={() => onSelect(nav.history.length - 1)}>
-          ▶| Live
+        <button
+          type="button"
+          disabled={following}
+          onClick={() => onSelect(nav.history.length - 1)}
+          style={navButtonStyle}
+        >
+          ▶|
         </button>
-      </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, textAlign: "left" }}>
-        {nav.history.slice(1).map((ply, i) => {
-          const viewIndex = i + 1;
-          const isWhiteMove = viewIndex % 2 === 1;
-          return (
-            <span key={viewIndex} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
-              {isWhiteMove && <span style={{ color: "#777" }}>{Math.ceil(viewIndex / 2)}.</span>}
-              <button
-                type="button"
-                onClick={() => onSelect(viewIndex)}
-                style={{ fontWeight: viewIndex === nav.viewIndex ? "bold" : "normal" }}
-              >
-                {ply.san}
-              </button>
-            </span>
-          );
-        })}
       </div>
     </div>
   );
 }
+
+const navButtonStyle: CSSProperties = {
+  flex: 1,
+  padding: "8px 0",
+  border: "none",
+  borderRight: "1px solid var(--border)",
+  background: "transparent",
+  color: "var(--text-h)",
+  cursor: "pointer",
+};
 
 /** Renders the stats + log panels for one slot, if it's a bot -- human
  * slots have no UciClient and so nothing to show here. */
