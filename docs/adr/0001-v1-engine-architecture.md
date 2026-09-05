@@ -49,3 +49,10 @@ HTTP/WebSocket observability lives outside the search hot path.
 - This decision can be revisited via a new ADR if a future milestone
   requires it (e.g. an explicit MCTS research effort), but it is binding
   for all v1 work.
+- The architecture is not tied to one specific machine: it must remain
+  configurable across reasonable CPU, memory, and time-control
+  environments rather than assuming a particular thread count, hash
+  size, or GPU availability. Hardware-specific tuning and
+  competition-specific constraints (baseline opponent, time controls,
+  deployment platform) are documented separately, in experiment,
+  benchmark, and tournament configuration rather than in this ADR.
