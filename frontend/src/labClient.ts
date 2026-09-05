@@ -24,12 +24,22 @@ export type GameStatus =
   | { status: "finished"; result: "white_wins" | "black_wins" | "draw" }
   | { status: "aborted"; reason: string };
 
+/** Mirrors `game::ParticipantInfo`'s JSON shape exactly -- who plays
+ * one side of a game, and enough to reconstruct that side's UI (is it
+ * a human who can drag pieces? which engine's eval bar is this?) from
+ * the snapshot alone, without a client needing to have remembered
+ * `Participant` configuration on its own. This is what lets a page
+ * refresh resume a game by persisting only its id (see `App.tsx`). */
+export type ParticipantInfo = { kind: "human" } | { kind: "engine"; name: string; debug: boolean };
+
 /** Mirrors `game::GameSnapshot`'s JSON shape exactly -- the complete,
  * self-sufficient resync payload `GET /api/games/:id` returns. */
 export type GameSnapshot = {
   id: string;
   fen: string;
   moves: string[];
+  white: ParticipantInfo;
+  black: ParticipantInfo;
 } & GameStatus;
 
 /** One side's requested participant for `createGame` -- mirrors

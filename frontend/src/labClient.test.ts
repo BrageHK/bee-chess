@@ -18,6 +18,22 @@ function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 400): Respon
   } as Response;
 }
 
+/** A minimal, human-vs-human `GameSnapshot` fixture -- these tests
+ * exercise labClient's request/response plumbing, not participant
+ * rendering, so `white`/`black` only need to be present and valid,
+ * not varied per test. */
+function humanSnapshot(overrides: Partial<{ id: string; fen: string; moves: string[]; status: "running" }> = {}) {
+  return {
+    id: "abc",
+    fen: "start",
+    moves: [] as string[],
+    status: "running" as const,
+    white: { kind: "human" as const },
+    black: { kind: "human" as const },
+    ...overrides,
+  };
+}
+
 describe("createGame", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
@@ -27,7 +43,7 @@ describe("createGame", () => {
   it("POSTs to /api/games with only the fields that were given", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(
-      jsonResponse({ id: "abc", fen: "start", moves: [], status: "running" }),
+      jsonResponse(humanSnapshot()),
     );
 
     await createGame({ white: "stockfish", moveTimeMs: 250 });
@@ -44,7 +60,7 @@ describe("createGame", () => {
   it("sends an empty body when called with no request at all", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(
-      jsonResponse({ id: "abc", fen: "start", moves: [], status: "running" }),
+      jsonResponse(humanSnapshot()),
     );
 
     await createGame();
@@ -56,7 +72,7 @@ describe("createGame", () => {
   });
 
   it("returns the parsed snapshot on success", async () => {
-    const snapshot = { id: "abc", fen: "start", moves: [], status: "running" as const };
+    const snapshot = humanSnapshot();
     vi.mocked(fetch).mockResolvedValue(jsonResponse(snapshot));
 
     await expect(createGame()).resolves.toEqual(snapshot);
@@ -77,7 +93,7 @@ describe("getGame", () => {
   it("GETs /api/games/:id", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(
-      jsonResponse({ id: "abc", fen: "start", moves: [], status: "running" }),
+      jsonResponse(humanSnapshot()),
     );
 
     await getGame("abc");
@@ -99,7 +115,7 @@ describe("postMove", () => {
   it("POSTs the uci move to /api/games/:id/moves", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(
-      jsonResponse({ id: "abc", fen: "after-e4", moves: ["e2e4"], status: "running" }),
+      jsonResponse(humanSnapshot({ fen: "after-e4", moves: ["e2e4"] })),
     );
 
     await postMove("abc", "e2e4");
@@ -157,20 +173,13 @@ describe("subscribeToGameEvents", () => {
     subscribeToGameEvents("abc", (event) => events.push(event));
 
     const ws = FakeWebSocket.instances[0];
+    const snapshot = humanSnapshot({ moves: ["e2e4"] });
     ws.receive(JSON.stringify({ type: "uci", color: "white", direction: "received", line: "uciok" }));
-    ws.receive(
-      JSON.stringify({
-        type: "updated",
-        snapshot: { id: "abc", fen: "start", moves: ["e2e4"], status: "running" },
-      }),
-    );
+    ws.receive(JSON.stringify({ type: "updated", snapshot }));
 
     expect(events).toEqual([
       { type: "uci", color: "white", direction: "received", line: "uciok" },
-      {
-        type: "updated",
-        snapshot: { id: "abc", fen: "start", moves: ["e2e4"], status: "running" },
-      },
+      { type: "updated", snapshot },
     ]);
   });
 

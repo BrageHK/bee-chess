@@ -17,10 +17,11 @@ import {
   type Color,
   type GameEvent,
   type GameSnapshot,
+  type ParticipantInfo,
   type ParticipantRequest,
 } from "./labClient";
 
-/** Board position before Lab has responded to `createGame` yet. */
+/** Board position before Lab has responded yet. */
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 /** How this component polls `GET /api/games/:id` to stay in sync while
@@ -29,32 +30,56 @@ const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
  * socket alone. */
 const POLL_INTERVAL_MS = 500;
 
+/** Either start a brand-new game (the setup screen's `Participant`
+ * configuration for each side) or resume an existing one by id alone
+ * -- see the component doc comment below for why resuming needs
+ * nothing but the id. */
+export type GameSource = { kind: "start"; white: Participant; black: Participant } | { kind: "resume"; gameId: string };
+
 /**
- * Plays one game between whatever `white`/`black` are configured as --
- * any mix of human and bots. Per #69/67b: this component owns none of
- * position/turn/legality/result itself. It asks Bee Lab to create a
- * game, renders whatever `GameSnapshot` Lab reports (via an initial
- * `getGame` plus a `GameEvent::Updated` stream, with polling as a
- * fallback in case the socket drops), and for a human's move asks Lab
- * to apply it via `postMove` -- trusting Lab's answer either way. Lab
- * itself drives any engine-controlled side automatically; this
- * component never talks to an engine process directly.
+ * Plays one game. Per #69/67b: this component owns none of
+ * position/turn/legality/result/participant-configuration itself --
+ * `GameSnapshot` (from Bee Lab) is the single source of truth for all
+ * of it, including *who is playing each side* (`ParticipantInfo`),
+ * which is why a page refresh can resume a game by persisting only its
+ * id (see `App.tsx`'s `?game=` URL param) rather than needing to
+ * remember the original `Participant` configuration too -- Lab already
+ * knows.
+ *
+ * For a fresh game (`source.kind === "start"`), this component calls
+ * `createGame` with `white`/`black` mapped from the setup screen's
+ * `Participant` config, then renders from the returned snapshot exactly
+ * like a resumed one from then on. For a resumed game
+ * (`source.kind === "resume"`), it skips straight to `getGame(gameId)`.
+ * Either way, once a snapshot exists, it's kept fresh via the
+ * WebSocket event stream primarily, with polling `GET /api/games/:id`
+ * as a fallback for a dropped/never-connected socket -- `GET` is the
+ * authoritative resync mechanism regardless, so polling it is never
+ * wrong, just occasionally redundant with a live event that already
+ * arrived. A human's move goes through `postMove`, trusting Lab's
+ * answer either way.
  *
  * Bee-Mamba has no Lab-side engine yet (see #66/#70) -- picking it for
- * either slot shows an "unavailable" message instead of attempting to
- * create a game, rather than silently falling back to some other path.
+ * either slot on a fresh game shows an "unavailable" message instead
+ * of attempting to create a game.
  *
  * The parent renders this with a `key` that changes per game, so a new
  * game is a fresh mount rather than this instance being reset in
  * place.
  */
 export function Game({
-  white,
-  black,
+  source,
+  onGameCreated,
   onBackToSetup,
 }: {
-  white: Participant;
-  black: Participant;
+  source: GameSource;
+  /** Called once with the game's id, as soon as it's known -- for a
+   * "start"-kind source, that's only after `createGame` resolves (its
+   * id doesn't exist beforehand); for "resume", it's the same id
+   * `source` already carried. Lets `App.tsx` keep the `?game=` URL
+   * param in sync even for a freshly started game, not just a resumed
+   * one. */
+  onGameCreated: (gameId: string) => void;
   onBackToSetup: () => void;
 }) {
   const gameIdRef = useRef<string | null>(null);
@@ -68,23 +93,26 @@ export function Game({
   const [status, setStatus] = useState("connecting to Bee Lab…");
   const [unavailable, setUnavailable] = useState<string | null>(null);
 
-  const participantFor = (color: Color): Participant => (color === "white" ? white : black);
+  const participantInfoFor = (color: Color): ParticipantInfo | null =>
+    snapshot ? (color === "white" ? snapshot.white : snapshot.black) : null;
   const nameFor = (color: Color): string => {
-    const participant = participantFor(color);
-    if (participant.kind === "human") return "You";
-    return participant.kind === "bee-mamba" ? "Bee-Mamba" : participant.kind;
+    const info = participantInfoFor(color);
+    if (!info) return "…";
+    return info.kind === "human" ? "You" : info.name;
   };
 
   const humanTurnColor = (): Color | null => {
     if (!snapshot || snapshot.status !== "running") return null;
     const turn: Color = snapshot.moves.length % 2 === 0 ? "white" : "black";
-    return participantFor(turn).kind === "human" ? turn : null;
+    return participantInfoFor(turn)?.kind === "human" ? turn : null;
   };
 
   const applySnapshot = (next: GameSnapshot) => {
     setSnapshot(next);
     if (next.status === "running") {
-      setStatus(humanTurnColorFor(next, white, black) ? "your move" : "thinking…");
+      const turn: Color = next.moves.length % 2 === 0 ? "white" : "black";
+      const onMove = turn === "white" ? next.white : next.black;
+      setStatus(onMove.kind === "human" ? "your move" : "thinking…");
     } else if (next.status === "finished") {
       setStatus(next.result === "draw" ? "game over — draw" : `game over — ${next.result.replace("_wins", "")} wins`);
     } else {
@@ -92,31 +120,37 @@ export function Game({
     }
   };
 
-  // Creates the Lab-side game and starts polling/subscribing. Runs
-  // once per mount, i.e. once per game (see the component doc comment
-  // above) -- guarded against React StrictMode's dev-only double-invoke
-  // the same way the previous client-driven version was: a `cancelled`
-  // flag, checked before ever touching state, so a superseded first run
-  // never races a second `createGame` call against this one.
+  // Starts or resumes the Lab-side game and begins polling/subscribing.
+  // Runs once per mount, i.e. once per game (see the component doc
+  // comment above) -- guarded against React StrictMode's dev-only
+  // double-invoke the same way the previous client-driven version was:
+  // a `cancelled` flag, checked before ever touching state, so a
+  // superseded first run never races a second `createGame`/`getGame`
+  // call against this one.
   useEffect(() => {
     let cancelled = false;
     let unsubscribe: (() => void) | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-    const bad = badParticipant(white) ?? badParticipant(black);
-    if (bad) {
-      setUnavailable(bad);
-      return;
+    if (source.kind === "start") {
+      const bad = badParticipant(source.white) ?? badParticipant(source.black);
+      if (bad) {
+        setUnavailable(bad);
+        return;
+      }
     }
 
     void (async () => {
-      let created: GameSnapshot;
+      let initial: GameSnapshot;
       try {
-        created = await createGame({
-          white: toParticipantRequest(white),
-          black: toParticipantRequest(black),
-          moveTimeMs: moveTimeMsFor(white, black),
-        });
+        initial =
+          source.kind === "resume"
+            ? await getGame(source.gameId)
+            : await createGame({
+                white: toParticipantRequest(source.white),
+                black: toParticipantRequest(source.black),
+                moveTimeMs: moveTimeMsFor(source.white, source.black),
+              });
       } catch (err) {
         if (cancelled) return;
         setStatus(message(err));
@@ -124,8 +158,9 @@ export function Game({
       }
       if (cancelled) return;
 
-      gameIdRef.current = created.id;
-      applySnapshot(created);
+      gameIdRef.current = initial.id;
+      onGameCreated(initial.id);
+      applySnapshot(initial);
 
       // The WebSocket stream is the primary way this component learns
       // about moves/status changes (and the only way it sees live UCI
@@ -133,14 +168,14 @@ export function Game({
       // polling `getGame` is purely a fallback for a dropped/never-
       // connected socket, since `GET /api/games/:id` is the
       // authoritative resync mechanism regardless (see labClient.ts).
-      unsubscribe = subscribeToGameEvents(created.id, (event: GameEvent) => {
+      unsubscribe = subscribeToGameEvents(initial.id, (event: GameEvent) => {
         if (cancelled) return;
         if (event.type === "updated") applySnapshot(event.snapshot);
         for (const listener of logListenersRef.current) listener(event);
       });
 
       pollTimer = setInterval(() => {
-        void getGame(created.id).then(
+        void getGame(initial.id).then(
           (fresh) => {
             if (!cancelled) applySnapshot(fresh);
           },
@@ -156,9 +191,9 @@ export function Game({
       unsubscribe?.();
       if (pollTimer) clearInterval(pollTimer);
     };
-    // Intentionally empty deps: white/black/onBackToSetup are fixed
-    // for this component's lifetime (a new game remounts it via a
-    // fresh `key` instead of these props changing in place).
+    // Intentionally empty deps: source/onBackToSetup are fixed for
+    // this component's lifetime (a new game remounts it via a fresh
+    // `key` instead of these props changing in place).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -222,7 +257,7 @@ export function Game({
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-        {white.kind !== "human" && (
+        {participantInfoFor("white")?.kind === "engine" && (
           <EvalBar color="white" subscribe={logSubscribeFor(logListenersRef, "white")} />
         )}
         <Chessground
@@ -240,38 +275,38 @@ export function Game({
             },
           }}
         />
-        {black.kind !== "human" && (
+        {participantInfoFor("black")?.kind === "engine" && (
           <EvalBar color="black" subscribe={logSubscribeFor(logListenersRef, "black")} />
         )}
       </div>
       <p>{status}</p>
       {finished && <button onClick={onBackToSetup}>New game</button>}
-      <BotPanels color="white" participant={white} logListenersRef={logListenersRef} />
-      <BotPanels color="black" participant={black} logListenersRef={logListenersRef} />
+      <BotPanels color="white" info={participantInfoFor("white")} logListenersRef={logListenersRef} />
+      <BotPanels color="black" info={participantInfoFor("black")} logListenersRef={logListenersRef} />
     </section>
   );
 }
 
-/** Renders the stats + log panels for one slot, if it's a bot -- human
- * slots have no engine traffic and so nothing to show here. */
+/** Renders the stats + log panels for one slot, if it's engine-driven
+ * -- a human slot has no engine traffic and so nothing to show here.
+ * `info` is `null` until the initial snapshot arrives. */
 function BotPanels({
   color,
-  participant,
+  info,
   logListenersRef,
 }: {
   color: Color;
-  participant: Participant;
+  info: ParticipantInfo | null;
   logListenersRef: RefObject<Set<(event: GameEvent) => void>>;
 }) {
-  if (participant.kind === "human") return null;
+  if (!info || info.kind === "human") return null;
 
-  const name = participant.kind === "bee-mamba" ? "Bee-Mamba" : participant.kind;
   const subscribe = logSubscribeFor(logListenersRef, color);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%", maxWidth: 900 }}>
-      <SearchStatsPanel name={`${name} (${color})`} subscribe={subscribe} />
-      <UciLogPanel name={`${name} (${color})`} subscribe={subscribe} />
+      <SearchStatsPanel name={`${info.name} (${color})`} subscribe={subscribe} />
+      <UciLogPanel name={`${info.name} (${color})`} subscribe={subscribe} />
     </div>
   );
 }
@@ -298,15 +333,19 @@ function logSubscribeFor(
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 /** Bee-Mamba has no Lab-side engine yet (#66/#70) -- returns an
- * explanatory message if `participant` picks it, else `null`. */
+ * explanatory message if `participant` picks it, else `null`. Only
+ * relevant for a fresh game: a resumed one's participants already went
+ * through this check when it was first created. */
 function badParticipant(participant: Participant): string | null {
   return participant.kind === "bee-mamba"
     ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
     : null;
 }
 
-/** Maps a frontend `Participant` to the request shape `createGame`
- * expects, or `undefined` for a human slot. */
+/** Maps a frontend `Participant` (the setup screen's configuration) to
+ * the request shape `createGame` expects, or `undefined` for a human
+ * slot. Only used when starting a fresh game -- a resumed game's
+ * participants come from the snapshot's `ParticipantInfo` instead. */
 function toParticipantRequest(participant: Participant): ParticipantRequest | undefined {
   switch (participant.kind) {
     case "human":
@@ -335,13 +374,6 @@ function moveTimeMsFor(white: Participant, black: Participant): number | undefin
   if ("moveTimeMs" in white) return white.moveTimeMs;
   if ("moveTimeMs" in black) return black.moveTimeMs;
   return undefined;
-}
-
-function humanTurnColorFor(snapshot: GameSnapshot, white: Participant, black: Participant): boolean {
-  if (snapshot.status !== "running") return false;
-  const turn: Color = snapshot.moves.length % 2 === 0 ? "white" : "black";
-  const participant = turn === "white" ? white : black;
-  return participant.kind === "human";
 }
 
 function lastMoveKeys(snapshot: GameSnapshot | null): Key[] | undefined {
