@@ -125,3 +125,66 @@ describe("UciClient logging", () => {
     expect(b).toHaveLength(1);
   });
 });
+
+/** Completes a client's uci/isready handshake against a FakeWebSocket. */
+async function completeHandshake(client: UciClient): Promise<FakeWebSocket> {
+  const readyPromise = client.init();
+  await Promise.resolve();
+  const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  ws.receive("uciok");
+  ws.receive("readyok");
+  await readyPromise;
+  return ws;
+}
+
+describe("UciClient.setDebug", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends 'debug on' then 'isready', and resolves once readyok arrives", async () => {
+    const client = new UciClient("ws://test", "engine");
+    const ws = await completeHandshake(client);
+
+    const setDebugPromise = client.setDebug(true);
+    await Promise.resolve(); // let the already-resolved init() await settle
+    expect(ws.sent.slice(-2)).toEqual(["debug on", "isready"]);
+
+    ws.receive("readyok");
+    await setDebugPromise; // resolves once readyok arrives
+  });
+
+  it("sends 'debug off'", async () => {
+    const client = new UciClient("ws://test", "engine");
+    const ws = await completeHandshake(client);
+
+    const setDebugPromise = client.setDebug(false);
+    await Promise.resolve();
+    expect(ws.sent.slice(-2)).toEqual(["debug off", "isready"]);
+
+    ws.receive("readyok");
+    await setDebugPromise;
+  });
+
+  it("only resolves once readyok arrives, not merely after sending", async () => {
+    const client = new UciClient("ws://test", "engine");
+    const ws = await completeHandshake(client);
+
+    let resolved = false;
+    const setDebugPromise = client.setDebug(true).then(() => {
+      resolved = true;
+    });
+
+    await Promise.resolve();
+    expect(resolved).toBe(false); // no readyok yet
+
+    ws.receive("readyok");
+    await setDebugPromise;
+    expect(resolved).toBe(true);
+  });
+});
