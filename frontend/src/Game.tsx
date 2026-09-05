@@ -239,6 +239,9 @@ export function Game({
   const canMoveColor = humanTurnColor();
   const fen = snapshot?.fen ?? START_FEN;
   const lastMove = lastMoveKeys(snapshot);
+  // Put the human player's pieces nearest them. White remains the default
+  // while the snapshot is loading and for games without a human Black side.
+  const orientation = snapshot?.black.kind === "human" ? "black" : "white";
   const dests = canMoveColor ? chessgroundDestsFromFen(fen) : new Map<Key, Key[]>();
   const finished = snapshot ? snapshot.status !== "running" : false;
 
@@ -264,6 +267,7 @@ export function Game({
           config={{
             fen,
             lastMove,
+            orientation,
             coordinatesOnSquares: true,
             viewOnly: canMoveColor === null,
             turnColor: snapshot && snapshot.moves.length % 2 === 1 ? "black" : "white",
