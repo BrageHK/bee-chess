@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Chess } from "chessops/chess";
 import { makeFen } from "chessops/fen";
 import { chessgroundDests } from "chessops/compat";
+import { makeSanAndPlay } from "chessops/san";
 import { parseUci } from "chessops/util";
 import type { Key, Dests } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
@@ -10,6 +11,7 @@ import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
 import { EvalBar } from "./EvalBar";
 import type { Participant } from "./participant";
+import { pushPly, startNav, type Nav } from "./gameHistory";
 
 /** Claim a draw once the fifty-move counter is full; chessops does not. */
 const MAX_HALFMOVES = 100;
@@ -46,8 +48,7 @@ export function Game({
   const movesRef = useRef<string[]>([]);
   const clientsRef = useRef<{ white?: UciClient; black?: UciClient }>({});
 
-  const [fen, setFen] = useState(START_FEN);
-  const [lastMove, setLastMove] = useState<Key[] | undefined>();
+  const [nav, setNav] = useState<Nav>(() => startNav(START_FEN));
   const [turn, setTurn] = useState<Color>("white");
   const [dests, setDests] = useState<Dests>(new Map());
   const [status, setStatus] = useState("starting…");
@@ -67,7 +68,6 @@ export function Game({
   };
 
   const syncBoardState = () => {
-    setFen(makeFen(posRef.current.toSetup()));
     setTurn(posRef.current.turn);
     setDests(humanTurnColor() ? chessgroundDests(posRef.current) : new Map());
   };
@@ -92,9 +92,13 @@ export function Game({
   const applyMove = (uci: string): boolean => {
     const move = parseUci(uci);
     if (!move || !posRef.current.isLegal(move)) return false;
-    posRef.current.play(move);
+    // makeSanAndPlay reads the SAN off `posRef.current` *before* playing
+    // the move, then plays it -- same mutation as the old bare `.play`,
+    // plus the string this history list wants.
+    const san = makeSanAndPlay(posRef.current, move);
     movesRef.current.push(uci);
-    setLastMove([uci.slice(0, 2), uci.slice(2, 4)] as Key[]);
+    const lastMove = [uci.slice(0, 2), uci.slice(2, 4)] as Key[];
+    setNav((prev) => pushPly(prev, { fen: makeFen(posRef.current.toSetup()), lastMove, san }));
     syncBoardState();
     return true;
   };
@@ -220,7 +224,7 @@ export function Game({
    * left is pawn promotion -- try the plain move first, and only add
    * the queen-promotion suffix if the board actually calls for one. */
   const onHumanMove = (orig: Key, dest: Key) => {
-    if (!humanTurnColor()) return;
+    if (!following || !humanTurnColor()) return;
 
     const plain = `${orig}${dest}`;
     const plainMove = parseUci(plain);
@@ -231,7 +235,29 @@ export function Game({
     void runBotTurns();
   };
 
-  const canMoveColor = humanTurnColor();
+  // Stepping through history is view-only, regardless of whose turn it
+  // really is -- there's no "play a move from an earlier position"
+  // here, only browsing (see the issue this closes: "go forward and
+  // backward in time", not branch the game).
+  const following = nav.viewIndex === nav.history.length - 1;
+  const canMoveColor = following ? humanTurnColor() : null;
+  const shownPly = nav.history[nav.viewIndex];
+
+  // Arrow keys step through history the same as the Prev/Next buttons.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "ArrowLeft") {
+        setNav((prev) => ({ ...prev, viewIndex: Math.max(0, prev.viewIndex - 1) }));
+      } else if (e.key === "ArrowRight") {
+        setNav((prev) => ({
+          ...prev,
+          viewIndex: Math.min(prev.history.length - 1, prev.viewIndex + 1),
+        }));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   return (
     <section
@@ -253,8 +279,8 @@ export function Game({
         )}
         <Chessground
           config={{
-            fen,
-            lastMove,
+            fen: shownPly.fen,
+            lastMove: shownPly.lastMove,
             // Default `coordinates: true` floats rank/file labels a few px
             // inside the board's own edge, overlapping back-rank pieces on
             // our fixed 480x480 board (#51). on-square labels avoid that.
@@ -274,10 +300,62 @@ export function Game({
         )}
       </div>
       <p>{status}</p>
+      <MoveNav nav={nav} onSelect={(viewIndex) => setNav((prev) => ({ ...prev, viewIndex }))} />
       {finished && <button onClick={onBackToSetup}>New game</button>}
       <BotPanels color="white" participant={white} client={clientFor("white")} />
       <BotPanels color="black" participant={black} client={clientFor("black")} />
     </section>
+  );
+}
+
+/** Move list (click any move to jump to the position right after it)
+ * plus Prev/Next stepping and a way back to the live position -- the
+ * board above always shows whatever ply is selected here, the arrow
+ * keys step it, and the underlying game (and any bot replying) keeps
+ * running regardless of what's currently on screen. */
+function MoveNav({ nav, onSelect }: { nav: Nav; onSelect: (viewIndex: number) => void }) {
+  const following = nav.viewIndex === nav.history.length - 1;
+  const atStart = nav.viewIndex === 0;
+
+  return (
+    <div style={{ display: "grid", gap: 8, width: "100%", maxWidth: 900, justifyItems: "center" }}>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="button" disabled={atStart} onClick={() => onSelect(0)}>
+          |◀
+        </button>
+        <button type="button" disabled={atStart} onClick={() => onSelect(nav.viewIndex - 1)}>
+          ◀ Prev
+        </button>
+        <button
+          type="button"
+          disabled={following}
+          onClick={() => onSelect(nav.viewIndex + 1)}
+        >
+          Next ▶
+        </button>
+        <button type="button" disabled={following} onClick={() => onSelect(nav.history.length - 1)}>
+          ▶| Live
+        </button>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, textAlign: "left" }}>
+        {nav.history.slice(1).map((ply, i) => {
+          const viewIndex = i + 1;
+          const isWhiteMove = viewIndex % 2 === 1;
+          return (
+            <span key={viewIndex} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              {isWhiteMove && <span style={{ color: "#777" }}>{Math.ceil(viewIndex / 2)}.</span>}
+              <button
+                type="button"
+                onClick={() => onSelect(viewIndex)}
+                style={{ fontWeight: viewIndex === nav.viewIndex ? "bold" : "normal" }}
+              >
+                {ply.san}
+              </button>
+            </span>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
