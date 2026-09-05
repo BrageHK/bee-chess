@@ -10,13 +10,18 @@ name = "bee-lab"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal"] }
+bee-chess-core = { path = "../chess" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "sync"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.28"
+tower = "0.5"
