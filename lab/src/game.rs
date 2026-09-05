@@ -51,7 +51,6 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::uci_process::{UciDirection, UciProcess};
-use crate::uci_relay::EngineSpec;
 
 /// How many events a slow (or absent) subscriber can lag behind before
 /// the broadcast channel starts dropping its oldest ones. Deliberately
@@ -505,13 +504,23 @@ impl GameStore {
     }
 }
 
-/// One engine-driven side's full configuration: which binary to spawn,
-/// plus the `setoption`s and debug flag a direct browser connection to
-/// the same engine could already set (see `UciClient.setOption`/
-/// `setDebug` in the frontend's `engine.ts`) -- e.g. Stockfish's
-/// `UCI_LimitStrength`/`UCI_Elo`, or Bee's debug diagnostics. Applied
-/// once, right after the process's `uci`/`isready` handshake, before
-/// any `go` -- see `run_engine_loop`.
+/// One engine this server knows how to spawn a process for: `argv[0]`
+/// plus any fixed arguments (e.g. `["/path/to/stockfish"]`), and the
+/// working directory to spawn it in. Used by `EngineConfig` (below)
+/// and `api::EngineRegistry` to describe an engine before it's ever
+/// spawned.
+#[derive(Debug, Clone)]
+pub struct EngineSpec {
+    pub argv: Vec<String>,
+    pub cwd: std::path::PathBuf,
+}
+
+/// One engine-driven side's full configuration: which binary to spawn
+/// (`EngineSpec`), plus the `setoption`s and debug flag a UCI client
+/// could set directly -- e.g. Stockfish's `UCI_LimitStrength`/
+/// `UCI_Elo`, or Bee's debug diagnostics. Applied once, right after
+/// the process's `uci`/`isready` handshake, before any `go` -- see
+/// `run_engine_loop`.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub spec: EngineSpec,

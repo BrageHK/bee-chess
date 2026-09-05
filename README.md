@@ -13,12 +13,11 @@ The frontend talks to `lab/` (Rust -- see #67), which serves the UI,
 owns authoritative game state (position, moves, status, and which
 engine or human plays each side -- see #69), and supervises Stockfish/
 Bee as subprocesses. `bridge/` (Python) was the original, dumber
-WebSocket relay this replaced; the frontend no longer uses it at all
-as of #69's migration (`./scripts/dev.sh` starts `lab/`, not
-`bridge/`). It's still in the repo, not yet deleted -- see #68 -- but
-is legacy at this point, kept only until its remaining open threads
-(Bee-Mamba's integration, #66/#70) are resolved through `lab/` instead.
-See [`lab/README.md`](lab/README.md).
+WebSocket relay this replaced; as of #89, it only serves Bee-Mamba
+now -- Stockfish/Bee's relay routes were removed once nothing used
+them (`./scripts/dev.sh` starts `lab/`, not `bridge/`). `bridge/` goes
+away entirely once Bee-Mamba's real integration (#66/#70) lands
+through `lab/` instead. See [`lab/README.md`](lab/README.md).
 
 ## Repository layout
 

@@ -1,41 +1,59 @@
 # Bee Lab
 
-A Rust server that serves the compiled frontend and relays UCI traffic
-between the browser and engine subprocesses over WebSocket, replacing
-`bridge/` (Python) for that purpose. See [#67](https://github.com/BrageHK/bee-chess/issues/67)
-for the full architecture this is working toward, and [#68](https://github.com/BrageHK/bee-chess/issues/68)
-for this slice's specific scope.
+A Rust server that serves the compiled frontend and is authoritative
+for game state: position, move list, clocks, turn, legality, and
+result. It owns and supervises the Stockfish/Bee subprocesses for
+every game itself, rather than the browser talking to an engine
+process directly. See [#67](https://github.com/BrageHK/bee-chess/issues/67)
+for the full architecture and [#69](https://github.com/BrageHK/bee-chess/issues/69)
+for the authoritative-game-state migration this crate completed.
 
 This is a **separate crate** from `engine/` (the competition `bee`
 binary) on purpose: `bee` stays runnable standalone with zero web/
 orchestration dependencies. `lab/` is where all of that -- process
-supervision, HTTP/WebSocket, static file serving, eventually game state
-and a model registry -- lives instead.
+supervision, HTTP/WebSocket, static file serving, game state, and
+(eventually) a real model registry -- lives instead.
 
-## What this slice does (67a)
+## What it does
 
 - Serves `frontend/dist/` as static files on one port.
-- Spawns a fresh Stockfish or Bee subprocess per WebSocket connection at
-  `/ws/stockfish` and `/ws/bee`, relaying raw UCI lines to/from its
-  stdin/stdout, unmodified.
-- If the engine process dies -- wrong binary, crashes on startup,
-  whatever -- before ever sending a UCI reply, the socket is actively
-  closed with an `info string engine process exited: <reason>` line
-  first, so the browser sees why instead of hanging forever waiting for
-  a reply that will never come. This mirrors `bridge/server.py`'s
-  `watch_for_exit` exactly.
+- `POST /api/games` creates a game -- `white`/`black` each name an
+  engine (`"stockfish"`, `"bee"`, or an object with `setoption`s/debug,
+  see `api::CreateGameRequest`) or are omitted for a human-controlled
+  side. Lab spawns and drives any engine-controlled side itself
+  (`game::run_engine_loop`), asking it for a move and applying it
+  through the exact same path a human's move goes through.
+- `GET /api/games/:id` returns a complete, self-sufficient snapshot
+  (fen, moves, status, and which participant plays each side) -- the
+  authoritative resync mechanism a client can always fall back on,
+  including after a page refresh (persist only the game id, e.g. in
+  the URL).
+- `POST /api/games/:id/moves` applies a human's move.
+- `GET /ws/games/:id` streams live events for an already-loaded
+  snapshot to stay fresh: raw UCI traffic per side
+  (`GameEvent::Uci` -- everything a direct engine connection would
+  have seen, id/option/info/bestmove, all of it) and the new snapshot
+  whenever a move is applied or the game ends (`GameEvent::Updated`).
+  Events are transient telemetry, never replayed -- a client that
+  connects late or misses some only needs its next `GET`.
+- If an engine process dies -- wrong binary, crashes on startup,
+  whatever -- before ever producing a reply, the game is marked
+  `aborted` with the reason rather than hanging forever.
 
-## What this slice deliberately does *not* do yet
+## What it deliberately does *not* do yet
 
-- **No authoritative game state.** The frontend still owns position,
-  move list, clocks, and turn-taking, exactly as it does against the
-  Python bridge today -- this is a straight relay. That's [#69](https://github.com/BrageHK/bee-chess/issues/69) (67b).
 - **No Bee-Mamba.** The Python/PyTorch engine isn't served here; it
-  stays on the old bridge for now. Its fate (ported here too, or
-  handled entirely differently once [#66](https://github.com/BrageHK/bee-chess/issues/66)'s model-integration
-  design lands) is a follow-up decision.
-- **No engine/model registry.** Stockfish and Bee's paths are resolved
-  directly in `main.rs`; that's [#70](https://github.com/BrageHK/bee-chess/issues/70) (67c).
+  stays on the legacy `bridge/` for now (that's now all `bridge/`
+  does -- see #89). Its fate (ported here too, or handled entirely
+  differently once [#66](https://github.com/BrageHK/bee-chess/issues/66)'s model-integration design lands) is a
+  follow-up decision.
+- **No real engine/model registry.** Stockfish and Bee's paths are
+  resolved directly in `main.rs` into a stopgap `EngineRegistry`; the
+  real descriptor-based version (ids, options, model references) is
+  [#70](https://github.com/BrageHK/bee-chess/issues/70) (67c).
+- **No concurrent games.** One game at a time in practice, though the
+  API is already game-ID-shaped so this doesn't need an API reshape
+  later -- see [#71](https://github.com/BrageHK/bee-chess/issues/71) (67d).
 
 ## Running it
 
@@ -52,11 +70,14 @@ cargo run -p bee-lab
 # -> bee-lab listening on http://127.0.0.1:8080
 ```
 
-Override the port with `PORT=<n>`. Note that `bee`'s build output lives
-at the repo-root `target/release/bee`, not `engine/target/release/bee`
--- `engine/` and `lab/` are both members of the root Cargo workspace
-(see `/Cargo.toml`), so Cargo shares one `target/` directory across
-every member.
+Override the port with `PORT=<n>` (and, if running the frontend dev
+server separately, `VITE_LAB_PORT` on the frontend side to match --
+`./scripts/dev.sh` wires this up automatically, including picking a
+free port itself if `:8080` is already taken). Note that `bee`'s build
+output lives at the repo-root `target/release/bee`, not
+`engine/target/release/bee` -- `engine/` and `lab/` are both members
+of the root Cargo workspace (see `/Cargo.toml`), so Cargo shares one
+`target/` directory across every member.
 
 ## Testing
 
@@ -64,9 +85,8 @@ every member.
 cd lab && cargo test
 ```
 
-`uci_relay`'s tests spin up a real axum server on an ephemeral port and
-connect to it with a real WebSocket client (`tokio-tungstenite`), so
-they exercise the actual upgrade path -- including the crash-visibility
-behavior (a process that fails to spawn at all, and one that spawns and
-exits immediately with a stderr message) -- rather than only unit-testing
-`relay` in isolation.
+`api`'s tests cover the HTTP+WebSocket surface end to end (via axum's
+`oneshot` for plain requests, a real bound server + `tokio-tungstenite`
+client for WebSocket upgrades) against fake engine processes (`sh`
+one-liners), so they don't depend on real Stockfish/Bee binaries being
+built in the test environment.

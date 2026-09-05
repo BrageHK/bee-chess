@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""WebSocket <-> UCI bridges: stockfish on :8765, bee on :8766, bee-mamba
-(the trained ChessMamba checkpoint, played move-by-move with no search --
-see training/src/bee_training/chess_mamba/play.py) on :8767.
+"""WebSocket <-> UCI bridge for bee-mamba (the trained ChessMamba
+checkpoint, played move-by-move with no search -- see
+training/src/bee_training/chess_mamba/play.py) on :8767.
 
-The browser cannot spawn a process, so this exposes one WebSocket per
-engine and pipes lines straight to the engine's stdin/stdout. Each browser
-connection gets its own engine process.
+This is what's left of the original bridge (see #89): Stockfish and
+Bee both moved to Bee Lab (`lab/`, see #67/#69), which is now the only
+way the frontend reaches either of them -- authoritative game state,
+not just a raw relay. Bee-Mamba stays here because it has no Lab-side
+equivalent yet (#66/#70); once it does, this file goes away entirely.
 
-Stockfish and Bee are required -- the bridge refuses to start without
-them. Bee-Mamba is optional: it needs a trained checkpoint that most
-clones won't have (it's produced by ./scripts/train-mamba.sh, not
-checked in), so its absence only disables :8767 rather than the whole
-bridge. Without it, the frontend's "Play vs Bee-Mamba" mode will fail
-to connect, but "Spectate: Stockfish vs Bee" (the other mode, and the
-only one that existed before Bee-Mamba was added) keeps working.
+The browser cannot spawn a process, so this exposes one WebSocket and
+pipes lines straight to the engine's stdin/stdout. Each browser
+connection gets its own engine process. Bee-Mamba is optional here
+too: it needs a trained checkpoint that most clones won't have (it's
+produced by ./scripts/train-mamba.sh, not checked in), so this process
+exits with a clear message rather than silently listening on nothing
+if it's missing.
 """
 import asyncio
 import contextlib
@@ -23,11 +25,6 @@ from pathlib import Path
 import websockets
 
 ROOT = Path(__file__).resolve().parent.parent
-STOCKFISH = ROOT / "external" / "stockfish" / "src" / "stockfish"
-# Not engine/target/ -- engine/ is a member of the root Cargo workspace
-# (see /Cargo.toml, introduced alongside lab/ by #68), so Cargo shares
-# one target/ directory across all workspace members by default.
-BEE = ROOT / "target" / "release" / "bee"
 TRAINING = ROOT / "training"
 MAMBA_PYTHON = TRAINING / ".venv" / "bin" / "python3"
 MAMBA_CHECKPOINT = TRAINING / "checkpoints" / "main-dawg" / "latest.pt"
@@ -80,17 +77,8 @@ def make_handler(argv, cwd):
     return handle
 
 
-def require(path, build_cmd):
-    """Stockfish/Bee are mandatory: without them there's nothing for
-    the bridge to serve at all, so refuse to start."""
-    if not path.exists():
-        sys.exit(f"missing engine binary: {path}\nbuild it with: {build_cmd}")
-
-
 def mamba_unavailable_reason():
-    """None if Bee-Mamba can be started; otherwise why not, so main()
-    can print a clear warning instead of silently not listening on
-    :8767. Optional, unlike Stockfish/Bee -- see the module docstring."""
+    """None if Bee-Mamba can be started; otherwise why not."""
     if not MAMBA_PYTHON.exists():
         return f"missing {MAMBA_PYTHON} (run: cd training && uv sync)"
     if not MAMBA_CHECKPOINT.exists():
@@ -102,33 +90,16 @@ def mamba_unavailable_reason():
 
 
 async def main():
-    require(STOCKFISH, "./scripts/build-stockfish.sh")
-    require(BEE, "./scripts/build-bee.sh")
+    unavailable = mamba_unavailable_reason()
+    if unavailable is not None:
+        sys.exit(f"bee-mamba unavailable, nothing for this bridge to serve ({unavailable})")
 
-    async with contextlib.AsyncExitStack() as stack:
-        await stack.enter_async_context(
-            websockets.serve(make_handler([str(STOCKFISH)], STOCKFISH.parent), "localhost", 8765)
-        )
-        await stack.enter_async_context(
-            websockets.serve(make_handler([str(BEE)], BEE.parent), "localhost", 8766)
-        )
-
-        status = "stockfish :8765  |  bee :8766"
-        unavailable = mamba_unavailable_reason()
-        if unavailable is None:
-            mamba_argv = [
-                str(MAMBA_PYTHON), "-m", "bee_training.chess_mamba.play",
-                "--checkpoint", str(MAMBA_CHECKPOINT), "--device", "cpu",
-            ]
-            await stack.enter_async_context(
-                websockets.serve(make_handler(mamba_argv, TRAINING), "localhost", 8767)
-            )
-            status += "  |  bee-mamba :8767"
-        else:
-            print(f"bee-mamba unavailable, skipping :8767 ({unavailable})", file=sys.stderr)
-            print("'Play vs Bee-Mamba' will fail to connect; 'Spectate' is unaffected.", file=sys.stderr)
-
-        print(status)
+    mamba_argv = [
+        str(MAMBA_PYTHON), "-m", "bee_training.chess_mamba.play",
+        "--checkpoint", str(MAMBA_CHECKPOINT), "--device", "cpu",
+    ]
+    async with websockets.serve(make_handler(mamba_argv, TRAINING), "localhost", 8767):
+        print("bee-mamba :8767")
         await asyncio.Future()
 
 

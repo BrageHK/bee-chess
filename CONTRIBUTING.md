@@ -33,7 +33,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-Python (`bridge/`, the development WebSocket <-> UCI adapter --
+Python (`bridge/`, legacy -- now only serves Bee-Mamba, see #89;
 `training/`'s environment is unrelated and much heavier, so this is a
 separate `uv`-managed environment on purpose):
 
