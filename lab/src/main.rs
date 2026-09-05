@@ -7,11 +7,15 @@
 //! Run as (from the repo root, after `npm --prefix frontend run build`):
 //!   cargo run -p bee-lab
 //!
-//! No authoritative game state yet -- the frontend still owns position,
-//! clocks, and move application, exactly as it does against the Python
-//! bridge today. That's #69 (67b). This slice is a straight relay:
-//! prove the process-supervision and static-hosting story works before
-//! changing what the frontend is responsible for.
+//! Also serves an authoritative game-state HTTP API under `/api/games`
+//! (see `api`/`game` -- #69/67b, slice 69a: `POST /api/games`,
+//! `GET /api/games/:id`, `POST /api/games/:id/moves`). The frontend
+//! does not use this yet -- it still owns position/clocks/move
+//! application itself against the `/ws/*` relay above, exactly as it
+//! does against the Python bridge today. Wiring the frontend to this
+//! API instead, and having the server drive each side's engine
+//! automatically rather than requiring a manual `POST .../moves` for
+//! every ply, are 69b/69c.
 //!
 //! Bee-Mamba (the Python/PyTorch engine) is intentionally not served
 //! here -- see #68's "out of scope." It stays on the old Python bridge
@@ -24,8 +28,11 @@ use std::path::{Path, PathBuf};
 
 use tower_http::services::ServeDir;
 
+mod api;
+mod game;
 mod uci_relay;
 
+use game::GameStore;
 use uci_relay::EngineSpec;
 
 const DEFAULT_PORT: u16 = 8080;
@@ -57,6 +64,7 @@ async fn main() {
 
     let app = uci_relay::route("/ws/stockfish", stockfish_spec)
         .merge(uci_relay::route("/ws/bee", bee_spec))
+        .merge(api::router(GameStore::new()))
         .fallback_service(ServeDir::new(&frontend_dist));
 
     let port: u16 = std::env::var("PORT")
