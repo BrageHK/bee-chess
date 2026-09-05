@@ -154,7 +154,7 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chess::{Move, MoveFlag};
+    use crate::{Move, MoveFlag};
 
     #[test]
     fn identical_positions_hash_identically() {
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn castling_rights_affect_the_hash() {
-        use crate::chess::CastlingRights;
+        use crate::CastlingRights;
 
         let mut with_rights = Position::startpos();
         with_rights.set_castling_rights(CastlingRights::all());

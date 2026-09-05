@@ -10,5 +10,6 @@ name = "bee"
 path = "src/bin/bee.rs"
 
 [dependencies]
+bee-chess-core = { path = "../chess" }
 
 [dev-dependencies]

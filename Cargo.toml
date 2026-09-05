@@ -1,9 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["engine", "lab"]
+members = ["chess", "engine", "lab"]
 
 # `bee` (in engine/) stays the competition binary with zero web/orchestration
 # dependencies -- see #67's architecture issue. `lab` is a separate crate for
 # exactly that reason: it can depend on tokio/axum/etc. without any of that
 # ever reaching the engine binary itself, since Cargo workspace members don't
 # share dependencies unless they actually depend on each other.
+#
+# `chess` (bee-chess-core) holds the canonical Position/Move/legality/FEN/
+# Zobrist types, extracted out of engine/ so lab/ can share one authoritative
+# interpretation of chess rules with the competition engine instead of
+# validating moves against a second implementation -- see #69's design notes.
