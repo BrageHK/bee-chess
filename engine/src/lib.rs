@@ -22,8 +22,14 @@
 //! ```
 //!
 //! No raw UCI strings may appear below the `uci` module.
+//!
+//! `chess` re-exports the `bee-chess-core` crate rather than defining
+//! these types itself -- they moved there so `bee-lab` can share the
+//! exact same `Position`/`Move`/legality/FEN/Zobrist implementation
+//! instead of validating moves against a second one. Every existing
+//! `use crate::chess::...` in this crate keeps working unchanged.
 
-pub mod chess;
+pub use bee_chess_core as chess;
 pub mod diagnostics;
 pub mod engine;
 pub mod eval;

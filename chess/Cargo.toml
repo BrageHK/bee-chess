@@ -1,0 +1,10 @@
+[package]
+name = "bee-chess-core"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical chess-domain types (Position, Move, legality, FEN, Zobrist hashing) shared by bee-engine and bee-lab. Deliberately zero-dependency: see its crate docs."
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]

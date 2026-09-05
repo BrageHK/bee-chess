@@ -5,12 +5,14 @@ on:
     branches: [main]
     paths:
       - 'lab/**'
+      - 'chess/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-lab.yml'
   pull_request:
     paths:
       - 'lab/**'
+      - 'chess/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-lab.yml'

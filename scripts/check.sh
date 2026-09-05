@@ -7,6 +7,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+echo "==> chess: cargo fmt --check"
+cargo fmt --check --manifest-path chess/Cargo.toml
+
+echo "==> chess: cargo clippy"
+(cd chess && cargo clippy --all-targets -- -D warnings)
+
+echo "==> chess: cargo test"
+(cd chess && cargo test)
+
 echo "==> engine: cargo fmt --check"
 cargo fmt --check --manifest-path engine/Cargo.toml
 

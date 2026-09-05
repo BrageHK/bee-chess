@@ -21,6 +21,7 @@ exist and either works standalone. See [`lab/README.md`](lab/README.md).
 ```text
 bee-chess/
 ├── docs/adr/          Architecture decision records
+├── chess/             Canonical chess-domain crate (Position/Move/legality/FEN/Zobrist), shared by engine/ and lab/
 ├── engine/            Rust UCI engine (competition hot path)
 ├── training/          Python training and dataset generation
 ├── bridge/            Development-only WebSocket <-> UCI bridge (Python)
@@ -29,6 +30,11 @@ bee-chess/
 ├── scripts/           Repo-level setup/dev/check/test entry points
 └── .github/workflows  CI
 ```
+
+`engine/` and `lab/` both depend on `chess/` (`bee-chess-core`) for chess
+rules, rather than each having their own -- see `chess/src/lib.rs`'s
+docs for why that matters once `lab/` starts validating moves
+server-side (#69).
 
 ## Getting started
 

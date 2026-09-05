@@ -1,33 +1,31 @@
-name: CI / Rust
+name: CI / Chess
 
 on:
   push:
     branches: [main]
     paths:
-      - 'engine/**'
       - 'chess/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - '.github/workflows/ci-rust.yml'
+      - '.github/workflows/ci-chess.yml'
   pull_request:
     paths:
-      - 'engine/**'
       - 'chess/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - '.github/workflows/ci-rust.yml'
+      - '.github/workflows/ci-chess.yml'
 
 concurrency:
-  group: ci-rust-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-chess-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust
+  chess:
+    name: Chess
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: engine
+        working-directory: chess
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,9 +33,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          # engine/ is a member of the root Cargo workspace (see
-          # /Cargo.toml, introduced alongside lab/ by #68) -- "." is the
-          # actual workspace root now, not engine/.
+          # chess/ is a member of the root Cargo workspace (see /Cargo.toml).
           workspaces: .
       - name: Format check
         run: cargo fmt --check
@@ -45,5 +41,3 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
-      - name: Test (ignored, e.g. deep perft)
-        run: cargo test --release -- --ignored

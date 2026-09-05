@@ -77,7 +77,7 @@ impl Position {
     /// Parses a `Position` from a FEN string.
     ///
     /// ```
-    /// use bee_engine::chess::Position;
+    /// use bee_chess_core::Position;
     ///
     /// let position = Position::from_fen(
     ///     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -109,7 +109,7 @@ impl Position {
     /// Serializes this position to a FEN string.
     ///
     /// ```
-    /// use bee_engine::chess::Position;
+    /// use bee_chess_core::Position;
     ///
     /// assert_eq!(
     ///     Position::startpos().to_fen(),

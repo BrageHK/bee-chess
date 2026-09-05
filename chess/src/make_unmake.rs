@@ -241,7 +241,7 @@ fn update_castling_rights_on_departure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chess::Color;
+    use crate::Color;
 
     #[test]
     fn undo_record_stays_small() {
