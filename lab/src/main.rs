@@ -7,16 +7,20 @@
 //! Run as (from the repo root, after `npm --prefix frontend run build`):
 //!   cargo run -p bee-lab
 //!
-//! Also serves an authoritative game-state HTTP API under `/api/games`
-//! (see `api`/`game` -- #69/67b): `POST /api/games` (optionally naming
-//! `white`/`black` engines by name to drive them automatically, see
-//! `api::CreateGameRequest`), `GET /api/games/:id`, and
-//! `POST /api/games/:id/moves` (still the way a human move, or a game
-//! with no engine side at all, reaches the server). The frontend does
-//! not use this yet -- it still owns position/clocks/move application
-//! itself against the `/ws/*` relay above, exactly as it does against
-//! the Python bridge today. Wiring the frontend to this API instead is
-//! 69c.
+//! Also serves an authoritative game-state HTTP+WebSocket API under
+//! `/api/games`/`/ws/games` (see `api`/`game` -- #69/67b): `POST
+//! /api/games` (optionally naming `white`/`black` engines by name to
+//! drive them automatically, see `api::CreateGameRequest`), `GET
+//! /api/games/:id`, `POST /api/games/:id/moves` (still the way a human
+//! move, or a game with no engine side at all, reaches the server),
+//! and `GET /ws/games/:id` (live UCI traffic + snapshot updates). As
+//! of 69c-1b, the frontend (`frontend/src/labClient.ts`, `Game.tsx`)
+//! uses exactly this API and no longer talks to any engine process
+//! directly -- it doesn't own position/clocks/legality/result itself
+//! anymore either. The permissive `CorsLayer` below exists specifically
+//! for that: `npm run dev`'s Vite server (`:5173`) and this server
+//! (`:8080`, by default) are different origins, and only plain HTTP
+//! fetches need CORS at all (WebSocket connections never did).
 //!
 //! Bee-Mamba (the Python/PyTorch engine) is intentionally not served
 //! here -- see #68's "out of scope." It stays on the old Python bridge
@@ -27,6 +31,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 mod api;
@@ -76,7 +81,17 @@ async fn main() {
     let app = uci_relay::route("/ws/stockfish", stockfish_spec)
         .merge(uci_relay::route("/ws/bee", bee_spec))
         .merge(api::router(GameStore::new(), registry))
-        .fallback_service(ServeDir::new(&frontend_dist));
+        .fallback_service(ServeDir::new(&frontend_dist))
+        // See the module docs above for why -- permissive (`Any`)
+        // since this is a development/orchestration server (#67), not
+        // something meant to be exposed to the open internet with real
+        // access control to protect. Revisit if that ever changes.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
 
     let port: u16 = std::env::var("PORT")
         .ok()

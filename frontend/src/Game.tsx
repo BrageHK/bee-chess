@@ -1,37 +1,52 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Chess } from "chessops/chess";
-import { makeFen } from "chessops/fen";
+import { parseFen } from "chessops/fen";
 import { chessgroundDests } from "chessops/compat";
-import { parseUci } from "chessops/util";
 import type { Key, Dests } from "@lichess-org/chessground/types";
 import { Chessground } from "./Chessground";
-import { createBotClient, type UciClient } from "./engine";
 import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
 import { EvalBar } from "./EvalBar";
+import type { UciLogLine } from "./engine";
 import type { Participant } from "./participant";
+import {
+  createGame,
+  getGame,
+  postMove,
+  subscribeToGameEvents,
+  type Color,
+  type GameEvent,
+  type GameSnapshot,
+  type ParticipantRequest,
+} from "./labClient";
 
-/** Claim a draw once the fifty-move counter is full; chessops does not. */
-const MAX_HALFMOVES = 100;
+/** Board position before Lab has responded to `createGame` yet. */
+const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-/** Board position before any move; avoids reading the ref during render. */
-const START_FEN = makeFen(Chess.default().toSetup());
-
-type Color = "white" | "black";
+/** How this component polls `GET /api/games/:id` to stay in sync while
+ * connected, as a fallback under the live WebSocket stream -- see
+ * `useEffect` below for why both exist rather than relying on the
+ * socket alone. */
+const POLL_INTERVAL_MS = 500;
 
 /**
  * Plays one game between whatever `white`/`black` are configured as --
- * any mix of human and bots. A bot slot gets its own `UciClient`
- * instance created fresh for this game (so the same bot kind on both
- * sides never shares a connection/position); a human slot has none,
- * and moves come from dragging pieces on the board instead.
+ * any mix of human and bots. Per #69/67b: this component owns none of
+ * position/turn/legality/result itself. It asks Bee Lab to create a
+ * game, renders whatever `GameSnapshot` Lab reports (via an initial
+ * `getGame` plus a `GameEvent::Updated` stream, with polling as a
+ * fallback in case the socket drops), and for a human's move asks Lab
+ * to apply it via `postMove` -- trusting Lab's answer either way. Lab
+ * itself drives any engine-controlled side automatically; this
+ * component never talks to an engine process directly.
+ *
+ * Bee-Mamba has no Lab-side engine yet (see #66/#70) -- picking it for
+ * either slot shows an "unavailable" message instead of attempting to
+ * create a game, rather than silently falling back to some other path.
  *
  * The parent renders this with a `key` that changes per game, so a new
  * game is a fresh mount rather than this instance being reset in
- * place -- there is deliberately no "is this still the current game"
- * guard anywhere below, since a superseded game's in-flight promises
- * belong to an unmounted component's own closure/refs and can't reach
- * a new game's state no matter how long they take to settle.
+ * place.
  */
 export function Game({
   white,
@@ -42,171 +57,104 @@ export function Game({
   black: Participant;
   onBackToSetup: () => void;
 }) {
-  const posRef = useRef(Chess.default());
-  const movesRef = useRef<string[]>([]);
-  const clientsRef = useRef<{ white?: UciClient; black?: UciClient }>({});
+  const gameIdRef = useRef<string | null>(null);
+  // Every raw GameEvent this game has seen, for EvalBar/SearchStatsPanel/
+  // UciLogPanel's `subscribe` props below -- see `logSubscribeFor`.
+  // Declared before the mount effect below since that effect forwards
+  // events into this set as they arrive over the WebSocket.
+  const logListenersRef = useRef(new Set<(event: GameEvent) => void>());
 
-  const [fen, setFen] = useState(START_FEN);
-  const [lastMove, setLastMove] = useState<Key[] | undefined>();
-  const [turn, setTurn] = useState<Color>("white");
-  const [dests, setDests] = useState<Dests>(new Map());
-  const [status, setStatus] = useState("starting…");
-  const [finished, setFinished] = useState(false);
+  const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
+  const [status, setStatus] = useState("connecting to Bee Lab…");
+  const [unavailable, setUnavailable] = useState<string | null>(null);
 
-  const clientFor = (color: Color): UciClient | undefined => clientsRef.current[color];
   const participantFor = (color: Color): Participant => (color === "white" ? white : black);
   const nameFor = (color: Color): string => {
     const participant = participantFor(color);
-    return participant.kind === "human" ? "You" : (clientFor(color)?.name ?? participant.kind);
+    if (participant.kind === "human") return "You";
+    return participant.kind === "bee-mamba" ? "Bee-Mamba" : participant.kind;
   };
 
   const humanTurnColor = (): Color | null => {
-    if (white.kind === "human" && posRef.current.turn === "white") return "white";
-    if (black.kind === "human" && posRef.current.turn === "black") return "black";
-    return null;
+    if (!snapshot || snapshot.status !== "running") return null;
+    const turn: Color = snapshot.moves.length % 2 === 0 ? "white" : "black";
+    return participantFor(turn).kind === "human" ? turn : null;
   };
 
-  const syncBoardState = () => {
-    setFen(makeFen(posRef.current.toSetup()));
-    setTurn(posRef.current.turn);
-    setDests(humanTurnColor() ? chessgroundDests(posRef.current) : new Map());
-  };
-
-  /** Ends the game if it's over, returning whether it did. */
-  const finishIfOver = (): boolean => {
-    if (posRef.current.isEnd()) {
-      setStatus(outcome(posRef.current));
-      setFinished(true);
-      return true;
-    }
-    if (posRef.current.halfmoves >= MAX_HALFMOVES) {
-      setStatus("draw by the fifty-move rule");
-      setFinished(true);
-      return true;
-    }
-    return false;
-  };
-
-  /** Plays `uci` if legal, updating both the game state and the board.
-   * Returns whether it was legal. */
-  const applyMove = (uci: string): boolean => {
-    const move = parseUci(uci);
-    if (!move || !posRef.current.isLegal(move)) return false;
-    posRef.current.play(move);
-    movesRef.current.push(uci);
-    setLastMove([uci.slice(0, 2), uci.slice(2, 4)] as Key[]);
-    syncBoardState();
-    return true;
-  };
-
-  /** Drives bot turns for as long as it's a bot's move (may be more
-   * than one ply in a row if both slots are bots, or zero if it's
-   * immediately a human's turn).
-   *
-   * `isCancelled` is checked right after each `bestMove` await
-   * resolves, before touching any shared ref/state -- it's how the
-   * mount effect below aborts an in-progress loop from a superseded
-   * (StrictMode double-invoked) run instead of letting its `bestMove`
-   * reply land as a second, racing move applied on top of a game a
-   * fresher run has since moved on from. Defaults to "never
-   * cancelled" for `onHumanMove`'s call site, a real event handler
-   * with no such superseded-run concern. */
-  const runBotTurns = async (isCancelled: () => boolean = () => false) => {
-    while (!finishIfOver()) {
-      const color: Color = posRef.current.turn;
-      const participant = participantFor(color);
-      if (participant.kind === "human") {
-        setStatus("your move");
-        return;
-      }
-
-      const client = clientFor(color);
-      if (!client) return; // should not happen: every bot slot gets a client below
-      setStatus(`${client.name} thinking…`);
-
-      let uci: string;
-      try {
-        uci = await client.bestMove(movesRef.current, participant.moveTimeMs);
-      } catch (err) {
-        if (isCancelled()) return;
-        setStatus(message(err));
-        setFinished(true);
-        return;
-      }
-
-      if (isCancelled()) return;
-
-      if (!applyMove(uci)) {
-        setStatus(`${client.name} played an illegal move: ${uci}`);
-        setFinished(true);
-        return;
-      }
+  const applySnapshot = (next: GameSnapshot) => {
+    setSnapshot(next);
+    if (next.status === "running") {
+      setStatus(humanTurnColorFor(next, white, black) ? "your move" : "thinking…");
+    } else if (next.status === "finished") {
+      setStatus(next.result === "draw" ? "game over — draw" : `game over — ${next.result.replace("_wins", "")} wins`);
+    } else {
+      setStatus(`game aborted: ${next.reason}`);
     }
   };
 
-  // Connects each bot slot's client and starts the game loop. Runs
+  // Creates the Lab-side game and starts polling/subscribing. Runs
   // once per mount, i.e. once per game (see the component doc comment
-  // above for why "on mount" and "on new game" are the same event
-  // here) -- *except* under React StrictMode's dev-only
-  // mount/unmount/remount cycle, which deliberately double-invokes
-  // every effect to surface exactly the bug this guards against: an
-  // effect with no cleanup runs its whole async body twice, and here
-  // that meant two concurrent `runBotTurns()` loops sharing the same
-  // `movesRef`/`posRef`, both calling `bestMove` from `startpos`
-  // before either had applied a move -- the second reply then landed
-  // as a stale, now-illegal move once the first had already advanced
-  // the game. `cancelled` (flipped by this effect's cleanup) is
-  // checked before ever touching shared refs/state and at every
-  // meaningful await boundary, so a StrictMode-aborted first run's
-  // continuations become no-ops instead of a second, racing game loop.
-  // `createdClients` lets the cleanup close every client this run
-  // opened, even ones aborted before `runBotTurns` ever started.
+  // above) -- guarded against React StrictMode's dev-only double-invoke
+  // the same way the previous client-driven version was: a `cancelled`
+  // flag, checked before ever touching state, so a superseded first run
+  // never races a second `createGame` call against this one.
   useEffect(() => {
     let cancelled = false;
-    const createdClients: UciClient[] = [];
+    let unsubscribe: (() => void) | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const bad = badParticipant(white) ?? badParticipant(black);
+    if (bad) {
+      setUnavailable(bad);
+      return;
+    }
 
     void (async () => {
-      setStatus("connecting to the bridge…");
-
-      const pending: Promise<void>[] = [];
-      for (const color of ["white", "black"] as const) {
-        const participant = participantFor(color);
-        if (participant.kind === "human") continue;
-        const client = createBotClient(participant.kind);
-        createdClients.push(client);
-        if (cancelled) return; // aborted before this slot's client could be tracked
-        clientsRef.current[color] = client;
-        pending.push(client.init());
-        if (participant.kind === "stockfish") {
-          pending.push(
-            client
-              .setOption("UCI_LimitStrength", true)
-              .then(() => client.setOption("UCI_Elo", participant.elo)),
-          );
-        }
-        if ("debug" in participant) {
-          pending.push(client.setDebug(participant.debug));
-        }
-      }
-
+      let created: GameSnapshot;
       try {
-        await Promise.all(pending);
+        created = await createGame({
+          white: toParticipantRequest(white),
+          black: toParticipantRequest(black),
+          moveTimeMs: moveTimeMsFor(white, black),
+        });
       } catch (err) {
         if (cancelled) return;
         setStatus(message(err));
-        setFinished(true);
         return;
       }
       if (cancelled) return;
 
-      if (cancelled) return;
-      syncBoardState();
-      await runBotTurns(() => cancelled);
+      gameIdRef.current = created.id;
+      applySnapshot(created);
+
+      // The WebSocket stream is the primary way this component learns
+      // about moves/status changes (and the only way it sees live UCI
+      // traffic for EvalBar/SearchStatsPanel/UciLogPanel below) --
+      // polling `getGame` is purely a fallback for a dropped/never-
+      // connected socket, since `GET /api/games/:id` is the
+      // authoritative resync mechanism regardless (see labClient.ts).
+      unsubscribe = subscribeToGameEvents(created.id, (event: GameEvent) => {
+        if (cancelled) return;
+        if (event.type === "updated") applySnapshot(event.snapshot);
+        for (const listener of logListenersRef.current) listener(event);
+      });
+
+      pollTimer = setInterval(() => {
+        void getGame(created.id).then(
+          (fresh) => {
+            if (!cancelled) applySnapshot(fresh);
+          },
+          () => {
+            /* transient fetch failure -- next poll retries */
+          },
+        );
+      }, POLL_INTERVAL_MS);
     })();
 
     return () => {
       cancelled = true;
-      for (const client of createdClients) client.close();
+      unsubscribe?.();
+      if (pollTimer) clearInterval(pollTimer);
     };
     // Intentionally empty deps: white/black/onBackToSetup are fixed
     // for this component's lifetime (a new game remounts it via a
@@ -216,22 +164,48 @@ export function Game({
 
   /** A piece was dropped on `dest`: chessground already restricted
    * `orig` to a legal source and `dest` to one of its legal
-   * destinations (see `movable.dests` below), so the only ambiguity
-   * left is pawn promotion -- try the plain move first, and only add
-   * the queen-promotion suffix if the board actually calls for one. */
+   * destinations (see `movable.dests` below, computed from the same
+   * position Lab holds), so the only ambiguity left is pawn promotion
+   * -- try the plain move first, and only add the queen-promotion
+   * suffix if Lab rejects it. Lab is the one deciding legality either
+   * way; this component doesn't pre-validate anything, just picks
+   * which move text to send. */
   const onHumanMove = (orig: Key, dest: Key) => {
-    if (!humanTurnColor()) return;
+    const gameId = gameIdRef.current;
+    if (!gameId || !humanTurnColor()) return;
 
     const plain = `${orig}${dest}`;
-    const plainMove = parseUci(plain);
-    const uci = plainMove && posRef.current.isLegal(plainMove) ? plain : `${plain}q`;
 
-    if (!applyMove(uci)) return;
-    if (finishIfOver()) return;
-    void runBotTurns();
+    void postMove(gameId, plain).then(
+      (next) => applySnapshot(next),
+      async () => {
+        // Plain move was rejected -- the only reason a chessground-
+        // legal-looking drop would be is a pawn reaching the back rank
+        // needing a promotion suffix Lab requires explicitly.
+        try {
+          const withQueen = await postMove(gameId, `${plain}q`);
+          applySnapshot(withQueen);
+        } catch (err) {
+          setStatus(message(err));
+        }
+      },
+    );
   };
 
+  if (unavailable) {
+    return (
+      <section style={{ display: "grid", gap: 8, textAlign: "center" }}>
+        <p>{unavailable}</p>
+        <button onClick={onBackToSetup}>Back to setup</button>
+      </section>
+    );
+  }
+
   const canMoveColor = humanTurnColor();
+  const fen = snapshot?.fen ?? START_FEN;
+  const lastMove = lastMoveKeys(snapshot);
+  const dests = canMoveColor ? chessgroundDestsFromFen(fen) : new Map<Key, Key[]>();
+  const finished = snapshot ? snapshot.status !== "running" : false;
 
   return (
     <section
@@ -248,63 +222,153 @@ export function Game({
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-        {clientFor("white") && (
-          <EvalBar color="white" subscribe={(l) => clientFor("white")!.onLog(l)} />
+        {white.kind !== "human" && (
+          <EvalBar color="white" subscribe={logSubscribeFor(logListenersRef, "white")} />
         )}
         <Chessground
           config={{
             fen,
             lastMove,
-            // Default `coordinates: true` floats rank/file labels a few px
-            // inside the board's own edge, overlapping back-rank pieces on
-            // our fixed 480x480 board (#51). on-square labels avoid that.
             coordinatesOnSquares: true,
             viewOnly: canMoveColor === null,
-            turnColor: turn,
+            turnColor: snapshot && snapshot.moves.length % 2 === 1 ? "black" : "white",
             movable: {
               free: false,
               color: canMoveColor ?? undefined,
-              dests: canMoveColor ? dests : new Map(),
+              dests,
               events: { after: onHumanMove },
             },
           }}
         />
-        {clientFor("black") && (
-          <EvalBar color="black" subscribe={(l) => clientFor("black")!.onLog(l)} />
+        {black.kind !== "human" && (
+          <EvalBar color="black" subscribe={logSubscribeFor(logListenersRef, "black")} />
         )}
       </div>
       <p>{status}</p>
       {finished && <button onClick={onBackToSetup}>New game</button>}
-      <BotPanels color="white" participant={white} client={clientFor("white")} />
-      <BotPanels color="black" participant={black} client={clientFor("black")} />
+      <BotPanels color="white" participant={white} logListenersRef={logListenersRef} />
+      <BotPanels color="black" participant={black} logListenersRef={logListenersRef} />
     </section>
   );
 }
 
 /** Renders the stats + log panels for one slot, if it's a bot -- human
- * slots have no UciClient and so nothing to show here. */
+ * slots have no engine traffic and so nothing to show here. */
 function BotPanels({
   color,
   participant,
-  client,
+  logListenersRef,
 }: {
   color: Color;
   participant: Participant;
-  client: UciClient | undefined;
+  logListenersRef: RefObject<Set<(event: GameEvent) => void>>;
 }) {
-  if (participant.kind === "human" || !client) return null;
+  if (participant.kind === "human") return null;
+
+  const name = participant.kind === "bee-mamba" ? "Bee-Mamba" : participant.kind;
+  const subscribe = logSubscribeFor(logListenersRef, color);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%", maxWidth: 900 }}>
-      <SearchStatsPanel name={`${client.name} (${color})`} subscribe={(l) => client.onLog(l)} />
-      <UciLogPanel name={`${client.name} (${color})`} subscribe={(l) => client.onLog(l)} />
+      <SearchStatsPanel name={`${name} (${color})`} subscribe={subscribe} />
+      <UciLogPanel name={`${name} (${color})`} subscribe={subscribe} />
     </div>
   );
 }
 
+/** Adapts the raw `GameEvent` stream (shared across both colors) into
+ * the per-color `UciLogLine` subscription shape `EvalBar`/
+ * `SearchStatsPanel`/`UciLogPanel` already expect -- this is what lets
+ * all three keep working completely unchanged against Lab's WebSocket
+ * instead of a direct browser-to-engine connection. */
+function logSubscribeFor(
+  logListenersRef: RefObject<Set<(event: GameEvent) => void>>,
+  color: Color,
+): (listener: (line: UciLogLine) => void) => () => void {
+  return (listener) => {
+    const handler = (event: GameEvent) => {
+      if (event.type !== "uci" || event.color !== color) return;
+      listener({ direction: event.direction, text: event.line, timestamp: Date.now() });
+    };
+    logListenersRef.current.add(handler);
+    return () => logListenersRef.current.delete(handler);
+  };
+}
+
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-function outcome(pos: Chess): string {
-  const winner = pos.outcome()?.winner;
-  return winner ? `game over — ${winner} wins` : "game over — draw";
+/** Bee-Mamba has no Lab-side engine yet (#66/#70) -- returns an
+ * explanatory message if `participant` picks it, else `null`. */
+function badParticipant(participant: Participant): string | null {
+  return participant.kind === "bee-mamba"
+    ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
+    : null;
+}
+
+/** Maps a frontend `Participant` to the request shape `createGame`
+ * expects, or `undefined` for a human slot. */
+function toParticipantRequest(participant: Participant): ParticipantRequest | undefined {
+  switch (participant.kind) {
+    case "human":
+      return undefined;
+    case "stockfish":
+      return {
+        engine: "stockfish",
+        options: { UCI_LimitStrength: true, UCI_Elo: participant.elo },
+        debug: participant.debug,
+      };
+    case "bee":
+      return { engine: "bee", debug: participant.debug };
+    case "bee-mamba":
+      // Unreachable: badParticipant already redirected to the
+      // unavailable-message screen before createGame is ever called.
+      return undefined;
+  }
+}
+
+/** Lab's `POST /api/games` takes one `move_time_ms` for the whole
+ * game, but the frontend's `Participant` model carries it per side --
+ * a real, documented simplification (see labClient.ts's docs) rather
+ * than something silently papered over. Prefers White's configured
+ * value, then Black's, since a single shared budget has to pick one. */
+function moveTimeMsFor(white: Participant, black: Participant): number | undefined {
+  if ("moveTimeMs" in white) return white.moveTimeMs;
+  if ("moveTimeMs" in black) return black.moveTimeMs;
+  return undefined;
+}
+
+function humanTurnColorFor(snapshot: GameSnapshot, white: Participant, black: Participant): boolean {
+  if (snapshot.status !== "running") return false;
+  const turn: Color = snapshot.moves.length % 2 === 0 ? "white" : "black";
+  const participant = turn === "white" ? white : black;
+  return participant.kind === "human";
+}
+
+function lastMoveKeys(snapshot: GameSnapshot | null): Key[] | undefined {
+  const last = snapshot?.moves.at(-1);
+  if (!last) return undefined;
+  return [last.slice(0, 2), last.slice(2, 4)] as Key[];
+}
+
+/**
+ * Computes chessground's `Dests` (legal destination squares per piece,
+ * needed for drag-and-drop to work at all) from `snapshot`'s FEN via a
+ * read-only `chessops` position. This is a **UI affordance only**, not
+ * a second source of chess-rules truth: Lab still decides whether any
+ * given move is actually legal when `postMove` is called, and its
+ * answer always wins regardless of what this function computed (a
+ * stale/wrong `dests` would only ever make chessground offer a square
+ * that Lab then rejects, never the reverse). Recomputed fresh from
+ * `snapshot` on every call rather than cached, since there's no
+ * meaningful state to keep here beyond "what does this FEN allow" --
+ * this deliberately does not construct a `Chess` object that
+ * accumulates moves over the game the way the pre-#69 client-owned
+ * position did.
+ */
+function chessgroundDestsFromFen(fen: string): Dests {
+  const setup = parseFen(fen);
+  if (setup.isErr) return new Map();
+  const position = Chess.fromSetup(setup.value);
+  if (position.isErr) return new Map();
+  return chessgroundDests(position.value);
 }
