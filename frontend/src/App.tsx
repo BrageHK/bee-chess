@@ -2,16 +2,31 @@ import { useState } from "react";
 import { GameSetup } from "./GameSetup";
 import { Game } from "./Game";
 import type { Participant } from "./participant";
+import { clearSavedGame, loadSavedGame } from "./savedGame";
 import "@lichess-org/chessground/assets/chessground.base.css";
 import "@lichess-org/chessground/assets/chessground.brown.css";
 import "@lichess-org/chessground/assets/chessground.cburnett.css";
 
 type Screen =
   | { phase: "setup" }
-  | { phase: "playing"; white: Participant; black: Participant; gameSeq: number };
+  | { phase: "playing"; white: Participant; black: Participant; gameSeq: number; resumeMoves: string[] };
+
+/** A game in progress survives a page refresh (#55): if `sessionStorage`
+ * has one, jump straight to it instead of the setup screen. */
+function initialScreen(): Screen {
+  const saved = loadSavedGame();
+  if (!saved) return { phase: "setup" };
+  return {
+    phase: "playing",
+    white: saved.white,
+    black: saved.black,
+    gameSeq: 0,
+    resumeMoves: saved.moves,
+  };
+}
 
 export default function App() {
-  const [screen, setScreen] = useState<Screen>({ phase: "setup" });
+  const [screen, setScreen] = useState<Screen>(initialScreen);
 
   return (
     <main
@@ -35,7 +50,7 @@ export default function App() {
       {screen.phase === "setup" ? (
         <GameSetup
           onStart={(white, black) =>
-            setScreen({ phase: "playing", white, black, gameSeq: Date.now() })
+            setScreen({ phase: "playing", white, black, gameSeq: Date.now(), resumeMoves: [] })
           }
         />
       ) : (
@@ -43,7 +58,11 @@ export default function App() {
           key={screen.gameSeq}
           white={screen.white}
           black={screen.black}
-          onBackToSetup={() => setScreen({ phase: "setup" })}
+          resumeMoves={screen.resumeMoves}
+          onBackToSetup={() => {
+            clearSavedGame();
+            setScreen({ phase: "setup" });
+          }}
         />
       )}
     </main>

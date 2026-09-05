@@ -9,6 +9,7 @@ import { createBotClient, type UciClient } from "./engine";
 import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
 import type { Participant } from "./participant";
+import { saveGame } from "./savedGame";
 
 /** Claim a draw once the fifty-move counter is full; chessops does not. */
 const MAX_HALFMOVES = 100;
@@ -35,10 +36,15 @@ type Color = "white" | "black";
 export function Game({
   white,
   black,
+  resumeMoves,
   onBackToSetup,
 }: {
   white: Participant;
   black: Participant;
+  /** Moves (UCI) to replay onto the position before anything else --
+   * resuming a game `sessionStorage` had saved (#55). Empty for a
+   * brand new game. */
+  resumeMoves: string[];
   onBackToSetup: () => void;
 }) {
   const posRef = useRef(Chess.default());
@@ -95,6 +101,7 @@ export function Game({
     movesRef.current.push(uci);
     setLastMove([uci.slice(0, 2), uci.slice(2, 4)] as Key[]);
     syncBoardState();
+    saveGame({ white, black, moves: movesRef.current });
     return true;
   };
 
@@ -137,6 +144,26 @@ export function Game({
   // here).
   useEffect(() => {
     void (async () => {
+      // Replay a resumed session's moves before anything else, so the
+      // bots about to connect (and the board about to render) start
+      // from the right position rather than move zero. Stops at the
+      // first move that doesn't check out rather than throwing --
+      // a stale/corrupt save shouldn't crash the game, just resume as
+      // far as it can.
+      for (const uci of resumeMoves) {
+        const move = parseUci(uci);
+        if (!move || !posRef.current.isLegal(move)) break;
+        posRef.current.play(move);
+        movesRef.current.push(uci);
+      }
+      if (movesRef.current.length > 0) {
+        const last = movesRef.current[movesRef.current.length - 1];
+        setLastMove([last.slice(0, 2), last.slice(2, 4)] as Key[]);
+        syncBoardState();
+      }
+      saveGame({ white, black, moves: movesRef.current });
+      if (finishIfOver()) return; // resumed a game that had already ended
+
       setStatus("connecting to the bridge…");
 
       const pending: Promise<void>[] = [];
