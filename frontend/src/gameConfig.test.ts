@@ -8,8 +8,8 @@ import {
 } from "./gameConfig";
 
 describe("validateGameConfig", () => {
-  it("accepts the defaults (1600 Elo, 100ms)", () => {
-    expect(DEFAULT_GAME_CONFIG).toEqual({ stockfishElo: 1600, moveTimeMs: 100 });
+  it("accepts the defaults (1600 Elo, 100ms, debug off)", () => {
+    expect(DEFAULT_GAME_CONFIG).toEqual({ stockfishElo: 1600, moveTimeMs: 100, debug: false });
     expect(validateGameConfig(DEFAULT_GAME_CONFIG)).toBeNull();
   });
 
@@ -70,5 +70,10 @@ describe("validateGameConfig", () => {
     expect(
       validateGameConfig({ ...DEFAULT_GAME_CONFIG, moveTimeMs: Number.NaN }),
     ).not.toBeNull();
+  });
+
+  it("debug does not affect validity either way", () => {
+    expect(validateGameConfig({ ...DEFAULT_GAME_CONFIG, debug: true })).toBeNull();
+    expect(validateGameConfig({ ...DEFAULT_GAME_CONFIG, debug: false })).toBeNull();
   });
 });

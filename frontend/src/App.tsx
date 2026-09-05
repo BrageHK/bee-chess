@@ -59,6 +59,10 @@ export default function App() {
 
     try {
       await Promise.all([whiteEngine.init(), blackEngine.init()]);
+      await Promise.all([
+        whiteEngine.setDebug(gameConfig.debug),
+        blackEngine.setDebug(gameConfig.debug),
+      ]);
       await whiteEngine.setOption("UCI_LimitStrength", true);
       await whiteEngine.setOption("UCI_Elo", gameConfig.stockfishElo);
     } catch (err) {
@@ -180,10 +184,12 @@ function GameConfigForm({
   // or mid-edit (e.g. "16") without snapping back to a number.
   const [eloText, setEloText] = useState(String(initial.stockfishElo));
   const [moveTimeText, setMoveTimeText] = useState(String(initial.moveTimeMs));
+  const [debug, setDebugField] = useState(initial.debug);
 
   const config: GameConfig = {
     stockfishElo: Number(eloText),
     moveTimeMs: Number(moveTimeText),
+    debug,
   };
   const error = validateGameConfig(config);
 
@@ -215,6 +221,14 @@ function GameConfigForm({
           step={1}
           onChange={(e) => setMoveTimeText(e.target.value)}
         />
+      </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={debug}
+          onChange={(e) => setDebugField(e.target.checked)}
+        />
+        Debug logging (sends <code>debug on</code> to both engines)
       </label>
       {error && <p style={{ color: "crimson", margin: 0 }}>{error}</p>}
       <button type="submit" disabled={error !== null}>
