@@ -11,10 +11,12 @@
 //! lands in a follow-up PR (`feat/uci-state-machine`).
 
 use std::io::{BufRead, Write};
+use std::time::Instant;
 
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
 use crate::engine::Engine;
+use crate::search::mate_in_plies;
 
 pub const ENGINE_NAME: &str = "bee-chess";
 pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
@@ -150,33 +152,47 @@ fn parse_moves_suffix(s: &str) -> Option<Vec<UciMove>> {
     rest.split_whitespace().map(UciMove::parse).collect()
 }
 
-/// The parsed body of a `go` command. Only `depth` is recognized so
-/// far -- enough to return a legal move, not to search. Clock/
-/// increment/nodes/movetime/infinite/ponder and the rest of `go`'s
-/// fields, along with `stop` and actual search, are a follow-up
-/// milestone's work; see `SearchLimits` in `crate::search` for the
-/// eventual full shape.
+/// The parsed body of a `go` command. Recognizes `depth <n>` (fixed-
+/// depth search, see `Engine::search`) and `movetime <ms>`
+/// (time-bounded iterative deepening, see `Engine::search_for_time`).
+/// If both are given, `movetime` takes priority -- iterative deepening
+/// is the more useful default for anything actually playing a timed
+/// game. Clock fields (`wtime`/`btime`/`winc`/`binc`), `infinite`,
+/// `ponder`, `stop`, and real cancellation are follow-up #6/#7 work;
+/// see `SearchLimits` in `crate::search` for the eventual full shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GoCommand {
     pub depth: Option<u32>,
+    pub movetime_ms: Option<u64>,
 }
 
 impl GoCommand {
     /// Parses the argument portion of a `go` command, i.e. everything
-    /// after `"go"`. Currently only recognizes `depth <n>`; any other
-    /// token is ignored rather than rejected, since a real `go` line
-    /// from a GUI will carry fields (`wtime`, `btime`, ...) this
-    /// milestone doesn't act on yet, and ignoring them is more useful
-    /// than refusing the whole command over them.
+    /// after `"go"`. Currently only recognizes `depth <n>` and
+    /// `movetime <ms>`; any other token is ignored rather than
+    /// rejected, since a real `go` line from a GUI will carry fields
+    /// (`wtime`, `btime`, ...) this milestone doesn't act on yet, and
+    /// ignoring them is more useful than refusing the whole command
+    /// over them.
     pub fn parse(args: &str) -> Self {
         let tokens: Vec<&str> = args.split_whitespace().collect();
-        let depth = tokens
-            .iter()
-            .position(|&token| token == "depth")
-            .and_then(|index| tokens.get(index + 1))
-            .and_then(|value| value.parse().ok());
-        GoCommand { depth }
+        GoCommand {
+            depth: go_field(&tokens, "depth"),
+            movetime_ms: go_field(&tokens, "movetime"),
+        }
     }
+}
+
+/// Extracts the integer value following `name` in a `go` command's
+/// tokens (e.g. `go_field(tokens, "depth")` finds the `4` in `"go
+/// depth 4"`), or `None` if `name` isn't present or isn't followed by
+/// a valid value of type `T`.
+fn go_field<T: std::str::FromStr>(tokens: &[&str], name: &str) -> Option<T> {
+    tokens
+        .iter()
+        .position(|&token| token == name)
+        .and_then(|index| tokens.get(index + 1))
+        .and_then(|value| value.parse().ok())
 }
 
 /// A parsed UCI command. Only a subset of the full protocol is
@@ -245,6 +261,36 @@ fn format_uci_move(mv: Move) -> String {
     }
 }
 
+/// Writes one `info depth <n> score cp <n>|mate <n> nodes <n> time
+/// <ms> pv ...` line for a completed search result. Real UCI `info`
+/// fields, not `info string` -- `info string` is reserved for
+/// diagnostics (see `crate::diagnostics`), and this is exactly the
+/// structured search telemetry those fields exist for.
+fn write_search_info<W: Write>(
+    output: &mut W,
+    result: &crate::search::SearchResult,
+    elapsed: std::time::Duration,
+) -> std::io::Result<()> {
+    let score_field = match mate_in_plies(result.score) {
+        Some(plies_to_mate) => format!("mate {plies_to_mate}"),
+        None => format!("cp {}", result.score),
+    };
+    write!(
+        output,
+        "info depth {} score {score_field} nodes {} time {}",
+        result.depth,
+        result.nodes,
+        elapsed.as_millis(),
+    )?;
+    if !result.pv.is_empty() {
+        write!(output, " pv")?;
+        for mv in &result.pv {
+            write!(output, " {}", format_uci_move(*mv))?;
+        }
+    }
+    writeln!(output)
+}
+
 /// Runs the UCI loop, reading commands from `input` and writing responses
 /// to `output`, until `quit` is received or input ends.
 ///
@@ -287,14 +333,37 @@ pub fn run<R: BufRead, W: Write>(
                     engine.emit_diagnostic(DiagnosticLevel::Warn, format!("{error:?}"));
                 }
             }
-            UciCommand::Go(_go_command) => {
-                // Not real search yet: return the first legal move.
-                // `_go_command.depth` (and the rest of `go`'s fields)
-                // are unused until iterative deepening/alpha-beta land
-                // in a follow-up milestone -- see GoCommand's docs.
-                let moves = engine.position().generate_legal_moves();
-                match moves.first() {
-                    Some(&mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
+            UciCommand::Go(go_command) => {
+                // No real cancellation/threading yet (see GoCommand's
+                // docs and #6/#7) -- `go` runs to completion
+                // synchronously before this loop reads its next line.
+                // movetime takes priority over depth when both are
+                // given, since time-bounded search is the more useful
+                // default for anything actually playing a timed game.
+                let result = match go_command.movetime_ms {
+                    Some(movetime_ms) => {
+                        let budget = std::time::Duration::from_millis(movetime_ms);
+                        let start = Instant::now();
+                        engine.search_for_time(budget, |depth_result| {
+                            let _ = write_search_info(&mut output, depth_result, start.elapsed());
+                        })
+                    }
+                    None => {
+                        // Default to a shallow depth when neither
+                        // movetime nor depth is given, since there's
+                        // no time-based stopping condition to fall
+                        // back on instead.
+                        const DEFAULT_DEPTH: u32 = 4;
+                        let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
+                        let start = Instant::now();
+                        let result = engine.search(depth);
+                        write_search_info(&mut output, &result, start.elapsed())?;
+                        result
+                    }
+                };
+
+                match result.best_move {
+                    Some(mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
                     // No legal moves (checkmate/stalemate): UCI's
                     // convention for "no move to make" is bestmove
                     // 0000 rather than omitting the response.
@@ -342,11 +411,17 @@ mod tests {
     fn go_command_parses_depth() {
         assert_eq!(
             UciCommand::parse("go depth 1"),
-            UciCommand::Go(GoCommand { depth: Some(1) })
+            UciCommand::Go(GoCommand {
+                depth: Some(1),
+                movetime_ms: None
+            })
         );
         assert_eq!(
             UciCommand::parse("go depth 12"),
-            UciCommand::Go(GoCommand { depth: Some(12) })
+            UciCommand::Go(GoCommand {
+                depth: Some(12),
+                movetime_ms: None
+            })
         );
     }
 
@@ -354,7 +429,10 @@ mod tests {
     fn go_command_with_no_depth_has_none() {
         assert_eq!(
             UciCommand::parse("go"),
-            UciCommand::Go(GoCommand { depth: None })
+            UciCommand::Go(GoCommand {
+                depth: None,
+                movetime_ms: None
+            })
         );
     }
 
@@ -365,7 +443,10 @@ mod tests {
         // the fields we do recognize.
         assert_eq!(
             UciCommand::parse("go wtime 300000 btime 300000 depth 3"),
-            UciCommand::Go(GoCommand { depth: Some(3) })
+            UciCommand::Go(GoCommand {
+                depth: Some(3),
+                movetime_ms: None
+            })
         );
     }
 
@@ -373,7 +454,32 @@ mod tests {
     fn go_command_with_malformed_depth_value_has_none() {
         assert_eq!(
             UciCommand::parse("go depth notanumber"),
-            UciCommand::Go(GoCommand { depth: None })
+            UciCommand::Go(GoCommand {
+                depth: None,
+                movetime_ms: None
+            })
+        );
+    }
+
+    #[test]
+    fn go_command_parses_movetime() {
+        assert_eq!(
+            UciCommand::parse("go movetime 100"),
+            UciCommand::Go(GoCommand {
+                depth: None,
+                movetime_ms: Some(100)
+            })
+        );
+    }
+
+    #[test]
+    fn go_command_parses_both_depth_and_movetime() {
+        assert_eq!(
+            UciCommand::parse("go depth 6 movetime 5000"),
+            UciCommand::Go(GoCommand {
+                depth: Some(6),
+                movetime_ms: Some(5000)
+            })
         );
     }
 
@@ -836,5 +942,156 @@ mod tests {
         let text = String::from_utf8(output).expect("output should be valid utf8");
 
         assert!(text.lines().any(|line| line == "bestmove 0000"));
+    }
+
+    #[test]
+    fn go_depth_4_reports_info_fields_before_bestmove() {
+        let input = b"position startpos moves e2e4 e7e5\ngo depth 4\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let info_line = text
+            .lines()
+            .find(|line| line.starts_with("info depth"))
+            .expect("should emit an info line");
+        assert!(info_line.contains("depth 4"));
+        assert!(info_line.contains("score cp") || info_line.contains("score mate"));
+        assert!(info_line.contains("nodes"));
+        assert!(info_line.contains("time"));
+
+        let info_index = text.lines().position(|line| line == info_line).unwrap();
+        let bestmove_index = text
+            .lines()
+            .position(|line| line.starts_with("bestmove"))
+            .expect("should emit a bestmove line");
+        assert!(
+            info_index < bestmove_index,
+            "info must be reported before bestmove"
+        );
+    }
+
+    #[test]
+    fn go_depth_4_searches_a_real_tree_and_finds_mate_in_one() {
+        // The milestone's target behavior: go depth N actually searches
+        // rather than returning the first legal move, and reports a
+        // mate score via the proper UCI `score mate` field (not
+        // `info string`).
+        let fen = "6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1";
+        let input = format!("position fen {fen}\ngo depth 4\nquit\n");
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines().any(|line| line == "bestmove d1d8"),
+            "expected `bestmove d1d8`, got: {text:?}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("info") && line.contains("score mate")),
+            "expected a `score mate` info line, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn go_with_no_depth_uses_a_default_depth() {
+        let input = b"position startpos\ngo\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+        assert!(text.lines().any(|line| line.starts_with("info depth")));
+    }
+
+    #[test]
+    fn go_movetime_reports_one_info_line_per_completed_depth() {
+        let input = b"position startpos\ngo movetime 200\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let info_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("info depth"))
+            .collect();
+        assert!(
+            info_lines.len() >= 2,
+            "expected multiple depths reported within 200ms, got: {info_lines:?}"
+        );
+
+        // Depths must be strictly increasing, starting at 1.
+        let depths: Vec<u32> = info_lines
+            .iter()
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(2)
+                    .unwrap()
+                    .parse()
+                    .expect("depth should be a number")
+            })
+            .collect();
+        assert_eq!(depths.first(), Some(&1));
+        for pair in depths.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1);
+        }
+
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+    }
+
+    #[test]
+    fn go_movetime_finds_mate_in_one_via_iterative_deepening() {
+        let fen = "6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1";
+        let input = format!("position fen {fen}\ngo movetime 500\nquit\n");
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines().any(|line| line == "bestmove d1d8"),
+            "expected `bestmove d1d8`, got: {text:?}"
+        );
+        assert!(text
+            .lines()
+            .any(|line| line.starts_with("info") && line.contains("score mate")));
+    }
+
+    #[test]
+    fn go_movetime_info_line_includes_pv() {
+        let input = b"position startpos\ngo movetime 100\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("info depth") && line.contains(" pv ")),
+            "expected at least one info line with a pv field, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn go_movetime_takes_priority_over_depth_when_both_given() {
+        // depth 1 alone would report only one info line; movetime
+        // should win and drive iterative deepening across several
+        // depths within its budget instead.
+        let input = b"position startpos\ngo depth 1 movetime 200\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let info_lines = text.lines().filter(|l| l.starts_with("info depth")).count();
+        assert!(
+            info_lines >= 2,
+            "expected movetime to drive iterative deepening past depth 1, got {info_lines} info lines"
+        );
     }
 }

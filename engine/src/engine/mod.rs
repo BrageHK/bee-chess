@@ -1,6 +1,8 @@
 /// Engine
 use crate::chess::{PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
+use crate::eval::MaterialEvaluator;
+use crate::search::{self, SearchResult};
 
 /// A move given as `(from, to, promotion)` could not be matched against
 /// any currently legal move. Carries the inputs back so the caller
@@ -110,6 +112,41 @@ impl Engine {
                 promotion,
             }),
         }
+    }
+
+    /// Searches the current position to exactly `depth` plies using
+    /// fixed-depth negamax alpha-beta (see `crate::search::alpha_beta`)
+    /// with a material-only evaluator, and returns the result. Does
+    /// not mutate the current position -- `search::search` restores it
+    /// fully via make/unmake on every path, including cut-off branches.
+    ///
+    /// No quiescence, no transposition table, no move ordering, no
+    /// real cancellation. `depth` is searched to completion
+    /// synchronously. See `search_for_time` for time-bounded iterative
+    /// deepening instead of a fixed depth.
+    #[must_use]
+    pub fn search(&mut self, depth: u32) -> SearchResult {
+        search::search(&mut self.position, depth, &MaterialEvaluator)
+    }
+
+    /// Searches the current position with iterative deepening (depth
+    /// 1, 2, 3, ...) for up to `budget`, calling `on_depth_complete`
+    /// after each depth that finishes in time, and returning the last
+    /// depth that completed -- never a partially-searched one (see
+    /// `crate::search::alpha_beta`'s module docs for why a cut-off
+    /// depth's score can't be trusted). Always completes at least
+    /// depth 1 even for a zero/expired budget.
+    pub fn search_for_time(
+        &mut self,
+        budget: std::time::Duration,
+        on_depth_complete: impl FnMut(&SearchResult),
+    ) -> SearchResult {
+        search::search_iterative(
+            &mut self.position,
+            budget,
+            &MaterialEvaluator,
+            on_depth_complete,
+        )
     }
 }
 
@@ -279,5 +316,57 @@ mod tests {
             engine.position().piece_at(Square::from_file_rank(0, 7)),
             Some(crate::chess::Piece::new(PieceKind::Rook, Color::White))
         );
+    }
+
+    #[test]
+    fn search_returns_a_legal_move_and_does_not_mutate_the_position() {
+        let mut engine = Engine::new();
+        let before = engine.position().clone();
+
+        let result = engine.search(3);
+
+        assert!(result.best_move.is_some());
+        assert_eq!(engine.position(), &before);
+    }
+
+    #[test]
+    fn search_finds_mate_in_one() {
+        let mut engine = Engine::new();
+        engine.set_position(
+            Position::from_fen("6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1").expect("valid FEN"),
+        );
+
+        let result = engine.search(2);
+
+        let best_move = result.best_move.expect("should find a move");
+        assert_eq!(best_move.from(), "d1".parse().unwrap());
+        assert_eq!(best_move.to(), "d8".parse().unwrap());
+    }
+
+    #[test]
+    fn search_for_time_returns_a_legal_move_and_does_not_mutate_the_position() {
+        let mut engine = Engine::new();
+        let before = engine.position().clone();
+
+        let result = engine.search_for_time(std::time::Duration::from_millis(50), |_| {});
+
+        assert!(result.best_move.is_some());
+        assert_eq!(engine.position(), &before);
+    }
+
+    #[test]
+    fn search_for_time_calls_on_depth_complete_for_each_completed_depth() {
+        let mut engine = Engine::new();
+        let mut depths_seen = Vec::new();
+
+        engine.search_for_time(std::time::Duration::from_millis(200), |result| {
+            depths_seen.push(result.depth);
+        });
+
+        assert!(
+            depths_seen.len() >= 2,
+            "should complete more than one depth in 200ms"
+        );
+        assert_eq!(depths_seen.first(), Some(&1));
     }
 }
