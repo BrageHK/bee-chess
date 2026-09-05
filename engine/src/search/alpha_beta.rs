@@ -1,12 +1,12 @@
 //! Negamax alpha-beta search, fixed-depth and time-bounded iterative
-//! deepening: the first two slices of #6 (6a, plus 6c's iterative
-//! deepening pulled forward to be time- rather than depth-driven).
+//! deepening, plus a quiescence search at the leaves: the first three
+//! slices of #6 (6a, 6c's iterative deepening pulled forward to be
+//! time- rather than depth-driven, and now quiescence).
 //!
-//! Deliberately excludes (see later #6 PRs): quiescence search (so it
-//! suffers the horizon effect at the search boundary), a transposition
+//! Deliberately still excludes (see later #6 PRs): a transposition
 //! table, move ordering, aspiration windows, and PVS. None of those
-//! affect correctness; they only affect speed and (for quiescence)
-//! tactical horizon quality. Get the tree itself correct first.
+//! affect correctness; they only affect speed. Get the tree itself
+//! correct first.
 //!
 //! There is also no threading/cancellation infrastructure yet (that's
 //! #7's territory) -- time-bounded search instead polls a `Deadline`
@@ -16,7 +16,7 @@
 //! so a score produced after bailing out partway through one is not
 //! trustworthy the way a fully-completed depth's score is.
 
-use crate::chess::{Move, Position};
+use crate::chess::{Move, MoveFlag, Position};
 use crate::eval::Evaluator;
 
 use super::deadline::Deadline;
@@ -210,7 +210,8 @@ fn negamax(
     }
 
     if depth == 0 {
-        return Some((evaluator.evaluate(position), Vec::new()));
+        let score = quiescence(position, alpha, beta, ply, ply, evaluator, nodes, deadline)?;
+        return Some((score, Vec::new()));
     }
 
     let mut best = -SCORE_INF;
@@ -248,6 +249,130 @@ fn negamax(
     }
 
     Some((best, best_pv))
+}
+
+/// How many plies deep quiescence will keep searching captures below
+/// the point it's called (`ply` at entry, not the root). Without this,
+/// a queen-and-rook-dense middlegame with many possible captures per
+/// side (e.g. the Kiwipete test position below) can take effectively
+/// forever: every capture is searched regardless of whether it's a
+/// good trade (no SEE/delta pruning here yet -- a real follow-up, not
+/// this cap), so branching stays wide at every ply of the exchange, not
+/// just deep. Measured against Kiwipete: quiescence's own node count
+/// roughly 10x's per additional ply allowed here, so this needs to stay
+/// small, not just finite -- a generous-looking cap (e.g. 16) still
+/// lets a single leaf's quiescence run into the tens of millions of
+/// nodes on a position like this. 4 plies (two full moves of exchange)
+/// covers the overwhelming majority of real capture sequences (which
+/// resolve via a short back-and-forth on one square) while keeping the
+/// pathological wide-branching case bounded. Past the cap, quiescence
+/// returns the stand-pat score instead of recursing further, the same
+/// way `negamax` returns `evaluator`'s score at `depth == 0` -- a real
+/// (if not fully exchange-resolved) evaluation, never an invented one.
+const MAX_QUIESCENCE_PLY: u32 = 4;
+
+/// Quiescence search: from `depth == 0`, keeps searching captures only
+/// (a "noisy" position with hanging material can't be trusted just
+/// because the depth budget ran out mid-exchange -- see the module
+/// docs' "horizon effect" mention) until the position is "quiet"
+/// (no more captures to consider) or `MAX_QUIESCENCE_PLY` is reached,
+/// then returns `evaluator`'s static score for that position.
+///
+/// This is a stand-pat alpha-beta: unlike `negamax`, a leaf here isn't
+/// forced to make a move at all. `evaluator.evaluate(position)` (the
+/// "stand-pat score") is itself a candidate result -- the side to move
+/// can always just decline every further capture -- so it seeds `best`
+/// and `alpha` before any capture is tried, and a capture is only worth
+/// recursing into if it can beat that baseline. This is what bounds the
+/// search: without stand-pat, quiescence would have to prove a losing
+/// capture is losing by searching it out, instead of pruning it
+/// immediately for scoring worse than just not capturing.
+///
+/// `start_ply` is the ply this quiescence call tree was entered at (the
+/// `ply` negamax was at when it hit `depth == 0`), used to measure
+/// depth *within* quiescence against `MAX_QUIESCENCE_PLY` separately
+/// from `ply`'s ordinary role of ply-adjusting mate scores.
+///
+/// Same `None`-means-deadline-expired contract as `negamax`.
+#[allow(clippy::too_many_arguments)]
+fn quiescence(
+    position: &mut Position,
+    mut alpha: Score,
+    beta: Score,
+    ply: u32,
+    start_ply: u32,
+    evaluator: &impl Evaluator,
+    nodes: &mut u64,
+    deadline: &Deadline,
+) -> Option<Score> {
+    if deadline.is_expired(*nodes) {
+        return None;
+    }
+
+    *nodes += 1;
+
+    // Checkmate/stalemate must still be detected even inside
+    // quiescence: a position with no legal moves at all has no stand-pat
+    // baseline to fall back on (there's no "declining every capture" if
+    // there's no legal move whatsoever), so this needs the full legal
+    // move list, not just captures, to tell those two cases apart from
+    // an ordinary quiet position.
+    let moves = position.generate_legal_moves();
+    if moves.is_empty() {
+        return Some(terminal_score(position, ply));
+    }
+
+    let stand_pat = evaluator.evaluate(position);
+    if stand_pat >= beta {
+        return Some(stand_pat); // opponent already wouldn't allow reaching this quiet line
+    }
+    let mut best = stand_pat;
+    alpha = alpha.max(stand_pat);
+
+    if ply - start_ply >= MAX_QUIESCENCE_PLY {
+        return Some(best); // safety valve -- see MAX_QUIESCENCE_PLY's docs
+    }
+
+    let captures: Vec<Move> = moves
+        .into_iter()
+        .filter(|&mv| is_capture(position, mv))
+        .collect();
+    for mv in captures {
+        let undo = position.make_move(mv);
+        let outcome = quiescence(
+            position,
+            -beta,
+            -alpha,
+            ply + 1,
+            start_ply,
+            evaluator,
+            nodes,
+            deadline,
+        );
+        position.unmake_move(mv, undo);
+
+        let score = -outcome?;
+
+        if score > best {
+            best = score;
+        }
+        alpha = alpha.max(score);
+
+        if alpha >= beta {
+            break; // beta cutoff, same reasoning as negamax's
+        }
+    }
+
+    Some(best)
+}
+
+/// Whether `mv` captures a piece in `position`. Not carried on `Move`
+/// itself (see `moves.rs`'s docs): a plain capture looks identical to a
+/// quiet move without checking what's actually on the destination
+/// square, except for en passant, whose destination square is always
+/// empty (the captured pawn sits beside it, not on it).
+fn is_capture(position: &Position, mv: Move) -> bool {
+    mv.flag() == MoveFlag::EnPassant || position.piece_at(mv.to()).is_some()
 }
 
 /// The score for a position with no legal moves: checkmate (ply-
@@ -474,5 +599,65 @@ mod tests {
         );
 
         assert_eq!(result.pv.first(), result.best_move.as_ref());
+    }
+
+    #[test]
+    fn quiescence_resolves_a_hanging_capture_at_the_search_horizon() {
+        // White rook on a1 can capture a black queen on a5 (same file,
+        // nothing defends it) in one move. At depth 1, plain negamax
+        // would stop right after that capture and score the position
+        // by material alone -- which already sees the up-a-queen
+        // material swing, since evaluation happens *after* the capturing
+        // move is made. This isn't actually a horizon-effect case (the
+        // gain is realized within the given depth either way); it exists
+        // to confirm quiescence doesn't change a value that's already
+        // correct at depth 1, i.e. it doesn't introduce a regression on
+        // the simplest possible case before trusting it on subtler ones.
+        let mut position =
+            Position::from_fen("4k3/8/8/q7/8/8/8/R3K3 w - - 0 1").expect("valid FEN");
+
+        let result = search(&mut position, 1, &MaterialEvaluator);
+
+        let best_move = result.best_move.expect("should find a move");
+        assert_eq!(best_move.from(), "a1".parse().unwrap());
+        assert_eq!(best_move.to(), "a5".parse().unwrap());
+    }
+
+    #[test]
+    fn quiescence_avoids_the_horizon_effect_of_a_losing_trade() {
+        // White to move, depth 1: a rook on d4 can capture a black knight
+        // on d5, but a black pawn on e6 recaptures it right back. Plain
+        // depth-1 negamax (no quiescence) would stop immediately after
+        // Rxd5 and score the position by material alone -- seeing only
+        // "I won a knight" and missing that the rook falls right back
+        // one ply later, the classic horizon effect. Quiescence must
+        // keep searching this capture-recapture exchange past the
+        // nominal depth-1 cutoff and correctly see the trade as a net
+        // loss (rook for knight), so the engine should prefer leaving
+        // its rook on d4 over grabbing the knight.
+        let mut position =
+            Position::from_fen("4k3/8/4p3/3n4/3R4/8/8/4K3 w - - 0 1").expect("valid FEN");
+
+        let result = search(&mut position, 1, &MaterialEvaluator);
+
+        let best_move = result.best_move.expect("should find a move");
+        assert_ne!(
+            (best_move.from(), best_move.to()),
+            ("d4".parse().unwrap(), "d5".parse().unwrap()),
+            "should not walk into a rook-for-knight trade that quiescence can see is losing"
+        );
+    }
+
+    #[test]
+    fn quiescence_never_makes_score_worse_than_stand_pat_when_no_capture_helps() {
+        // A quiet position (no captures available at all for the side to
+        // move) should score exactly the same at depth 1 as plain
+        // material evaluation would -- quiescence must be a no-op here,
+        // not perturb an already-quiet leaf's score.
+        let mut position = Position::startpos();
+
+        let result = search(&mut position, 1, &MaterialEvaluator);
+
+        assert_eq!(result.score, MaterialEvaluator.evaluate(&position));
     }
 }
