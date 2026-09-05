@@ -20,12 +20,37 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+/// Which direction a line of raw UCI traffic went -- passed to
+/// `UciProcess`'s `on_line` callback so a caller building an event
+/// stream (see `game::run_engine_loop`, #69's 69c-1a) can tag it
+/// correctly without needing to track direction itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UciDirection {
+    Sent,
+    Received,
+}
+
 /// A running engine process, mid-UCI-conversation.
+///
+/// `on_line`, if set, is called with every line sent to or received
+/// from the process -- `info` telemetry included, not just the lines
+/// this type's own methods act on (`uciok`/`readyok`/`bestmove`). This
+/// is what lets a caller mirror the exact same raw UCI traffic a
+/// direct browser connection to the engine would see (`uci_relay`'s
+/// job for the old bridge/lab relay), now that the server itself is
+/// the one actually talking to the process.
 pub struct UciProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    on_line: Option<OnLine>,
 }
+
+/// A callback invoked with every line `UciProcess` sends or receives --
+/// see its struct docs. Factored into its own alias since the bare
+/// trait-object type reads as noise wherever it appears (clippy's
+/// `type_complexity` lint agrees).
+pub type OnLine = Box<dyn Fn(UciDirection, &str) + Send + Sync>;
 
 #[derive(Debug)]
 pub enum UciProcessError {
@@ -53,9 +78,15 @@ impl std::error::Error for UciProcessError {}
 impl UciProcess {
     /// Spawns `argv[0]` (with `argv[1..]` as arguments) in `cwd` and
     /// completes the `uci`/`isready` handshake, discarding every line
-    /// in between (`id name`, `option ...`) -- this slice doesn't need
-    /// any of it, just confirmation the engine is alive and ready.
-    pub async fn spawn(argv: &[String], cwd: &Path) -> Result<Self, UciProcessError> {
+    /// in between (`id name`, `option ...`) for this type's own
+    /// purposes -- this slice doesn't need any of it beyond
+    /// confirmation the engine is alive and ready. `on_line`, if given,
+    /// still sees every line regardless (see the struct docs).
+    pub async fn spawn(
+        argv: &[String],
+        cwd: &Path,
+        on_line: Option<OnLine>,
+    ) -> Result<Self, UciProcessError> {
         let (program, args) = argv.split_first().expect("argv must be non-empty");
 
         let mut child = Command::new(program)
@@ -75,6 +106,7 @@ impl UciProcess {
             child,
             stdin,
             stdout,
+            on_line,
         };
 
         process.send("uci").await?;
@@ -118,6 +150,9 @@ impl UciProcess {
     }
 
     async fn send(&mut self, line: &str) -> Result<(), UciProcessError> {
+        if let Some(on_line) = &self.on_line {
+            on_line(UciDirection::Sent, line);
+        }
         self.stdin
             .write_all(line.as_bytes())
             .await
@@ -131,7 +166,12 @@ impl UciProcess {
 
     async fn read_line(&mut self) -> Result<String, UciProcessError> {
         match self.stdout.next_line().await {
-            Ok(Some(line)) => Ok(line),
+            Ok(Some(line)) => {
+                if let Some(on_line) = &self.on_line {
+                    on_line(UciDirection::Received, &line);
+                }
+                Ok(line)
+            }
             Ok(None) => Err(UciProcessError::ProcessExited),
             Err(err) => Err(UciProcessError::Io(err)),
         }
@@ -177,7 +217,7 @@ mod tests {
             read _; echo "readyok"
             "#,
         );
-        let result = UciProcess::spawn(&argv, std::env::temp_dir().as_path()).await;
+        let result = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
@@ -190,7 +230,7 @@ mod tests {
             read _; read _; echo "bestmove e2e4"
             "#,
         );
-        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path())
+        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
             .await
             .expect("handshake should succeed");
 
@@ -212,7 +252,7 @@ mod tests {
             echo "bestmove e2e4"
             "#,
         );
-        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path())
+        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
             .await
             .expect("handshake should succeed");
 
@@ -232,7 +272,7 @@ mod tests {
             read _; read _; echo "bestmove 0000"
             "#,
         );
-        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path())
+        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
             .await
             .expect("handshake should succeed");
 
@@ -246,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_of_a_nonexistent_binary_is_a_spawn_error() {
         let argv = vec!["/no/such/binary/exists".to_string()];
-        let result = UciProcess::spawn(&argv, std::env::temp_dir().as_path()).await;
+        let result = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None).await;
         assert!(matches!(result, Err(UciProcessError::Spawn(_))));
     }
 
@@ -259,11 +299,64 @@ mod tests {
             exit 0
             "#,
         );
-        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path())
+        let mut process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
             .await
             .expect("handshake should succeed");
 
         let result = process.best_move(&[], 100).await;
         assert!(matches!(result, Err(UciProcessError::ProcessExited)));
+    }
+
+    #[tokio::test]
+    async fn on_line_sees_every_sent_and_received_line_including_info() {
+        let argv = fake_engine_argv(
+            r#"
+            read _; echo "uciok"
+            read _; echo "readyok"
+            read _; read _
+            echo "info depth 1 score cp 10 pv e2e4"
+            echo "bestmove e2e4"
+            "#,
+        );
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_for_callback = lines.clone();
+        let mut process = UciProcess::spawn(
+            &argv,
+            std::env::temp_dir().as_path(),
+            Some(Box::new(move |direction, line: &str| {
+                lines_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((direction, line.to_string()));
+            })),
+        )
+        .await
+        .expect("handshake should succeed");
+
+        process
+            .best_move(&[], 100)
+            .await
+            .expect("should get a bestmove");
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|(dir, line)| *dir == UciDirection::Sent && line == "uci"),
+            "should have seen the sent 'uci' line: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(dir, line)| *dir == UciDirection::Received
+                    && line.starts_with("info depth 1")),
+            "should have seen the received info line, not just bestmove: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(dir, line)| *dir == UciDirection::Received && line == "bestmove e2e4"),
+            "should have seen the received bestmove line: {captured:?}"
+        );
     }
 }
