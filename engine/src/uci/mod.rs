@@ -11,10 +11,12 @@
 //! lands in a follow-up PR (`feat/uci-state-machine`).
 
 use std::io::{BufRead, Write};
+use std::time::Instant;
 
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
 use crate::engine::Engine;
+use crate::search::mate_in_plies;
 
 pub const ENGINE_NAME: &str = "bee-chess";
 pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
@@ -151,11 +153,11 @@ fn parse_moves_suffix(s: &str) -> Option<Vec<UciMove>> {
 }
 
 /// The parsed body of a `go` command. Only `depth` is recognized so
-/// far -- enough to return a legal move, not to search. Clock/
-/// increment/nodes/movetime/infinite/ponder and the rest of `go`'s
-/// fields, along with `stop` and actual search, are a follow-up
-/// milestone's work; see `SearchLimits` in `crate::search` for the
-/// eventual full shape.
+/// far, driving a real fixed-depth alpha-beta search (see
+/// `Engine::search`). Clock/increment/nodes/movetime/infinite/ponder,
+/// `stop`, cancellation, and iterative deepening are follow-up #6
+/// work; see `SearchLimits` in `crate::search` for the eventual full
+/// shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GoCommand {
     pub depth: Option<u32>,
@@ -287,14 +289,31 @@ pub fn run<R: BufRead, W: Write>(
                     engine.emit_diagnostic(DiagnosticLevel::Warn, format!("{error:?}"));
                 }
             }
-            UciCommand::Go(_go_command) => {
-                // Not real search yet: return the first legal move.
-                // `_go_command.depth` (and the rest of `go`'s fields)
-                // are unused until iterative deepening/alpha-beta land
-                // in a follow-up milestone -- see GoCommand's docs.
-                let moves = engine.position().generate_legal_moves();
-                match moves.first() {
-                    Some(&mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
+            UciCommand::Go(go_command) => {
+                // Fixed-depth search only so far (no iterative
+                // deepening/cancellation/time management yet -- see
+                // GoCommand's docs and #6). Default to a shallow depth
+                // when the GUI doesn't specify one, since this milestone
+                // has no time-based stopping condition to fall back on.
+                const DEFAULT_DEPTH: u32 = 4;
+                let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
+
+                let start = Instant::now();
+                let result = engine.search(depth);
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                let score_field = match mate_in_plies(result.score) {
+                    Some(plies_to_mate) => format!("mate {plies_to_mate}"),
+                    None => format!("cp {}", result.score),
+                };
+                writeln!(
+                    output,
+                    "info depth {depth} score {score_field} nodes {} time {elapsed_ms}",
+                    result.nodes,
+                )?;
+
+                match result.best_move {
+                    Some(mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
                     // No legal moves (checkmate/stalemate): UCI's
                     // convention for "no move to make" is bestmove
                     // 0000 rather than omitting the response.
@@ -836,5 +855,69 @@ mod tests {
         let text = String::from_utf8(output).expect("output should be valid utf8");
 
         assert!(text.lines().any(|line| line == "bestmove 0000"));
+    }
+
+    #[test]
+    fn go_depth_4_reports_info_fields_before_bestmove() {
+        let input = b"position startpos moves e2e4 e7e5\ngo depth 4\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let info_line = text
+            .lines()
+            .find(|line| line.starts_with("info depth"))
+            .expect("should emit an info line");
+        assert!(info_line.contains("depth 4"));
+        assert!(info_line.contains("score cp") || info_line.contains("score mate"));
+        assert!(info_line.contains("nodes"));
+        assert!(info_line.contains("time"));
+
+        let info_index = text.lines().position(|line| line == info_line).unwrap();
+        let bestmove_index = text
+            .lines()
+            .position(|line| line.starts_with("bestmove"))
+            .expect("should emit a bestmove line");
+        assert!(
+            info_index < bestmove_index,
+            "info must be reported before bestmove"
+        );
+    }
+
+    #[test]
+    fn go_depth_4_searches_a_real_tree_and_finds_mate_in_one() {
+        // The milestone's target behavior: go depth N actually searches
+        // rather than returning the first legal move, and reports a
+        // mate score via the proper UCI `score mate` field (not
+        // `info string`).
+        let fen = "6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1";
+        let input = format!("position fen {fen}\ngo depth 4\nquit\n");
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines().any(|line| line == "bestmove d1d8"),
+            "expected `bestmove d1d8`, got: {text:?}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("info") && line.contains("score mate")),
+            "expected a `score mate` info line, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn go_with_no_depth_uses_a_default_depth() {
+        let input = b"position startpos\ngo\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+        assert!(text.lines().any(|line| line.starts_with("info depth")));
     }
 }
