@@ -2,18 +2,18 @@
 //!
 //! These types are the shared vocabulary between the UCI adapter and the
 //! search implementation. Per ADR 0001, the v1 search algorithm is
-//! alpha-beta/PVS. Fixed-depth negamax alpha-beta with a material
-//! evaluator is the first slice (see `search::alpha_beta`), with
-//! time-bounded iterative deepening (`search_iterative`) as the second;
-//! quiescence, transposition tables, and move ordering are separate
-//! follow-up PRs -- see issue #6.
+//! alpha-beta/PVS. The implementation includes time-bounded iterative
+//! deepening, quiescence, move ordering, a transposition table, and rule-draw
+//! handling; see `search::alpha_beta` and issue #6.
 
 use crate::chess::{Move, Position};
 
 mod alpha_beta;
 mod deadline;
 
-pub use alpha_beta::{search, search_iterative};
+pub use alpha_beta::{
+    search, search_iterative, search_iterative_with_history, search_with_history,
+};
 
 /// A search score in centipawns, always from the perspective of the
 /// side to move at the point the score was produced (i.e. what

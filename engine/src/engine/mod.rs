@@ -193,19 +193,23 @@ impl Engine {
     /// not mutate the current position -- `search::search` restores it
     /// fully via make/unmake on every path, including cut-off branches.
     ///
-    /// No transposition table, move ordering, or real cancellation.
-    /// `depth` is searched to completion
-    /// synchronously. See `search_for_time` for time-bounded iterative
+    /// `depth` is searched to completion synchronously. See `search_for_time` for time-bounded iterative
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
         match self.evaluator {
-            EvaluatorKind::Material => {
-                search::search(&mut self.position, depth, &MaterialEvaluator)
-            }
-            EvaluatorKind::Positional => {
-                search::search(&mut self.position, depth, &PositionalEvaluator)
-            }
+            EvaluatorKind::Material => search::search_with_history(
+                &mut self.position,
+                depth,
+                &MaterialEvaluator,
+                &self.position_history,
+            ),
+            EvaluatorKind::Positional => search::search_with_history(
+                &mut self.position,
+                depth,
+                &PositionalEvaluator,
+                &self.position_history,
+            ),
         }
     }
 
@@ -222,16 +226,18 @@ impl Engine {
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         match self.evaluator {
-            EvaluatorKind::Material => search::search_iterative(
+            EvaluatorKind::Material => search::search_iterative_with_history(
                 &mut self.position,
                 budget,
                 &MaterialEvaluator,
+                &self.position_history,
                 on_depth_complete,
             ),
-            EvaluatorKind::Positional => search::search_iterative(
+            EvaluatorKind::Positional => search::search_iterative_with_history(
                 &mut self.position,
                 budget,
                 &PositionalEvaluator,
+                &self.position_history,
                 on_depth_complete,
             ),
         }
@@ -522,6 +528,7 @@ mod tests {
             Position::startpos().zobrist_hash()
         );
         assert!(engine.is_threefold_repetition());
+        assert_eq!(engine.search(4).score, 0, "search must honor game history");
     }
 
     #[test]
