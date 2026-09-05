@@ -100,8 +100,17 @@ export function Game({
 
   /** Drives bot turns for as long as it's a bot's move (may be more
    * than one ply in a row if both slots are bots, or zero if it's
-   * immediately a human's turn). */
-  const runBotTurns = async () => {
+   * immediately a human's turn).
+   *
+   * `isCancelled` is checked right after each `bestMove` await
+   * resolves, before touching any shared ref/state -- it's how the
+   * mount effect below aborts an in-progress loop from a superseded
+   * (StrictMode double-invoked) run instead of letting its `bestMove`
+   * reply land as a second, racing move applied on top of a game a
+   * fresher run has since moved on from. Defaults to "never
+   * cancelled" for `onHumanMove`'s call site, a real event handler
+   * with no such superseded-run concern. */
+  const runBotTurns = async (isCancelled: () => boolean = () => false) => {
     while (!finishIfOver()) {
       const color: Color = posRef.current.turn;
       const participant = participantFor(color);
@@ -118,10 +127,13 @@ export function Game({
       try {
         uci = await client.bestMove(movesRef.current, participant.moveTimeMs);
       } catch (err) {
+        if (isCancelled()) return;
         setStatus(message(err));
         setFinished(true);
         return;
       }
+
+      if (isCancelled()) return;
 
       if (!applyMove(uci)) {
         setStatus(`${client.name} played an illegal move: ${uci}`);
@@ -134,8 +146,21 @@ export function Game({
   // Connects each bot slot's client and starts the game loop. Runs
   // once per mount, i.e. once per game (see the component doc comment
   // above for why "on mount" and "on new game" are the same event
-  // here).
+  // here) -- *except* under React StrictMode's dev-only
+  // mount/unmount/remount cycle, which deliberately double-invokes
+  // every effect to surface exactly the bug this guards against: an
+  // effect with no cleanup runs its whole async body twice, and here
+  // that meant two concurrent `runBotTurns()` loops sharing the same
+  // `movesRef`/`posRef`, both calling `bestMove` from `startpos`
+  // before either had applied a move -- the second reply then landed
+  // as a stale, now-illegal move once the first had already advanced
+  // the game. `cancelled` (flipped by this effect's cleanup) is
+  // checked before ever touching shared refs/state and at every
+  // meaningful await boundary, so a StrictMode-aborted first run's
+  // continuations become no-ops instead of a second, racing game loop.
   useEffect(() => {
+    let cancelled = false;
+
     void (async () => {
       setStatus("connecting to the bridge…");
 
@@ -144,6 +169,7 @@ export function Game({
         const participant = participantFor(color);
         if (participant.kind === "human") continue;
         const client = createBotClient(participant.kind);
+        if (cancelled) return; // aborted before this slot's client could be tracked
         clientsRef.current[color] = client;
         pending.push(client.init());
         if (participant.kind === "stockfish") {
@@ -161,14 +187,20 @@ export function Game({
       try {
         await Promise.all(pending);
       } catch (err) {
+        if (cancelled) return;
         setStatus(message(err));
         setFinished(true);
         return;
       }
 
+      if (cancelled) return;
       syncBoardState();
-      await runBotTurns();
+      await runBotTurns(() => cancelled);
     })();
+
+    return () => {
+      cancelled = true;
+    };
     // Intentionally empty deps: white/black/onBackToSetup are fixed
     // for this component's lifetime (a new game remounts it via a
     // fresh `key` instead of these props changing in place).
