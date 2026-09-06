@@ -1,6 +1,6 @@
 /// Engine
-use crate::book::{CowOpeningBook, NoBook, OpeningBook};
-use crate::chess::{PieceKind, Position, Square};
+use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
+use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, SearchOptions, SearchResult};
@@ -42,6 +42,18 @@ pub struct Engine {
     /// clones, since a repetition check only needs "was this exact
     /// position reached before," not the position itself.
     position_history: Vec<u64>,
+    /// Every move played since the last `set_position`, in order --
+    /// unlike `position_history`, this records the actual `Move`s, not
+    /// just their resulting hashes. Exists purely so an `OpeningBook`
+    /// (see `OpeningContext`) can tell "what has genuinely happened in
+    /// this game" apart from "what the board looks like right now" --
+    /// `CowOpeningBook` needs exactly that distinction (see its docs)
+    /// to keep a temporary knight retreat from reopening an
+    /// already-completed setup step. Reset (not appended to) by
+    /// `set_position`, for the same reason `position_history` is: a
+    /// UCI `position` command always resends the entire move list from
+    /// a base position.
+    move_history: Vec<Move>,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -122,6 +134,7 @@ impl Engine {
             position,
             diagnostics: DiagnosticBuffer::new(),
             position_history,
+            move_history: Vec::new(),
         }
     }
 
@@ -151,6 +164,7 @@ impl Engine {
     /// at a time after this.
     pub fn set_position(&mut self, position: Position) {
         self.position_history = vec![position.zobrist_hash()];
+        self.move_history = Vec::new();
         self.position = position;
     }
 
@@ -248,6 +262,7 @@ impl Engine {
             Some(mv) => {
                 self.position.make_move(mv);
                 self.position_history.push(self.position.zobrist_hash());
+                self.move_history.push(mv);
                 Ok(())
             }
             None => Err(IllegalMoveError {
@@ -276,7 +291,11 @@ impl Engine {
     /// forever. An invalid candidate is logged and treated as a book
     /// miss, never played.
     fn book_move(&mut self) -> Option<SearchResult> {
-        let mv = self.opening_book.probe(&self.position)?;
+        let context = OpeningContext {
+            position: &self.position,
+            moves: &self.move_history,
+        };
+        let mv = self.opening_book.probe(&context)?;
         if !self
             .position
             .generate_legal_moves()

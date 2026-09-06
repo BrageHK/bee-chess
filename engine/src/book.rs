@@ -3,15 +3,17 @@
 //! well-known opening moves and doesn't need to search from scratch
 //! before showing any real chess understanding at all.
 //!
-//! `OpeningBook::probe` takes a `&Position`, not a Zobrist hash or ply
-//! count: keying by the actual position (not move sequence) is what
-//! makes a book work correctly across transpositions -- two different
-//! move orders reaching the same position get the same answer -- and
-//! keying by position rather than a raw hash keeps a future real
-//! book's on-disk key scheme entirely its own implementation detail,
-//! never something the engine or this trait needs to agree on ahead of
-//! time (see `CowOpeningBook`'s own docs for why this first
-//! implementation doesn't even need a hash at all).
+//! `OpeningBook::probe` takes an `OpeningContext`, not a bare position:
+//! most implementations only need the current position (keying by
+//! position rather than move sequence or a raw hash is what makes a
+//! book work correctly across transpositions -- two different move
+//! orders reaching the same position get the same answer -- and keeps
+//! a future real book's on-disk key scheme entirely its own
+//! implementation detail). But a book's notion of "progress" can
+//! genuinely depend on *how* the position was reached, not just what
+//! it looks like right now -- see `OpeningContext` and
+//! `CowOpeningBook`'s own docs for exactly why the latter needs full
+//! move history, not just the position, to behave correctly.
 //!
 //! This first slice deliberately implements only the smallest useful
 //! vertical slice through the whole architecture: the trait, a `NoBook`
@@ -21,21 +23,35 @@
 //! are real follow-ups once this seam has proven itself, not
 //! prerequisites for it.
 
-use crate::chess::{Color, Move, MoveFlag, PieceKind, Position, Square};
+use crate::chess::{Color, Move, MoveFlag, Position, Square};
 
-/// Looks up a known-good move for `position`, if any. Implementations
-/// must return a currently *legal* move or `None` -- the caller
-/// (`Engine::search`/`search_for_time`) still doesn't re-validate a
-/// `Some` result against `generate_legal_moves` beyond what a specific
-/// implementation's own docs promise, so an implementation that can't
-/// guarantee legality (e.g corrupt/stale on-disk data, once a
-/// file-backed book exists) must probe legality itself and return
-/// `None` rather than risk playing an illegal move.
+/// Everything an `OpeningBook` gets to look at when deciding a move:
+/// the current position, and every move played to reach it (in order,
+/// starting from whatever base position the current game started
+/// from -- see `Engine::move_history`'s docs). Most implementations
+/// (a Zobrist-keyed database, Polyglot) only need `position` and can
+/// ignore `moves` entirely; `moves` exists for the rarer book whose
+/// notion of progress genuinely depends on *how* the current position
+/// was reached, not just what it looks like right now -- see
+/// `CowOpeningBook`'s docs for exactly why it needs this.
+pub struct OpeningContext<'a> {
+    pub position: &'a Position,
+    pub moves: &'a [Move],
+}
+
+/// Looks up a known-good move for `context`'s position, if any.
+/// Implementations must return a currently *legal* move or `None` --
+/// the caller (`Engine::search`/`search_for_time`) still doesn't
+/// re-validate a `Some` result against `generate_legal_moves` beyond
+/// what a specific implementation's own docs promise, so an
+/// implementation that can't guarantee legality (e.g corrupt/stale
+/// on-disk data, once a file-backed book exists) must probe legality
+/// itself and return `None` rather than risk playing an illegal move.
 ///
 /// A book miss (`None`) is always a completely ordinary outcome, not
 /// an error -- see `NoBook`.
 pub trait OpeningBook: Send + Sync {
-    fn probe(&self, position: &Position) -> Option<Move>;
+    fn probe(&self, context: &OpeningContext<'_>) -> Option<Move>;
 }
 
 /// The null opening book: always a miss. Used whenever `OwnBook`/
@@ -46,7 +62,7 @@ pub trait OpeningBook: Send + Sync {
 pub struct NoBook;
 
 impl OpeningBook for NoBook {
-    fn probe(&self, _position: &Position) -> Option<Move> {
+    fn probe(&self, _context: &OpeningContext<'_>) -> Option<Move> {
         None
     }
 }
@@ -56,38 +72,39 @@ impl OpeningBook for NoBook {
 /// not the Hippopotamus (which fianchettoes both bishops behind a
 /// king-side pawn triangle instead). It's a real, if eccentric and
 /// objectively passive, setup: a good first opening book precisely
-/// *because* it's simple enough to encode as "which setup move is
-/// still pending" rather than needing a real position-keyed database.
+/// *because* it's simple enough to encode as "which setup steps have
+/// happened" rather than needing a real position-keyed database.
 ///
-/// The Cow's setup order for one side, adjusted for which pieces have
-/// already been played: e-pawn to e3, d-pawn to d3, king knight to e2,
-/// queen knight to d2, then the knight on e2 continues to g3 and the
-/// knight on d2 continues to b3. `probe` walks this list and returns
-/// the first step that (a) hasn't happened yet and (b) is currently a
-/// legal move.
+/// The Cow's setup order for one side: e-pawn to e3, d-pawn to d3,
+/// king knight to e2, queen knight to d2, then the knight on e2
+/// continues to g3 and the knight on d2 continues to b3. `probe`
+/// returns the first *not-yet-completed* step that's currently legal.
 ///
-/// "Hasn't happened yet" is checked by looking for the *expected piece
-/// kind* still sitting on the step's `from` square -- not just whether
-/// `from` is occupied at all. That distinction matters here
-/// specifically because two steps share a square: the e-pawn vacates
-/// e2 (step 0) and the king's knight later arrives on e2 (step 2) to
-/// continue on to g3 (step 4). Checking bare occupancy would read "a
-/// piece is on e2" once the knight gets there and wrongly conclude
-/// step 0 (the pawn push) still needs playing, sending `probe` off to
-/// try an already-completed (and by then illegal) pawn move instead of
-/// reaching the real pending step. Checking "is there still a *pawn*
-/// on e2" instead correctly reads that step as done and moves on. This
-/// is still genuinely keyed by the position's actual piece placement,
-/// not a move counter -- just checking placement precisely enough to
-/// handle the setup's own square reuse.
+/// Progress is **historical, not positional**: a step counts as
+/// completed the moment `context.moves` shows it was ever played by
+/// this side, and staying completed regardless of what the board
+/// looks like afterward -- retreating a knight, or the piece being
+/// captured, never un-completes a step. This distinction matters
+/// concretely: e2 is both the e-pawn's start square and the king
+/// knight's stop on the way to g3. A board-only check ("is a pawn
+/// still on e2?") can't tell "the pawn never left" apart from "the
+/// knight reached e2, then later retreated back to e2 after g3 was
+/// attacked" -- both leave a piece sitting on e2 that isn't the pawn.
+/// Reading the *history* instead of just the current board is what
+/// keeps a temporary retreat from resurrecting an already-finished
+/// step and, e.g., marching the same knight back into the same
+/// now-attacked g3 square it just retreated from.
 ///
-/// If the pending step isn't legal right now (the opponent is doing
-/// something that makes it impossible, e.g. `e3` blocked or the
-/// knight's target square defended in a way that matters, or,
-/// plainly, it's simply not this side's move), this returns `None`
-/// rather than forcing the setup through, and `Engine` falls back to
-/// a normal search -- the Cow setup is a starting point Bee commits to
-/// only while it stays reasonable, never a script it plays blindly.
+/// Once a genuinely pending (never-completed) step isn't legal right
+/// now (the opponent is doing something that makes it impossible,
+/// e.g. `e3` blocked, or it's simply not this side's move), this
+/// returns `None` rather than forcing the setup through -- `Engine`
+/// falls back to a normal search, and (since progress is monotonic,
+/// not reset) the same step is offered again next time this side is
+/// to move and it's legal, rather than being abandoned. Once every
+/// step has ever been completed, this always returns `None` --the Cow
+/// never reopens a finished horn just because the board temporarily
+/// looks like an earlier stage of it.
 ///
 /// Symmetric for both colors: the shape is mirrored (rank 2->3 for
 /// White becomes rank 7->6 for Black, etc.) via `Color`-relative
@@ -96,51 +113,64 @@ impl OpeningBook for NoBook {
 pub struct CowOpeningBook;
 
 impl OpeningBook for CowOpeningBook {
-    fn probe(&self, position: &Position) -> Option<Move> {
+    fn probe(&self, context: &OpeningContext<'_>) -> Option<Move> {
+        let position = context.position;
         let side = position.side_to_move();
         let legal_moves = position.generate_legal_moves();
+        let side_moves = moves_by(context.moves, position, side);
 
         for step in cow_setup_steps(side) {
-            // Already played this step (a piece of `step.piece` no
-            // longer sits on `step.from`, having moved to `step.to` or
-            // been captured) -- move on to the next one rather than
-            // getting stuck offering the same move forever. See this
-            // book's docs on why this checks piece *kind*, not just
-            // occupancy: e2 is both the e-pawn's start and the king
-            // knight's later stop, so occupancy alone can't tell two
-            // different steps apart.
-            let piece_still_pending = position
-                .piece_at(step.from)
-                .is_some_and(|piece| piece.kind == step.piece && piece.color == side);
-            if !piece_still_pending {
+            let already_completed = side_moves
+                .iter()
+                .any(|mv| mv.from() == step.from && mv.to() == step.to);
+            if already_completed {
                 continue;
             }
             let mv = Move::new(step.from, step.to, MoveFlag::Quiet);
             if legal_moves.contains(&mv) {
                 return Some(mv);
             }
-            // The next pending step isn't legal right now (blocked, or
-            // the expected piece has been captured/promoted away
-            // without technically "moving" in a way the check above
-            // would catch). Rather than skipping ahead to a later step
-            // out of setup order (which could make an
-            // already-questionable setup actively unsound), treat this
-            // as a book miss.
+            // The next never-completed step isn't legal right now
+            // (blocked, or it's not this side's move at all). Rather
+            // than skipping ahead to a later step out of setup order
+            // (which could make an already-questionable setup
+            // actively unsound), treat this as a book miss for this
+            // call -- progress isn't reset, so the same step is
+            // offered again once it's actually legal.
             return None;
         }
 
-        // Every setup step has already been played -- the Cow is
-        // fully built, nothing left for this book to offer.
+        // Every setup step has ever been completed -- the Cow is
+        // done, permanently, for the rest of this game.
         None
     }
 }
 
-/// One pending step of the Cow setup: move the piece of kind `piece`
-/// currently expected on `from` to `to`. See `CowOpeningBook`'s docs.
+/// Every move in `moves` that `side` actually played, given that
+/// `position` (the position `moves` led to) currently has
+/// `position.side_to_move()` to move -- moves strictly alternate, so
+/// `side`'s own moves are found by walking `moves` backward from the
+/// end, taking every other one, starting from the most recent move if
+/// it wasn't `side`'s (i.e. if `side` is the side to move next) or
+/// from the last move if it was (`side` just moved).
+fn moves_by(moves: &[Move], position: &Position, side: Color) -> Vec<Move> {
+    // If `side` is on move now, the *other* side made the last move in
+    // `moves`; `side`'s own most recent move (if any) is the one
+    // before that.
+    let last_move_was_side = position.side_to_move() != side;
+    let start = if last_move_was_side { 0 } else { 1 };
+    moves.iter().rev().skip(start).step_by(2).copied().collect()
+}
+
+/// One pending step of the Cow setup: move whatever piece is on `from`
+/// to `to`. See `CowOpeningBook`'s docs -- since completion is tracked
+/// by history rather than by inspecting the piece currently on
+/// `from`, a step needs no piece-kind field of its own; `(from, to)`
+/// alone is both what makes a step legal to offer and what identifies
+/// it in `context.moves`.
 struct CowSetupStep {
     from: Square,
     to: Square,
-    piece: PieceKind,
 }
 
 /// The Cow's six setup steps for `side`, in the order they should be
@@ -169,32 +199,26 @@ fn cow_setup_steps(side: Color) -> [CowSetupStep; 6] {
         CowSetupStep {
             from: sq(4, rank(1)),
             to: sq(4, rank(2)),
-            piece: PieceKind::Pawn,
         }, // e2-e3 / e7-e6
         CowSetupStep {
             from: sq(3, rank(1)),
             to: sq(3, rank(2)),
-            piece: PieceKind::Pawn,
         }, // d2-d3 / d7-d6
         CowSetupStep {
             from: sq(6, rank(0)),
             to: sq(4, rank(1)),
-            piece: PieceKind::Knight,
         }, // Ng1-e2 / Ng8-e7
         CowSetupStep {
             from: sq(1, rank(0)),
             to: sq(3, rank(1)),
-            piece: PieceKind::Knight,
         }, // Nb1-d2 / Nb8-d7
         CowSetupStep {
             from: sq(4, rank(1)),
             to: sq(6, rank(2)),
-            piece: PieceKind::Knight,
         }, // Ne2-g3 / Ne7-g6
         CowSetupStep {
             from: sq(3, rank(1)),
             to: sq(1, rank(2)),
-            piece: PieceKind::Knight,
         }, // Nd2-b3 / Nd7-b6
     ]
 }
@@ -204,80 +228,81 @@ mod tests {
     use super::*;
     use crate::chess::Position;
 
+    /// A tiny in-memory game: owns the position and the full move
+    /// history together so tests can play real moves (via
+    /// `push`/`push_uci`) and then `probe` the book against an
+    /// `OpeningContext` built from both, exactly as `Engine` does.
+    struct Game {
+        position: Position,
+        moves: Vec<Move>,
+    }
+
+    impl Game {
+        fn startpos() -> Self {
+            Self {
+                position: Position::startpos(),
+                moves: Vec::new(),
+            }
+        }
+
+        fn from_fen(fen: &str) -> Self {
+            Self {
+                position: Position::from_fen(fen).unwrap(),
+                moves: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, mv: Move) {
+            self.position.make_move(mv);
+            self.moves.push(mv);
+        }
+
+        fn push_uci(&mut self, uci: &str) {
+            let (from, to) = uci.split_at(2);
+            let mv = self
+                .position
+                .generate_legal_moves()
+                .into_iter()
+                .find(|mv| mv.from() == from.parse().unwrap() && mv.to() == to.parse().unwrap())
+                .unwrap_or_else(|| panic!("{uci} should be legal here"));
+            self.push(mv);
+        }
+
+        fn probe(&self) -> Option<Move> {
+            CowOpeningBook.probe(&OpeningContext {
+                position: &self.position,
+                moves: &self.moves,
+            })
+        }
+    }
+
     #[test]
     fn no_book_always_misses() {
-        assert_eq!(NoBook.probe(&Position::startpos()), None);
+        let position = Position::startpos();
+        let context = OpeningContext {
+            position: &position,
+            moves: &[],
+        };
+        assert_eq!(NoBook.probe(&context), None);
     }
 
     #[test]
     fn cow_book_plays_e3_from_the_start_position() {
-        let mv = CowOpeningBook
-            .probe(&Position::startpos())
-            .expect("should hit");
+        let game = Game::startpos();
+        let mv = game.probe().expect("should hit");
         assert_eq!(mv.from(), "e2".parse().unwrap());
         assert_eq!(mv.to(), "e3".parse().unwrap());
     }
 
     #[test]
     fn cow_book_continues_the_setup_after_e3() {
-        let position =
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
-                .unwrap();
+        let mut game = Game::startpos();
+        game.push_uci("e2e3");
         // Black to move; White has already played e3. Probing from
         // Black's side should offer Black's own first setup step
         // (e7-e6), not react to White's move at all -- the book is
         // symmetric and per-side.
-        let mv = CowOpeningBook.probe(&position).expect("should hit");
-        assert_eq!(mv.from(), "e7".parse().unwrap());
-        assert_eq!(mv.to(), "e6".parse().unwrap());
-    }
-
-    #[test]
-    fn cow_book_works_the_same_regardless_of_move_order_into_the_same_position() {
-        // 1.e3 Nf6 2.d3, versus 1.d3 Nf6 2.e3 -- two different move
-        // sequences (same reply from Black both times, since a
-        // position needs someone to move on both sides) reaching the
-        // exact same resulting position. Since `probe` is keyed by
-        // position (piece placement), not by which moves got there,
-        // both must offer the same next step (a knight reroute),
-        // proving this isn't secretly keyed by ply count or move
-        // history.
-        fn find(position: &Position, from: &str, to: &str) -> Move {
-            position
-                .generate_legal_moves()
-                .into_iter()
-                .find(|mv| mv.from() == from.parse().unwrap() && mv.to() == to.parse().unwrap())
-                .unwrap_or_else(|| panic!("{from}{to} should be legal here"))
-        }
-
-        let e3_nf6_d3 = {
-            let mut position = Position::startpos();
-            position.make_move(find(&position, "e2", "e3"));
-            position.make_move(find(&position, "g8", "f6"));
-            position.make_move(find(&position, "d2", "d3"));
-            position
-        };
-        let d3_nf6_e3 = {
-            let mut position = Position::startpos();
-            position.make_move(find(&position, "d2", "d3"));
-            position.make_move(find(&position, "g8", "f6"));
-            position.make_move(find(&position, "e2", "e3"));
-            position
-        };
-
-        assert_eq!(
-            e3_nf6_d3.zobrist_hash(),
-            d3_nf6_e3.zobrist_hash(),
-            "should be the same position"
-        );
-        assert_eq!(
-            CowOpeningBook.probe(&e3_nf6_d3),
-            CowOpeningBook.probe(&d3_nf6_e3)
-        );
-        // After 1.e3 Nf6 2.d3, it's Black to move -- both White pawn
-        // steps are already played, so the book offers Black's own
-        // first pending step, not White's next one.
-        let mv = CowOpeningBook.probe(&e3_nf6_d3).expect("should hit");
+        let mv = game.probe().expect("should hit");
         assert_eq!(mv.from(), "e7".parse().unwrap());
         assert_eq!(mv.to(), "e6".parse().unwrap());
     }
@@ -287,17 +312,22 @@ mod tests {
         // Regression test: e2 is both the e-pawn's vacated square
         // (step 0) and the king knight's later stop (step 2, on its
         // way to g3 in step 4). A real game (1.e3 e5 2.d3 d5 3.Ne2
-        // Nf6) reaching this exact position used to make `probe`
-        // wrongly conclude "step 0 (e2-e3) still pending" the instant
-        // a knight sat on e2 -- occupancy alone can't distinguish "the
-        // pawn never left" from "a knight arrived after" -- try the
-        // now-illegal pawn push, and give up instead of reaching the
-        // real pending step (Nb1-d2).
-        let position =
-            Position::from_fen("rnbqkb1r/ppp2ppp/5n2/3pp3/8/3PP3/PPP1NPPP/RNBQKB1R w KQkq - 0 4")
-                .unwrap();
+        // Nf6) reaching this position used to make `probe` wrongly
+        // conclude "step 0 (e2-e3) still pending" the instant a
+        // knight sat on e2 -- occupancy alone can't distinguish "the
+        // pawn never left" from "a knight arrived after". Reading it
+        // from history (which this game's `moves` now carries) is
+        // what fixes it -- try the now-illegal pawn push, and give up
+        // instead of reaching the real pending step (Nb1-d2).
+        let mut game = Game::startpos();
+        game.push_uci("e2e3");
+        game.push_uci("e7e5");
+        game.push_uci("d2d3");
+        game.push_uci("d7d5");
+        game.push_uci("g1e2");
+        game.push_uci("g8f6");
 
-        let mv = CowOpeningBook.probe(&position).expect("should hit");
+        let mv = game.probe().expect("should hit");
 
         assert_eq!(mv.from(), "b1".parse().unwrap());
         assert_eq!(mv.to(), "d2".parse().unwrap());
@@ -312,23 +342,17 @@ mod tests {
         // end-to-end scenario the earlier regression above was found
         // in, covering every step (and every square-reuse point) in
         // one game rather than one isolated position.
-        let mut position = Position::startpos();
+        let mut game = Game::startpos();
         let black_replies = ["e7e5", "d7d5", "g8f6", "b8c6", "f6e4", "c6d4"];
         let mut white_moves = Vec::new();
 
         for black_reply in black_replies {
-            let white_mv = CowOpeningBook
-                .probe(&position)
+            let white_mv = game
+                .probe()
                 .unwrap_or_else(|| panic!("book should still have a move; got to {white_moves:?}"));
             white_moves.push(format!("{}{}", white_mv.from(), white_mv.to()));
-            position.make_move(white_mv);
-
-            let black_mv = position
-                .generate_legal_moves()
-                .into_iter()
-                .find(|mv| format!("{}{}", mv.from(), mv.to()) == black_reply)
-                .unwrap_or_else(|| panic!("{black_reply} should be legal"));
-            position.make_move(black_mv);
+            game.push(white_mv);
+            game.push_uci(black_reply);
         }
 
         assert_eq!(
@@ -337,15 +361,56 @@ mod tests {
         );
         // The setup is now complete -- nothing left for the book to
         // offer, Engine would fall back to a real search from here.
-        assert_eq!(CowOpeningBook.probe(&position), None);
+        assert_eq!(game.probe(), None);
+    }
+
+    #[test]
+    fn cow_book_does_not_reopen_a_completed_horn_after_a_retreat() {
+        // The exact reported bug: the Cow is completed in full, then
+        // the opponent attacks the g3 knight and it retreats back to
+        // e2 -- the same square the king knight passed through on its
+        // way to g3 in the first place. The board now looks
+        // (piece-kind-wise) just like the moment right after step 2
+        // (Ng1-e2) completed, before step 4 (Ne2-g3) happened. A
+        // position-only check would wrongly conclude step 4 is still
+        // pending and send the knight straight back into the attack
+        // it just fled; history shows Ne2-g3 was already played, so
+        // the book must stay a miss instead of reopening that horn.
+        let mut game = Game::startpos();
+        for (white, black) in [
+            ("e2e3", "e7e5"),
+            ("d2d3", "d7d5"),
+            ("g1e2", "g8f6"),
+            ("b1d2", "b8c6"),
+            ("e2g3", "f6e4"),
+            ("d2b3", "c6d4"),
+        ] {
+            game.push_uci(white);
+            game.push_uci(black);
+        }
+        // Full Cow completed; book is a miss.
+        assert_eq!(game.probe(), None);
+
+        // It's White to move (Black just played c6d4 to close the
+        // loop above). Something now threatens the g3 knight (the
+        // exact reason doesn't matter to the book), so it retreats
+        // straight back to e2 -- the same square the king knight
+        // passed through in step 2.
+        game.push_uci("g3e2");
+
+        // Even though a knight now sits on e2 exactly like right after
+        // step 2, and g3 is empty exactly like right before step 4,
+        // history shows both step 2 and step 4 were already completed
+        // -- the book must not offer Ne2-g3 (or anything else) again.
+        assert_eq!(game.probe(), None);
     }
 
     #[test]
     fn cow_book_offers_d3_once_e3_is_already_played() {
-        let position =
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR w KQkq - 0 1")
-                .unwrap();
-        let mv = CowOpeningBook.probe(&position).expect("should hit");
+        let mut game = Game::startpos();
+        game.push_uci("e2e3");
+        game.push_uci("e7e5");
+        let mv = game.probe().expect("should hit");
         assert_eq!(mv.from(), "d2".parse().unwrap());
         assert_eq!(mv.to(), "d3".parse().unwrap());
     }
@@ -356,23 +421,25 @@ mod tests {
         // should reroute to) is occupied by a bishop (an artificial
         // position -- not reachable via legal play -- purely to prove
         // "next step illegal" produces a miss rather than skipping
-        // ahead to a later, out-of-order step).
-        let position =
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/3PP3/PPP1BPPP/RNBQK1NR w KQkq - 0 1")
-                .unwrap();
-        assert_eq!(CowOpeningBook.probe(&position), None);
+        // ahead to a later, out-of-order step). No prior moves, so
+        // history-wise nothing has ever been completed either.
+        let game = Game::from_fen("rnbqkbnr/pppppppp/8/8/8/3PP3/PPP1BPPP/RNBQK1NR w KQkq - 0 1");
+        assert_eq!(game.probe(), None);
     }
 
     #[test]
     fn cow_book_is_a_miss_once_the_setup_is_fully_built() {
-        // The finished Cow shape: pawns on d3/e3, knights on b3/g3,
-        // b1/g1/d2/e2 all vacated (a hand-built position, not
-        // necessarily one reachable via legal play in this exact move
-        // count, but a faithful "setup complete" board) -- nothing
-        // left for this book to offer.
-        let position =
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/1N1PP1N1/P1P2P1P/R1BQKB1R w KQkq - 0 1")
-                .unwrap();
-        assert_eq!(CowOpeningBook.probe(&position), None);
+        // The finished Cow shape reached with no recorded history at
+        // all (a hand-built position, not the result of played
+        // moves): every step's `(from, to)` pair is vacuously "not in
+        // history", so `probe` falls through to trying the first
+        // pending step -- e2-e3 -- which is no longer legal (no pawn
+        // on e2), so it still reports a miss rather than skipping
+        // ahead. This is a position-shape check, not a history one;
+        // `cow_book_completes_the_full_setup_move_by_move` and
+        // `cow_book_does_not_reopen_a_completed_horn_after_a_retreat`
+        // cover the real history-aware behavior.
+        let game = Game::from_fen("rnbqkbnr/pppppppp/8/8/8/1N1PP1N1/P1P2P1P/R1BQKB1R w KQkq - 0 1");
+        assert_eq!(game.probe(), None);
     }
 }
