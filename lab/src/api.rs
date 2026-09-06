@@ -30,6 +30,9 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::experiment::{
+    EngineVariant, ExperimentId, ExperimentSnapshot, ExperimentSpec, ExperimentStore,
+};
 use crate::game::{
     ApplyMoveError, EngineConfig, EngineSlots, EngineSpec, GameEvent, GameSnapshot, GameStore,
     ParticipantInfo,
@@ -66,6 +69,13 @@ impl EngineRegistry {
 struct ApiState {
     store: GameStore,
     engines: EngineRegistry,
+    /// Not a constructor parameter like `store`/`engines`: nothing
+    /// outside this module needs to share or preconfigure it (an
+    /// experiment's whole spec arrives with the `POST` that creates
+    /// it), so `router` owns creating one rather than forcing every
+    /// caller (including ~15 existing tests) to pass a third argument
+    /// for something they don't use.
+    experiments: ExperimentStore,
 }
 
 pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
@@ -75,7 +85,13 @@ pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
         .route("/api/games/{id}/moves", post(apply_move))
         .route("/ws/games/{id}", get(game_events_ws))
         .route("/api/engines/{name}/options", get(get_engine_options))
-        .with_state(ApiState { store, engines })
+        .route("/api/experiments", post(create_experiment))
+        .route("/api/experiments/{id}", get(get_experiment))
+        .with_state(ApiState {
+            store,
+            engines,
+            experiments: ExperimentStore::new(),
+        })
 }
 
 /// `GET /api/engines/:name/options`: the UCI options `name` (e.g.
@@ -115,6 +131,137 @@ async fn get_engine_options(
 
 fn engine_spawn_error_message(err: &UciProcessError) -> String {
     format!("failed to query engine options: {err}")
+}
+
+/// One side of an experiment request: a human-readable label plus the
+/// `setoption`s that define it -- e.g. `{"label": "Candidate",
+/// "options": {"UseTT": false}}`. Deliberately no `engine` field here
+/// (unlike `ParticipantRequest`): v1 experiments are Bee-vs-Bee only
+/// (see `experiment`'s module docs), so `CreateExperimentRequest`
+/// names the engine once for the whole experiment, not per variant.
+#[derive(Debug, Deserialize)]
+struct ExperimentVariantRequest {
+    label: String,
+    #[serde(default)]
+    options: HashMap<String, serde_json::Value>,
+}
+
+impl ExperimentVariantRequest {
+    /// Same value-stringification rule as `ParticipantRequest::
+    /// options` -- see its docs.
+    fn options(&self) -> Vec<(String, String)> {
+        self.options
+            .iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateExperimentRequest {
+    /// Which engine both variants are (see this module's docs on why
+    /// v1 doesn't support two different engines). Defaults to `"bee"`
+    /// since that's the only realistic value right now, but still
+    /// resolved through `EngineRegistry` like everything else rather
+    /// than hardcoded, so a differently-registered name still works.
+    #[serde(default = "default_experiment_engine")]
+    engine: String,
+    variant_a: ExperimentVariantRequest,
+    variant_b: ExperimentVariantRequest,
+    games: u32,
+    #[serde(default)]
+    move_time_ms: Option<u64>,
+    #[serde(default)]
+    debug: bool,
+}
+
+fn default_experiment_engine() -> String {
+    "bee".to_string()
+}
+
+/// `POST /api/experiments`: starts a new A/B experiment (see
+/// `experiment`'s module docs) and immediately begins running it in
+/// the background -- the response carries the experiment's id right
+/// away (status `Running`, no games yet), the same "create returns
+/// immediately, poll/subscribe for progress" shape `POST /api/games`
+/// already uses for an engine-driven game.
+async fn create_experiment(
+    State(state): State<ApiState>,
+    Json(request): Json<CreateExperimentRequest>,
+) -> impl IntoResponse {
+    if request.games == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new("games must be at least 1")),
+        )
+            .into_response();
+    }
+
+    let Some(spec) = state.engines.get(&request.engine) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new(format!(
+                "unknown engine {:?}",
+                request.engine
+            ))),
+        )
+            .into_response();
+    };
+
+    let variant_a = EngineVariant {
+        label: request.variant_a.label.clone(),
+        config: EngineConfig {
+            spec: spec.clone(),
+            options: request.variant_a.options(),
+            debug: request.debug,
+        },
+    };
+    let variant_b = EngineVariant {
+        label: request.variant_b.label.clone(),
+        config: EngineConfig {
+            spec,
+            options: request.variant_b.options(),
+            debug: request.debug,
+        },
+    };
+    let experiment_spec = ExperimentSpec {
+        variant_a,
+        variant_b,
+        requested_games: request.games,
+        move_time_ms: request.move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS),
+    };
+
+    let snapshot = state.experiments.create(experiment_spec.clone());
+    tokio::spawn(crate::experiment::run_experiment(
+        state.store.clone(),
+        state.experiments.clone(),
+        snapshot.id,
+        experiment_spec,
+    ));
+
+    (StatusCode::CREATED, Json(snapshot)).into_response()
+}
+
+async fn get_experiment(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ExperimentSnapshot>, (StatusCode, Json<ErrorBody>)> {
+    let id: ExperimentId = id.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new("malformed experiment id")),
+        )
+    })?;
+    state.experiments.snapshot(id).map(Json).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody::new("no such experiment")),
+    ))
 }
 
 /// Default per-move time budget for an engine-driven side, when
@@ -433,6 +580,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -765,6 +913,166 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn post_experiments_with_zero_games_is_400() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experiments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "engine": "fake",
+                            "variant_a": {"label": "A"},
+                            "variant_b": {"label": "B"},
+                            "games": 0,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_experiments_with_an_unknown_engine_is_400() {
+        let app = router(GameStore::new(), EngineRegistry::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experiments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "engine": "no-such-engine",
+                            "variant_a": {"label": "A"},
+                            "variant_b": {"label": "B"},
+                            "games": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_experiment_with_a_malformed_id_is_400() {
+        let app = router(GameStore::new(), EngineRegistry::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/experiments/not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_unknown_experiment_is_404() {
+        let app = router(GameStore::new(), EngineRegistry::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/experiments/{}", Uuid::new_v4()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_experiments_starts_running_games_that_complete_through_the_http_api() {
+        // The fake engine always replies "bestmove e2e4" -- legal only
+        // on a game's first move, so every game this experiment runs
+        // aborts on its second move. Same reasoning as `experiment`'s
+        // own `run_experiment_...` test: this only needs to prove the
+        // HTTP layer actually starts and reports on a real experiment
+        // end to end, not exercise real chess results -- result
+        // tallying itself is already covered at the `experiment`
+        // module level.
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let created = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/experiments")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "engine": "fake",
+                                "variant_a": {"label": "Baseline"},
+                                "variant_b": {"label": "Candidate", "options": {"UseTT": false}},
+                                "games": 2,
+                                "move_time_ms": 20,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created["status"], "running");
+        assert_eq!(created["requested_games"], 2);
+        assert_eq!(created["completed_games"], 0);
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snapshot = body_json(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/api/experiments/{id}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if snapshot["status"] == "completed" {
+                assert_eq!(snapshot["games"].as_array().unwrap().len(), 2);
+                assert_eq!(snapshot["label_a"], "Baseline");
+                assert_eq!(snapshot["label_b"], "Candidate");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "experiment did not complete in time: {snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,631 @@
+//! A/B experiments: run N paired games between two engine
+//! configurations ("variant A" vs "variant B") and tally the result --
+//! the actual point of the whole UCI-option-discovery milestone (#104,
+//! #105, #106): change one `setoption` on Bee, run an experiment, find
+//! out whether it actually won more games.
+//!
+//! v1 is deliberately Bee-vs-Bee only (both variants use the same
+//! `EngineSpec`, just different `options`) -- see the design-system
+//! milestone's discussion for why: Stockfish's Elo/`UCI_LimitStrength`
+//! semantics and asymmetric engines add real complexity that has
+//! nothing to do with "did this Bee change help." Nothing here
+//! actually enforces that (an `EngineVariant` carries its own full
+//! `EngineConfig`, spec included), so lifting the restriction later --
+//! if there's ever a real reason to A/B two different engines -- needs
+//! no redesign, only a decision to allow it in the API layer.
+//!
+//! Games run through the exact same `GameStore`/`run_engine_loop` a
+//! normal `POST /api/games` game does -- an experiment is an
+//! orchestrator over ordinary Lab games, not a second game engine.
+//! That's also why an experiment's games are inspectable at their own
+//! ordinary `/api/games/:id` and `/ws/games/:id` -- see
+//! `ExperimentSnapshot::games`.
+//!
+//! Games run sequentially, not concurrently: this keeps the
+//! implementation (and its state machine) simple and correct for v1,
+//! at the cost of an experiment taking roughly `requested_games *
+//! move_time_ms * average_game_length` wall-clock time. Worth
+//! revisiting once that's actually felt to be too slow -- not before.
+//!
+//! Paired by color, not by opening (no opening book/suite exists yet):
+//! game `2k` has variant A playing White, game `2k+1` has variant A
+//! playing Black, both from the standard starting position. This
+//! halves (not eliminates) color-imbalance noise in the result --
+//! see the module docs' "pair the games" rationale.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::game::{EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore};
+
+/// Opaque experiment identifier, serialized as a plain string over the
+/// API -- same shape as `GameId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExperimentId(Uuid);
+
+impl ExperimentId {
+    fn new() -> Self {
+        ExperimentId(Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for ExperimentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ExperimentId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(ExperimentId(Uuid::parse_str(s)?))
+    }
+}
+
+/// One side of an experiment: a human-readable label ("Baseline",
+/// "PassedPawns") plus the full engine configuration that label means.
+#[derive(Debug, Clone)]
+pub struct EngineVariant {
+    pub label: String,
+    pub config: EngineConfig,
+}
+
+/// One experiment's fixed setup, given at creation and never mutated
+/// afterward -- see `Experiment` for the mutable progress tracked
+/// alongside it.
+#[derive(Debug, Clone)]
+pub struct ExperimentSpec {
+    pub variant_a: EngineVariant,
+    pub variant_b: EngineVariant,
+    pub requested_games: u32,
+    pub move_time_ms: u64,
+}
+
+/// One game this experiment ran or is running, in the order it was
+/// started -- enough for a client to link into that game's own
+/// ordinary `/api/games/:id` (and live `/ws/games/:id`) view, plus
+/// know which variant played which color without needing to
+/// cross-reference anything else.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperimentGame {
+    pub game_id: GameId,
+    /// `true` if variant A played White in this game (`false` means B
+    /// did) -- see the module docs' pairing scheme.
+    pub variant_a_is_white: bool,
+    pub outcome: GameOutcome,
+}
+
+/// How one experiment game ended, if it has -- deliberately distinct
+/// from a bare `Option<GameResult>`: `Aborted` (an engine crashed,
+/// played an illegal move, etc.) is *also* a game that's done running,
+/// just one with no chess result to tally, and `Experiment::status`
+/// needs to tell "still running" and "done, no result" apart to ever
+/// report `Completed` for an experiment where a game aborted (see
+/// `run_experiment`'s docs on why an aborted game isn't retried).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum GameOutcome {
+    Pending,
+    Finished { result: GameResult },
+    Aborted,
+}
+
+impl GameOutcome {
+    const fn is_settled(self) -> bool {
+        !matches!(self, GameOutcome::Pending)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentStatus {
+    Running,
+    Completed,
+}
+
+/// One A/B experiment's full state: its fixed spec plus every game it
+/// has run or is running, in order. `ExperimentStore` holds these
+/// behind a mutex the same way `GameStore` holds `Game`s -- see that
+/// type's docs for why a plain mutex is the right amount of
+/// infrastructure here.
+#[derive(Debug, Clone)]
+pub struct Experiment {
+    pub id: ExperimentId,
+    pub spec: ExperimentSpec,
+    pub games: Vec<ExperimentGame>,
+}
+
+impl Experiment {
+    fn new(id: ExperimentId, spec: ExperimentSpec) -> Self {
+        Experiment {
+            id,
+            spec,
+            games: Vec::new(),
+        }
+    }
+
+    /// `Completed` once every requested game has *ended* -- a real
+    /// chess result or an abort, either one settles a game (see
+    /// `GameOutcome::is_settled`) -- not once every game has a
+    /// `GameResult` specifically; an experiment where a game aborted
+    /// must still be able to report `Completed` once there's nothing
+    /// left to run, rather than reporting `Running` forever.
+    fn status(&self) -> ExperimentStatus {
+        if self.games.len() as u32 >= self.spec.requested_games
+            && self.games.iter().all(|g| g.outcome.is_settled())
+        {
+            ExperimentStatus::Completed
+        } else {
+            ExperimentStatus::Running
+        }
+    }
+
+    /// Tallies completed games from variant A's perspective: wins,
+    /// draws, and losses (i.e. variant B's wins), regardless of which
+    /// color A played in any given game -- see `ExperimentGame::
+    /// variant_a_is_white`. An aborted game contributes to none of the
+    /// three (see `run_experiment`'s docs); `wins_a + draws + wins_b`
+    /// therefore only ever equals the number of games that reached a
+    /// real chess result, which may be less than `requested_games`.
+    fn tally(&self) -> (u32, u32, u32) {
+        let mut wins_a = 0;
+        let mut draws = 0;
+        let mut wins_b = 0;
+        for game in &self.games {
+            let GameOutcome::Finished { result } = game.outcome else {
+                continue;
+            };
+            let a_won = match (result, game.variant_a_is_white) {
+                (GameResult::WhiteWins, true) | (GameResult::BlackWins, false) => Some(true),
+                (GameResult::WhiteWins, false) | (GameResult::BlackWins, true) => Some(false),
+                (GameResult::Draw, _) => None,
+            };
+            match a_won {
+                Some(true) => wins_a += 1,
+                Some(false) => wins_b += 1,
+                None => draws += 1,
+            }
+        }
+        (wins_a, draws, wins_b)
+    }
+}
+
+/// A complete, self-sufficient snapshot of one experiment -- the shape
+/// `GET /api/experiments/:id` returns. Same "authoritative resync"
+/// philosophy as `GameSnapshot`: a client renders this directly, with
+/// no need to have tracked anything about the experiment itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperimentSnapshot {
+    pub id: ExperimentId,
+    pub status: ExperimentStatus,
+    pub label_a: String,
+    pub label_b: String,
+    pub requested_games: u32,
+    pub completed_games: u32,
+    pub wins_a: u32,
+    pub draws: u32,
+    pub wins_b: u32,
+    /// Variant A's score as a fraction of completed games (a win = 1,
+    /// a draw = 0.5, a loss = 0), the standard chess-engine-testing
+    /// scoring convention -- `None` until at least one game has
+    /// finished, rather than a misleading `0.0`.
+    pub score_a: Option<f64>,
+    pub games: Vec<ExperimentGame>,
+}
+
+impl From<&Experiment> for ExperimentSnapshot {
+    fn from(experiment: &Experiment) -> Self {
+        let (wins_a, draws, wins_b) = experiment.tally();
+        let completed_games = wins_a + draws + wins_b;
+        let score_a = if completed_games == 0 {
+            None
+        } else {
+            Some((f64::from(wins_a) + 0.5 * f64::from(draws)) / f64::from(completed_games))
+        };
+        ExperimentSnapshot {
+            id: experiment.id,
+            status: experiment.status(),
+            label_a: experiment.spec.variant_a.label.clone(),
+            label_b: experiment.spec.variant_b.label.clone(),
+            requested_games: experiment.spec.requested_games,
+            completed_games,
+            wins_a,
+            draws,
+            wins_b,
+            score_a,
+            games: experiment.games.clone(),
+        }
+    }
+}
+
+/// In-memory store of every experiment the server currently knows
+/// about -- same shape/reasoning as `GameStore`.
+#[derive(Clone, Default)]
+pub struct ExperimentStore {
+    experiments: Arc<Mutex<HashMap<ExperimentId, Experiment>>>,
+}
+
+impl ExperimentStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create(&self, spec: ExperimentSpec) -> ExperimentSnapshot {
+        let id = ExperimentId::new();
+        let experiment = Experiment::new(id, spec);
+        let snapshot = ExperimentSnapshot::from(&experiment);
+        self.experiments
+            .lock()
+            .expect("experiment store mutex poisoned")
+            .insert(id, experiment);
+        snapshot
+    }
+
+    pub fn snapshot(&self, id: ExperimentId) -> Option<ExperimentSnapshot> {
+        self.experiments
+            .lock()
+            .expect("experiment store mutex poisoned")
+            .get(&id)
+            .map(ExperimentSnapshot::from)
+    }
+
+    /// Records a newly-started game against `id`'s experiment, with no
+    /// result yet -- called once per game, right after `GameStore::
+    /// create` returns its id, before that game's `run_engine_loop`
+    /// starts (see `run_experiment`).
+    fn record_game_started(&self, id: ExperimentId, game_id: GameId, variant_a_is_white: bool) {
+        let mut experiments = self
+            .experiments
+            .lock()
+            .expect("experiment store mutex poisoned");
+        if let Some(experiment) = experiments.get_mut(&id) {
+            experiment.games.push(ExperimentGame {
+                game_id,
+                variant_a_is_white,
+                outcome: GameOutcome::Pending,
+            });
+        }
+    }
+
+    /// Records `game_id`'s final outcome (a real chess result or an
+    /// abort -- see `GameOutcome`) against `id`'s experiment. Silently
+    /// does nothing if either the experiment or that particular game
+    /// entry isn't found -- mirrors `GameStore::abort`'s "the caller
+    /// shouldn't panic over state that vanished" stance; there's no
+    /// persistence yet to make that likely, but nothing here should
+    /// crash the orchestration task over it either.
+    fn record_game_outcome(&self, id: ExperimentId, game_id: GameId, outcome: GameOutcome) {
+        let mut experiments = self
+            .experiments
+            .lock()
+            .expect("experiment store mutex poisoned");
+        let Some(experiment) = experiments.get_mut(&id) else {
+            return;
+        };
+        if let Some(game) = experiment.games.iter_mut().find(|g| g.game_id == game_id) {
+            game.outcome = outcome;
+        }
+    }
+}
+
+/// Runs `id`'s experiment to completion: `spec.requested_games` games,
+/// alternating which variant plays White each game (see the module
+/// docs' pairing scheme), each played out via the ordinary
+/// `GameStore`/`run_engine_loop` machinery. Intended to be
+/// `tokio::spawn`ed once, right after `ExperimentStore::create` --
+/// like `run_engine_loop`, this returns once there's nothing left to
+/// do (every requested game finished), so the caller doesn't need to
+/// `.await` it directly.
+///
+/// A game that ends in `Aborted` (an engine crashed, failed to spawn,
+/// etc.) rather than a real chess result is not retried and not
+/// counted in either variant's win/draw/loss tally -- it still occupies
+/// one of `requested_games`' slots and is visible in
+/// `ExperimentGame`/the underlying game's own snapshot, so an aborted
+/// game is never silently hidden, just excluded from `wins_a`/`draws`/
+/// `wins_b` (which only ever sum to `completed_games`, not
+/// `requested_games`).
+pub async fn run_experiment(
+    store: GameStore,
+    experiments: ExperimentStore,
+    id: ExperimentId,
+    spec: ExperimentSpec,
+) {
+    for game_index in 0..spec.requested_games {
+        // Even-indexed games: A plays White. Odd-indexed: A plays
+        // Black. See the module docs -- this is the whole "pair the
+        // games" scheme for v1 (no opening suite yet, so every pair is
+        // just the standard starting position with colors swapped).
+        let variant_a_is_white = game_index % 2 == 0;
+        let (white, black) = if variant_a_is_white {
+            (&spec.variant_a, &spec.variant_b)
+        } else {
+            (&spec.variant_b, &spec.variant_a)
+        };
+
+        let white_info = engine_participant_info(white);
+        let black_info = engine_participant_info(black);
+        let snapshot = store.create(white_info, black_info);
+        experiments.record_game_started(id, snapshot.id, variant_a_is_white);
+
+        let slots = EngineSlots {
+            white: Some(white.config.clone()),
+            black: Some(black.config.clone()),
+        };
+        crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.move_time_ms).await;
+
+        // `run_engine_loop` only returns once the game reached a
+        // terminal status (Finished or Aborted) -- see its own docs --
+        // so re-fetching the snapshot here always sees one of those,
+        // never `Running`. If the game vanished entirely (no
+        // persistence yet -- see GameStore's docs), there's nothing to
+        // record and nothing more this loop iteration can do.
+        if let Some(final_snapshot) = store.snapshot(snapshot.id) {
+            let outcome = match final_snapshot.status {
+                GameStatus::Finished { result } => GameOutcome::Finished { result },
+                GameStatus::Aborted { .. } => GameOutcome::Aborted,
+                GameStatus::Running => {
+                    unreachable!("run_engine_loop only returns once the game is no longer Running")
+                }
+            };
+            experiments.record_game_outcome(id, snapshot.id, outcome);
+        }
+    }
+}
+
+fn engine_participant_info(variant: &EngineVariant) -> crate::game::ParticipantInfo {
+    crate::game::ParticipantInfo::Engine {
+        name: variant.label.clone(),
+        debug: variant.config.debug,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::EngineSpec;
+
+    fn fake_bee_spec() -> EngineSpec {
+        EngineSpec {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"
+                while read -r line; do
+                    case "$line" in
+                        uci) echo "uciok" ;;
+                        isready) echo "readyok" ;;
+                        go*) echo "bestmove e2e4" ;;
+                    esac
+                done
+                "#
+                .to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    fn fake_spec(requested_games: u32) -> ExperimentSpec {
+        ExperimentSpec {
+            variant_a: EngineVariant {
+                label: "Baseline".to_string(),
+                config: EngineConfig {
+                    spec: fake_bee_spec(),
+                    options: Vec::new(),
+                    debug: false,
+                },
+            },
+            variant_b: EngineVariant {
+                label: "Candidate".to_string(),
+                config: EngineConfig {
+                    spec: fake_bee_spec(),
+                    options: Vec::new(),
+                    debug: false,
+                },
+            },
+            requested_games,
+            move_time_ms: 5,
+        }
+    }
+
+    #[test]
+    fn create_returns_a_running_snapshot_with_no_games_yet() {
+        let store = ExperimentStore::new();
+        let snapshot = store.create(fake_spec(4));
+
+        assert_eq!(snapshot.status, ExperimentStatus::Running);
+        assert_eq!(snapshot.requested_games, 4);
+        assert_eq!(snapshot.completed_games, 0);
+        assert_eq!(snapshot.score_a, None);
+        assert!(snapshot.games.is_empty());
+    }
+
+    #[test]
+    fn snapshot_of_unknown_id_is_none() {
+        let store = ExperimentStore::new();
+        let bogus: ExperimentId = "00000000-0000-0000-0000-000000000000".parse().unwrap();
+        assert!(store.snapshot(bogus).is_none());
+    }
+
+    #[test]
+    fn record_game_started_then_outcome_updates_the_snapshot() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(2));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        let mid = store.snapshot(created.id).unwrap();
+        assert_eq!(mid.games.len(), 1);
+        assert_eq!(mid.games[0].outcome, GameOutcome::Pending);
+        assert_eq!(mid.completed_games, 0);
+
+        store.record_game_outcome(
+            created.id,
+            game_id,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+        );
+        let after = store.snapshot(created.id).unwrap();
+        assert_eq!(
+            after.games[0].outcome,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins
+            }
+        );
+        assert_eq!(after.wins_a, 1, "A played White in this game and White won");
+        assert_eq!(after.completed_games, 1);
+        assert_eq!(after.score_a, Some(1.0));
+    }
+
+    #[test]
+    fn tally_credits_the_right_variant_regardless_of_color() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(2));
+        let game_a_white: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let game_a_black: GameId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+
+        // Game 1: A is White, White wins -- A wins.
+        store.record_game_started(created.id, game_a_white, true);
+        store.record_game_outcome(
+            created.id,
+            game_a_white,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+        );
+        // Game 2: A is Black, White wins -- B wins (B was White).
+        store.record_game_started(created.id, game_a_black, false);
+        store.record_game_outcome(
+            created.id,
+            game_a_black,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+        );
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.wins_a, 1);
+        assert_eq!(snapshot.wins_b, 1);
+        assert_eq!(snapshot.draws, 0);
+        assert_eq!(snapshot.score_a, Some(0.5));
+    }
+
+    #[test]
+    fn a_draw_counts_toward_neither_variants_wins() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        store.record_game_outcome(
+            created.id,
+            game_id,
+            GameOutcome::Finished {
+                result: GameResult::Draw,
+            },
+        );
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.wins_a, 0);
+        assert_eq!(snapshot.wins_b, 0);
+        assert_eq!(snapshot.draws, 1);
+        assert_eq!(snapshot.score_a, Some(0.5));
+    }
+
+    #[test]
+    fn an_aborted_game_is_settled_but_tallies_toward_neither_variant() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        store.record_game_outcome(created.id, game_id, GameOutcome::Aborted);
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.games[0].outcome, GameOutcome::Aborted);
+        assert_eq!(snapshot.wins_a, 0);
+        assert_eq!(snapshot.wins_b, 0);
+        assert_eq!(snapshot.draws, 0);
+        assert_eq!(snapshot.completed_games, 0, "an abort isn't a chess result");
+        assert_eq!(
+            snapshot.status,
+            ExperimentStatus::Completed,
+            "the only requested game has ended (aborted), so there's nothing left to run"
+        );
+    }
+
+    #[test]
+    fn experiment_is_completed_once_every_requested_game_has_settled() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        assert_eq!(
+            store.snapshot(created.id).unwrap().status,
+            ExperimentStatus::Running,
+            "started but not yet settled"
+        );
+
+        store.record_game_outcome(
+            created.id,
+            game_id,
+            GameOutcome::Finished {
+                result: GameResult::Draw,
+            },
+        );
+        assert_eq!(
+            store.snapshot(created.id).unwrap().status,
+            ExperimentStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn run_experiment_plays_the_requested_number_of_games_and_alternates_colors() {
+        // The fake engine always replies "bestmove e2e4" -- legal only
+        // on the game's first move, so every one of these games aborts
+        // (an illegal move) rather than reaching a real chess result.
+        // That's fine for what this test checks: run_experiment still
+        // must run exactly `requested_games` games, in order, alternating
+        // colors, and return once every one of them has *ended* -- an
+        // abort settles a game just as much as a real result does (see
+        // GameOutcome's docs), it just contributes nothing to
+        // wins_a/draws/wins_b. Result tallying itself is covered by the
+        // record_game_outcome-based tests above.
+        let game_store = GameStore::new();
+        let experiments = ExperimentStore::new();
+        let created = experiments.create(fake_spec(3));
+
+        run_experiment(game_store, experiments.clone(), created.id, fake_spec(3)).await;
+
+        let snapshot = experiments.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.games.len(), 3, "should have started all 3 games");
+        assert_eq!(
+            snapshot
+                .games
+                .iter()
+                .filter(|g| g.variant_a_is_white)
+                .count(),
+            2,
+            "games 0 and 2 (of 3) should have A playing White"
+        );
+        assert!(
+            snapshot
+                .games
+                .iter()
+                .all(|g| g.outcome == GameOutcome::Aborted),
+            "every game should have aborted on its second (illegal) move: {:?}",
+            snapshot.games
+        );
+        assert_eq!(
+            snapshot.status,
+            ExperimentStatus::Completed,
+            "every game settled (by aborting), so there's nothing left to run"
+        );
+    }
+}
