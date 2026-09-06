@@ -117,6 +117,93 @@ pub struct TimeBudget {
     pub hard: Duration,
 }
 
+/// Version of the `bee-tm` telemetry line's field set -- bump this
+/// whenever a field is removed or changes meaning (adding a new field
+/// is not a breaking change: consumers are required to ignore unknown
+/// keys, per this type's docs). Emitted as `v=1` so a consumer parsing
+/// old logs, or built against a future engine version, can tell which
+/// fields to expect rather than guessing from what happens to be
+/// present.
+pub const BEE_TM_VERSION: u32 = 1;
+
+/// Per-move time-management telemetry: everything about *how* a clock-
+/// bounded search actually spent its budget that only the engine
+/// itself can know (Lab separately measures what it, not the engine,
+/// is authoritative for -- real wall-clock elapsed, clock remaining,
+/// increment applied, timeout/result; see `lab::game`). This is
+/// deliberately not folded into `SearchResult`/the ordinary `info
+/// depth ...` line: those describe *what search found*, this describes
+/// *how the time budget was spent finding it* -- e.g. `aborted`
+/// carries a wall-clock duration for a depth whose search result was
+/// itself discarded and never became part of any `SearchResult` at
+/// all.
+///
+/// Rendered as a single `info string bee-tm ...` line (see
+/// `to_bee_tm_line`) -- a machine-readable record, not human-oriented
+/// diagnostic prose (contrast `crate::diagnostics`, which is prose by
+/// design). Consumers must treat this as append-only: recognize the
+/// `bee-tm` prefix, split on whitespace then each token once on `=`,
+/// and silently ignore any key they don't recognize -- see
+/// `BEE_TM_VERSION`'s docs on why a missing/unknown field is expected,
+/// forward-compatible behavior, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeManagementTelemetry {
+    /// This move's allocated `TimeBudget`, unpacked -- what
+    /// `allocate_time` decided *before* any searching happened.
+    pub soft_ms: u64,
+    pub hard_ms: u64,
+    /// The depth iterative deepening actually completed and reported
+    /// as its `SearchResult` -- same number `info depth` itself
+    /// carries, duplicated here purely so a `bee-tm` line is a
+    /// complete record on its own without needing to be correlated
+    /// with a separate `info depth` line to be useful.
+    pub completed_depth: u32,
+    /// Wall-clock time spent on the one iteration (if any) that was
+    /// started but never completed -- cut off by the hard deadline (or
+    /// an external `stop`) partway through, its result discarded per
+    /// `search_to_depth`'s contract. Zero if every started iteration
+    /// completed (the common case: the soft deadline, not the hard
+    /// one, is what normally ends a search). This is the single most
+    /// actionable number for deciding whether depth-cost prediction is
+    /// worth building: time here is pure waste, spent computing a
+    /// result that was then thrown away.
+    pub aborted_ms: u64,
+    /// How many times the best move at the root changed between one
+    /// completed depth and the next (i.e. `depth N`'s best move
+    /// differs from `depth N-1`'s) -- a stability signal: a search
+    /// that keeps agreeing with itself as it goes deeper is a good
+    /// candidate for stopping early; one that keeps flip-flopping
+    /// probably isn't.
+    pub best_move_changes: u32,
+    /// Signed centipawn difference between the last two completed
+    /// depths' scores (`last - previous`, from the root side to
+    /// move's own perspective both times) -- `None` if fewer than two
+    /// depths completed. A second stability signal alongside
+    /// `best_move_changes`: a small score delta at the end of a search
+    /// suggests the evaluation has settled; a large swing on the final
+    /// depth suggests it might not have.
+    pub score_delta_cp: Option<i32>,
+}
+
+impl TimeManagementTelemetry {
+    /// Renders this record as the payload of an `info string bee-tm
+    /// ...` line (the `info string bee-tm ` prefix itself is the
+    /// caller's job -- see `crate::uci`'s docs on where diagnostics vs.
+    /// structured `info` fields are written) -- see this type's docs
+    /// on the wire format's stability rules.
+    #[must_use]
+    pub fn to_bee_tm_line(self) -> String {
+        let mut line = format!(
+            "v={BEE_TM_VERSION} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
+            self.soft_ms, self.hard_ms, self.completed_depth, self.aborted_ms, self.best_move_changes,
+        );
+        if let Some(delta) = self.score_delta_cp {
+            line.push_str(&format!(" score_delta_cp={delta}"));
+        }
+        line
+    }
+}
+
 /// Computes a [`TimeBudget`] for one move from `control` and `config`.
 /// Pure and deterministic -- no clock reads, no sleeping -- so this is
 /// exactly as unit-testable as any other arithmetic (see this module's
@@ -167,6 +254,62 @@ mod tests {
             time_left: Duration::from_millis(time_left_ms),
             increment: Duration::from_millis(increment_ms),
             moves_to_go,
+        }
+    }
+
+    #[test]
+    fn bee_tm_line_includes_the_version_and_every_field() {
+        let telemetry = TimeManagementTelemetry {
+            soft_ms: 220,
+            hard_ms: 660,
+            completed_depth: 7,
+            aborted_ms: 201,
+            best_move_changes: 3,
+            score_delta_cp: Some(-42),
+        };
+
+        assert_eq!(
+            telemetry.to_bee_tm_line(),
+            "v=1 soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
+        );
+    }
+
+    #[test]
+    fn bee_tm_line_omits_score_delta_when_fewer_than_two_depths_completed() {
+        let telemetry = TimeManagementTelemetry {
+            soft_ms: 220,
+            hard_ms: 660,
+            completed_depth: 1,
+            aborted_ms: 0,
+            best_move_changes: 0,
+            score_delta_cp: None,
+        };
+
+        let line = telemetry.to_bee_tm_line();
+        assert!(!line.contains("score_delta_cp"), "got: {line}");
+        // Every other field is still present -- a missing key is only
+        // ever the *consumer's* signal to skip it, not a reason for
+        // the emitter to omit anything it does have.
+        assert!(line.contains("completed_depth=1"));
+    }
+
+    #[test]
+    fn bee_tm_line_has_no_whitespace_inside_any_value() {
+        // Consumers split the whole line on whitespace first, then
+        // each token once on '=' -- see the type's docs on the wire
+        // format's stability rules. A value containing a space would
+        // silently corrupt that parse.
+        let telemetry = TimeManagementTelemetry {
+            soft_ms: 220,
+            hard_ms: 660,
+            completed_depth: 7,
+            aborted_ms: 0,
+            best_move_changes: 1,
+            score_delta_cp: Some(12),
+        };
+
+        for token in telemetry.to_bee_tm_line().split(' ') {
+            assert_eq!(token.matches('=').count(), 1, "malformed token: {token}");
         }
     }
 

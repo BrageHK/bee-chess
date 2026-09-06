@@ -368,6 +368,13 @@ enum SearchEvent {
     /// and knows its own elapsed time), only the actual `write!` to
     /// `output` happens on the event-loop thread.
     Info(String),
+    /// A `bee-tm` time-management telemetry payload (see
+    /// `search::TimeManagementTelemetry`'s docs), pre-rendered on the
+    /// worker thread exactly like `Info`. Sent at most once per `go`
+    /// (only `search_with_clock` searches produce one at all -- see
+    /// `SearchWorker::spawn`), always *before* `Done` for the same
+    /// search.
+    Telemetry(String),
     /// The search has produced its final answer -- exactly one of
     /// these is sent per `go`, always as the worker's last message.
     Done(crate::search::SearchResult),
@@ -446,9 +453,12 @@ impl SearchWorker {
                 }
             };
 
-            let result = if let Some(movetime_ms) = go_command.movetime_ms {
+            let (result, telemetry) = if let Some(movetime_ms) = go_command.movetime_ms {
                 let budget = std::time::Duration::from_millis(movetime_ms);
-                engine.search_for_time(budget, worker_stop, on_depth_complete)
+                (
+                    engine.search_for_time(budget, worker_stop, on_depth_complete),
+                    None,
+                )
             } else if let Some(control) = go_command.clock_for(side_to_move) {
                 engine.search_with_clock(control, worker_stop, on_depth_complete)
             } else {
@@ -468,9 +478,19 @@ impl SearchWorker {
                 if result.depth > 0 {
                     on_depth_complete(&result);
                 }
-                result
+                (result, None)
             };
 
+            // `search_with_clock` is the only path that ever produces
+            // real telemetry (see its own docs) -- `go movetime`/
+            // fixed-`depth` searches have no allocated `TimeBudget` to
+            // report on. See `search::TimeManagementTelemetry`'s docs
+            // for the wire format/stability rules this line follows.
+            if let Some(telemetry) = telemetry {
+                let _ = events.send(Event::Search(SearchEvent::Telemetry(
+                    telemetry.to_bee_tm_line(),
+                )));
+            }
             let _ = events.send(Event::Search(SearchEvent::Done(result)));
             engine
         });
@@ -870,6 +890,11 @@ fn write_search_event<W: Write>(
 ) -> std::io::Result<()> {
     match event {
         SearchEvent::Info(line) => writeln!(output, "{line}"),
+        // Always written, not gated behind `debug on` (unlike ordinary
+        // diagnostics -- see `crate::diagnostics`): this is structured
+        // telemetry a consumer like Bee Lab needs from every real
+        // clock-based game, not a human debugging aid to opt into.
+        SearchEvent::Telemetry(payload) => writeln!(output, "info string bee-tm {payload}"),
         SearchEvent::Done(result) => {
             let _ = engine; // reserved for future per-result engine bookkeeping
             match result.best_move {
@@ -1821,6 +1846,66 @@ mod tests {
             "expected at least one real search depth, got: {text:?}"
         );
         assert!(text.lines().any(|line| line.starts_with("bestmove")));
+    }
+
+    #[test]
+    fn go_wtime_btime_emits_a_bee_tm_telemetry_line_before_bestmove() {
+        // Real clock-based search (`search_with_clock`) is the only
+        // path that produces `TimeManagementTelemetry` -- see
+        // `SearchWorker::spawn`'s docs -- so this is the one `go` mode
+        // that should always carry a `bee-tm` line, unconditionally
+        // (not gated behind `debug on`, unlike ordinary diagnostics).
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            "position startpos\ngo wtime 5000 btime 5000\n",
+            std::time::Duration::from_millis(300),
+        ));
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let bee_tm_line = text
+            .lines()
+            .find(|line| line.starts_with("info string bee-tm "))
+            .unwrap_or_else(|| panic!("expected a bee-tm telemetry line, got: {text:?}"));
+
+        // Wire-format sanity check: `v=1`, and every field is a bare
+        // `key=value` token with no embedded whitespace -- see
+        // `TimeManagementTelemetry`'s docs on the stability rules a
+        // consumer (Bee Lab) relies on.
+        let payload = bee_tm_line.strip_prefix("info string bee-tm ").unwrap();
+        assert!(payload.starts_with("v=1 "), "got: {payload}");
+        for token in payload.split(' ') {
+            assert_eq!(token.matches('=').count(), 1, "malformed token: {token}");
+        }
+        assert!(payload.contains("soft_ms="));
+        assert!(payload.contains("hard_ms="));
+        assert!(payload.contains("completed_depth="));
+        assert!(payload.contains("aborted_ms="));
+        assert!(payload.contains("best_move_changes="));
+
+        // Must appear before bestmove, since it describes the search
+        // that produced it.
+        let bee_tm_index = text.find("bee-tm").unwrap();
+        let bestmove_index = text.find("bestmove").expect("should have a bestmove");
+        assert!(bee_tm_index < bestmove_index);
+    }
+
+    #[test]
+    fn go_depth_does_not_emit_a_bee_tm_line() {
+        // A fixed-depth `go` (no clock, no movetime) never allocates a
+        // `TimeBudget` at all -- there's nothing for telemetry to
+        // describe, so no `bee-tm` line should appear.
+        let input = b"position startpos\ngo depth 2\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            !text.contains("bee-tm"),
+            "a fixed-depth go has no time budget to report telemetry about, got: {text:?}"
+        );
     }
 
     #[test]

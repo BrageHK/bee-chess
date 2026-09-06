@@ -604,19 +604,30 @@ impl Engine {
     /// deadlines (see `search_iterative_with_budget`'s docs), so a
     /// UCI `stop` is indistinguishable from crossing the hard limit as
     /// far as this method's own fallback handling is concerned.
+    ///
+    /// Returns telemetry (see `crate::search::TimeManagementTelemetry`)
+    /// about how the allocated budget was actually spent alongside the
+    /// `SearchResult` -- `None` on a book hit (no budget was ever
+    /// allocated, since `book_move` returns before `allocate_time` is
+    /// even called) or on the depth-1-never-completed fallback path
+    /// (no completed search to describe). `Engine` itself never reads
+    /// this; it exists purely for the UCI layer to report onward (see
+    /// `crate::uci`'s `bee-tm` line) -- see the module docs on why
+    /// `Engine`'s own methods return data for the protocol layer to
+    /// format rather than doing that themselves.
     pub fn search_with_clock(
         &mut self,
         control: ClockTimeControl,
         stop: search::StopSignal,
         on_depth_complete: impl FnMut(&SearchResult),
-    ) -> SearchResult {
+    ) -> (SearchResult, Option<search::TimeManagementTelemetry>) {
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
             EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
         };
         if let Some(result) = book_result {
-            return result;
+            return (result, None);
         }
 
         let fallback = self.position.generate_legal_moves().into_iter().next();
@@ -652,19 +663,25 @@ impl Engine {
             ),
         };
 
-        searched.unwrap_or_else(|| {
-            self.emit_diagnostic(
-                DiagnosticLevel::Warn,
-                "time budget expired before depth 1 completed; playing the first legal move instead of a searched one",
-            );
-            SearchResult {
-                best_move: fallback,
-                score: 0,
-                nodes: 0,
-                depth: 0,
-                pv: fallback.into_iter().collect(),
+        match searched {
+            Some((result, telemetry)) => (result, Some(telemetry)),
+            None => {
+                self.emit_diagnostic(
+                    DiagnosticLevel::Warn,
+                    "time budget expired before depth 1 completed; playing the first legal move instead of a searched one",
+                );
+                (
+                    SearchResult {
+                        best_move: fallback,
+                        score: 0,
+                        nodes: 0,
+                        depth: 0,
+                        pv: fallback.into_iter().collect(),
+                    },
+                    None,
+                )
             }
-        })
+        }
     }
 }
 
@@ -1026,7 +1043,8 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
+        let (result, _telemetry) =
+            engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some());
         assert_eq!(engine.position(), &before);
@@ -1045,7 +1063,8 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
+        let (result, _telemetry) =
+            engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some(), "must still return a legal move");
         assert_eq!(
@@ -1068,7 +1087,8 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
+        let (result, _telemetry) =
+            engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some());
         assert_eq!(result.depth, 0);
@@ -1084,7 +1104,8 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
+        let (result, _telemetry) =
+            engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         let best_move = result.best_move.expect("should hit the book");
         assert_eq!(best_move.from(), "e2".parse().unwrap());

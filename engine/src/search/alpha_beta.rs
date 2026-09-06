@@ -325,9 +325,20 @@ pub fn search_iterative_with_stop(
 /// `stop` (see `StopSignal`'s docs) is attached to both the soft and
 /// hard deadlines, so an external UCI `stop` cancels this exactly like
 /// crossing the hard limit does -- the caller sees the same `None`-on-
-/// nothing-completed / `Some(last_completed)`-otherwise contract
-/// either way, with no separate "was this a stop or a timeout" signal
-/// needed at this layer.
+/// nothing-completed / `Some((..))`-otherwise contract either way,
+/// with no separate "was this a stop or a timeout" signal needed at
+/// this layer.
+///
+/// Returns the `SearchResult` alongside a
+/// [`super::TimeManagementTelemetry`] record of how the budget was
+/// actually spent getting there (see that type's own docs for what
+/// each field means and why it's not just folded into `SearchResult`
+/// itself) -- this is the one place that has all the information
+/// needed to build one (per-depth wall-clock timing, whether the final
+/// attempted depth was aborted, and the root best-move/score history
+/// across completed depths), so it's assembled here rather than
+/// reconstructed by a caller from a sequence of `on_depth_complete`
+/// calls after the fact.
 pub fn search_iterative_with_budget(
     position: &mut Position,
     budget: super::TimeBudget,
@@ -336,11 +347,21 @@ pub fn search_iterative_with_budget(
     options: SearchOptions,
     stop: StopSignal,
     mut on_depth_complete: impl FnMut(&SearchResult),
-) -> Option<SearchResult> {
+) -> Option<(SearchResult, super::TimeManagementTelemetry)> {
     let soft_deadline = Deadline::from_now(budget.soft).with_stop_signal(stop.clone());
     let hard_deadline = Deadline::from_now(budget.hard).with_stop_signal(stop);
     let mut state = SearchState::new(options);
     let mut path = normalized_history(position, history);
+
+    let mut best_move_changes = 0u32;
+    // Updated only when a depth actually *completes* (never on an
+    // aborted one, which has no trustworthy score to compare against
+    // -- see `search_to_depth`'s module-level contract) -- this is
+    // exactly `TimeManagementTelemetry::score_delta_cp`'s definition:
+    // the delta between the last two *completed* depths, `None` until
+    // there have been two of them.
+    let mut last_score_delta: Option<Score> = None;
+    let mut aborted = std::time::Duration::ZERO;
 
     let mut depth = 1;
     let mut last_completed = search_to_depth(
@@ -351,6 +372,14 @@ pub fn search_iterative_with_budget(
         &mut state,
         &mut path,
     )?;
+    // Depth 1 itself being cut off (`?` returns `None` above) means no
+    // `SearchResult` was ever produced, so there's no `SearchResult`
+    // to pair telemetry with either -- the caller (`Engine`) falls
+    // back to its own pre-chosen legal move in that case and has no
+    // use for a telemetry record describing a search that found
+    // nothing.
+    let mut previous_score = Some(last_completed.score);
+    let mut previous_best_move = last_completed.best_move;
     on_depth_complete(&last_completed);
 
     // If depth 1 already found a forced mate, searching deeper cannot
@@ -358,11 +387,15 @@ pub fn search_iterative_with_budget(
     // meaningfully more expensive -- stop immediately rather than
     // burning the rest of the time budget for no gain.
     if super::mate_in_plies(last_completed.score).is_some() {
-        return Some(last_completed);
+        return Some((
+            last_completed,
+            telemetry(budget, depth, aborted, best_move_changes, None),
+        ));
     }
 
     loop {
         depth += 1;
+        let depth_start = std::time::Instant::now();
         match search_to_depth(
             position,
             depth,
@@ -373,13 +406,45 @@ pub fn search_iterative_with_budget(
         ) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
+                last_score_delta = previous_score.map(|previous| result.score - previous);
+                if result.best_move != previous_best_move {
+                    best_move_changes += 1;
+                }
+                previous_score = Some(result.score);
+                previous_best_move = result.best_move;
                 last_completed = result;
                 on_depth_complete(&last_completed);
                 if found_mate {
-                    return Some(last_completed);
+                    return Some((
+                        last_completed,
+                        telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                    ));
                 }
             }
-            None => return Some(last_completed), // this depth was cut off by the hard limit; keep the previous one
+            None => {
+                // This depth was cut off by the hard limit (or an
+                // external stop) -- its result is discarded (per
+                // `search_to_depth`'s contract), but the wall-clock
+                // time spent computing it wasn't free, and is exactly
+                // what `TimeManagementTelemetry::aborted_ms` exists to
+                // surface: a search that regularly burns hundreds of
+                // milliseconds on a depth it then throws away is the
+                // concrete signal that predicting "can the next depth
+                // plausibly finish" before starting it is worth
+                // building. `depth - 1` here since `depth` itself is
+                // the one that got cut off, not completed.
+                aborted = depth_start.elapsed();
+                return Some((
+                    last_completed,
+                    telemetry(
+                        budget,
+                        depth - 1,
+                        aborted,
+                        best_move_changes,
+                        last_score_delta,
+                    ),
+                ));
+            }
         }
 
         if soft_deadline.is_expired(0) {
@@ -388,8 +453,33 @@ pub fn search_iterative_with_budget(
             // not from inside the hot loop. Only the soft deadline is
             // checked here -- crossing it just means "don't start
             // another depth," not "abort the one that just finished."
-            return Some(last_completed);
+            return Some((
+                last_completed,
+                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+            ));
         }
+    }
+}
+
+/// Assembles a [`super::TimeManagementTelemetry`] record --
+/// `search_iterative_with_budget`'s one job besides searching. Kept as
+/// its own tiny function purely so every `return` site above states
+/// its telemetry the same way rather than repeating the same struct
+/// literal five times.
+fn telemetry(
+    budget: super::TimeBudget,
+    completed_depth: u32,
+    aborted: std::time::Duration,
+    best_move_changes: u32,
+    score_delta_cp: Option<Score>,
+) -> super::TimeManagementTelemetry {
+    super::TimeManagementTelemetry {
+        soft_ms: budget.soft.as_millis() as u64,
+        hard_ms: budget.hard.as_millis() as u64,
+        completed_depth,
+        aborted_ms: aborted.as_millis() as u64,
+        best_move_changes,
+        score_delta_cp,
     }
 }
 
@@ -1141,9 +1231,158 @@ mod tests {
         // acceptable outcome; what matters is that a `None` result
         // here doesn't panic and is a well-defined "use the fallback"
         // signal.
-        if let Some(completed) = result {
+        if let Some((completed, _telemetry)) = result {
             assert_eq!(completed.depth, 1);
         }
+    }
+
+    #[test]
+    fn telemetry_records_the_allocated_budget_and_completed_depth() {
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+        let budget = super::super::TimeBudget {
+            soft: Duration::from_millis(500),
+            hard: Duration::from_secs(2),
+        };
+
+        let (result, telemetry) = search_iterative_with_budget(
+            &mut position,
+            budget,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            StopSignal::new(),
+            |_| {},
+        )
+        .expect("depth 1 should complete with a generous budget");
+
+        assert_eq!(telemetry.soft_ms, 500);
+        assert_eq!(telemetry.hard_ms, 2000);
+        assert_eq!(telemetry.completed_depth, result.depth);
+        // `aborted_ms` itself is deliberately not asserted here: with a
+        // real wall-clock budget, whether the final iteration happens
+        // to land exactly on the soft boundary or instead gets cut off
+        // by the hard one partway through depends on real timing (and
+        // is *expected* to vary with machine speed/load -- e.g. a
+        // slower CI runner can easily make an iteration still be
+        // running when the hard deadline arrives, which is completely
+        // normal, not a bug). See
+        // `telemetry_reports_the_last_completed_depth_when_a_later_one_is_cancelled`
+        // for a deterministic (StopSignal-driven, not timing-based)
+        // test of the aborted-iteration path itself.
+    }
+
+    #[test]
+    fn telemetry_has_no_score_delta_when_only_depth_1_completes() {
+        // Request cancellation right after depth 1 completes -- same
+        // deterministic technique as
+        // `telemetry_reports_the_last_completed_depth_when_a_later_one_is_cancelled`,
+        // guaranteeing exactly one completed depth (never a second),
+        // so there's nothing to compute a score delta or a best-move
+        // change from yet.
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+        let budget = super::super::TimeBudget {
+            soft: Duration::from_secs(60),
+            hard: Duration::from_secs(60),
+        };
+        let stop = StopSignal::new();
+        let stop_from_callback = stop.clone();
+
+        let (_result, telemetry) = search_iterative_with_budget(
+            &mut position,
+            budget,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            stop,
+            move |_| stop_from_callback.request_stop(),
+        )
+        .expect("depth 1 should still complete");
+
+        assert_eq!(telemetry.completed_depth, 1);
+        assert_eq!(telemetry.score_delta_cp, None);
+        assert_eq!(telemetry.best_move_changes, 0);
+    }
+
+    #[test]
+    fn telemetry_counts_best_move_changes_across_completed_depths() {
+        // A generous budget: iterative deepening should comfortably
+        // reach several depths from the start position, giving
+        // multiple completed-depth transitions to count changes across.
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+        let budget = super::super::TimeBudget {
+            soft: Duration::from_secs(1),
+            hard: Duration::from_secs(3),
+        };
+
+        let mut best_moves = Vec::new();
+        let (_result, telemetry) = search_iterative_with_budget(
+            &mut position,
+            budget,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            StopSignal::new(),
+            |result| best_moves.push(result.best_move),
+        )
+        .expect("should complete at least depth 1");
+
+        let actual_changes = best_moves
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count() as u32;
+        assert_eq!(
+            telemetry.best_move_changes, actual_changes,
+            "telemetry's count must match the actual best-move transitions on_depth_complete observed"
+        );
+    }
+
+    #[test]
+    fn telemetry_reports_the_last_completed_depth_when_a_later_one_is_cancelled() {
+        // Request cancellation as soon as depth 2 starts (from
+        // `on_depth_complete`, called after depth 1) -- deterministic,
+        // unlike relying on a hard-deadline race against real wall-
+        // clock timing: depth 2 is guaranteed to be cut off by the
+        // `StopSignal` (checked unconditionally on every node -- see
+        // `Deadline::is_expired`'s docs), never completing, so
+        // telemetry must report `completed_depth: 1`, not 2 -- even
+        // though a depth-2 attempt genuinely started and was aborted.
+        // (`aborted_ms` itself isn't asserted here: cancelling a
+        // trivial depth-2 search from the start position typically
+        // takes microseconds, which rounds down to 0 at
+        // `Duration::as_millis`'s millisecond granularity -- see
+        // `telemetry_records_the_allocated_budget_and_completed_depth`
+        // for `aborted_ms`'s zero-when-nothing-aborted case, and the
+        // module's own real-position search timings for evidence
+        // `aborted_ms` is wired to something real when a cut-off
+        // iteration actually takes measurable wall-clock time.)
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+        let budget = super::super::TimeBudget {
+            soft: Duration::from_secs(60),
+            hard: Duration::from_secs(60),
+        };
+        let stop = StopSignal::new();
+        let stop_from_callback = stop.clone();
+
+        let (result, telemetry) = search_iterative_with_budget(
+            &mut position,
+            budget,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            stop,
+            move |_| stop_from_callback.request_stop(),
+        )
+        .expect("depth 1 should complete before the stop takes effect");
+
+        assert_eq!(
+            result.depth, 1,
+            "depth 2 must have been cancelled, not completed"
+        );
+        assert_eq!(telemetry.completed_depth, 1);
     }
 
     #[test]
