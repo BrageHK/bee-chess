@@ -27,11 +27,10 @@
 //! move_time_ms * average_game_length` wall-clock time. Worth
 //! revisiting once that's actually felt to be too slow -- not before.
 //!
-//! Paired by color, not by opening (no opening book/suite exists yet):
-//! game `2k` has variant A playing White, game `2k+1` has variant A
-//! playing Black, both from the standard starting position. This
-//! halves (not eliminates) color-imbalance noise in the result --
-//! see the module docs' "pair the games" rationale.
+//! Games are paired by color and opening: game `2k` has variant A playing
+//! White, game `2k+1` has variant A playing Black, and both begin from the
+//! same short opening line. Successive pairs rotate through a small built-in
+//! suite so an experiment does not merely replay two start-position games.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,6 +38,26 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
+
+/// Short, deliberately unsurprising opening lines in UCI notation. Every
+/// line has an even number of plies, leaving White to move in each seeded
+/// position and making both games in a color-swapped pair directly comparable.
+const OPENING_SUITE: &[&[&str]] = &[
+    &[],
+    &["e2e4", "e7e5", "g1f3", "b8c6"],
+    &["d2d4", "d7d5", "c2c4", "e7e6"],
+    &["c2c4", "e7e5", "b1c3", "g8f6"],
+    &["g1f3", "d7d5", "g2g3", "g8f6"],
+    &["e2e4", "c7c5", "g1f3", "d7d6"],
+    &["e2e4", "e7e6", "d2d4", "d7d5"],
+    &["d2d4", "g8f6", "c2c4", "g7g6"],
+    &["e2e4", "c7c6", "d2d4", "d7d5"],
+];
+
+fn opening_moves_for_game(game_index: u32) -> &'static [&'static str] {
+    let pair_index = game_index as usize / 2;
+    OPENING_SUITE[pair_index % OPENING_SUITE.len()]
+}
 
 use crate::game::{EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore};
 
@@ -101,11 +120,8 @@ pub struct ExperimentSpec {
 /// `variant_b_argv`, `started_at`) plus once more when the experiment
 /// finishes (`finished_at`) -- see `Experiment::finish`.
 ///
-/// Doesn't (yet) record an opening/start-position policy as its own
-/// field: v1 always plays from the standard starting position (see
-/// this module's own docs), so that's implicit rather than a real
-/// per-experiment choice to record -- add a field here once that
-/// stops being true.
+/// The opening policy is the fixed built-in `OPENING_SUITE`; each game's
+/// ordinary move list records the exact line it received.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExperimentMetadata {
     pub lab_git_commit: String,
@@ -590,10 +606,8 @@ pub async fn run_experiment(
     spec: ExperimentSpec,
 ) {
     for game_index in 0..spec.requested_games {
-        // Even-indexed games: A plays White. Odd-indexed: A plays
-        // Black. See the module docs -- this is the whole "pair the
-        // games" scheme for v1 (no opening suite yet, so every pair is
-        // just the standard starting position with colors swapped).
+        // Even-indexed games: A plays White. Odd-indexed: A plays Black.
+        // Both games in each pair receive the same opening line.
         let variant_a_is_white = game_index % 2 == 0;
         let (white, black) = if variant_a_is_white {
             (&spec.variant_a, &spec.variant_b)
@@ -605,6 +619,16 @@ pub async fn run_experiment(
         let black_info = engine_participant_info(black);
         let snapshot = store.create_for_experiment(white_info, black_info, id);
         experiments.record_game_started(id, snapshot.id, variant_a_is_white);
+
+        for &mv in opening_moves_for_game(game_index) {
+            if let Err(err) = store.apply_move(snapshot.id, mv) {
+                store.abort(
+                    snapshot.id,
+                    format!("built-in opening contains illegal move {mv}: {err:?}"),
+                );
+                break;
+            }
+        }
 
         let slots = EngineSlots {
             white: Some(white.config.clone()),
@@ -648,7 +672,7 @@ fn engine_participant_info(variant: &EngineVariant) -> crate::game::ParticipantI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::EngineSpec;
+    use crate::game::{EngineSpec, Game, ParticipantInfo};
 
     fn fake_bee_spec() -> EngineSpec {
         EngineSpec {
@@ -690,6 +714,30 @@ mod tests {
             },
             requested_games,
             move_time_ms: 5,
+        }
+    }
+
+    #[test]
+    fn color_swapped_pairs_use_the_same_opening_and_pairs_rotate() {
+        assert_eq!(opening_moves_for_game(0), opening_moves_for_game(1));
+        assert_eq!(opening_moves_for_game(2), opening_moves_for_game(3));
+        assert_ne!(opening_moves_for_game(0), opening_moves_for_game(2));
+        assert_eq!(
+            opening_moves_for_game((OPENING_SUITE.len() * 2) as u32),
+            OPENING_SUITE[0]
+        );
+    }
+
+    #[test]
+    fn every_built_in_opening_is_legal_and_non_terminal() {
+        for opening in OPENING_SUITE {
+            let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+            for &mv in *opening {
+                game.apply_move(mv).unwrap_or_else(|err| {
+                    panic!("illegal move {mv} in opening {opening:?}: {err:?}")
+                });
+            }
+            assert_eq!(game.status(), &GameStatus::Running, "opening {opening:?}");
         }
     }
 

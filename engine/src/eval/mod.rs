@@ -29,6 +29,7 @@ impl Evaluator for ExperimentalEvaluator {
         let mut phase = 0;
         let mut bishops = [0u8; 2];
         let mut pawns = [[0u8; 8]; 2];
+        let mut rooks = Vec::new();
 
         for index in 0..Square::COUNT as u8 {
             let square = Square::new(index);
@@ -54,6 +55,9 @@ impl Evaluator for ExperimentalEvaluator {
             }
             if piece.kind == PieceKind::Pawn {
                 pawns[color][square.file() as usize] += 1;
+            }
+            if piece.kind == PieceKind::Rook {
+                rooks.push((piece.color, square.file() as usize));
             }
         }
 
@@ -81,24 +85,33 @@ impl Evaluator for ExperimentalEvaluator {
             }
         }
 
+        for (color, file) in rooks {
+            let own = color_index(color);
+            let opponent = color_index(color.opposite());
+            let sign = if color == Color::White { 1 } else { -1 };
+
+            if pawns[own][file] == 0 {
+                if pawns[opponent][file] == 0 {
+                    // Open file: no pawn of either color blocks the rook.
+                    middle += sign * 20;
+                    end += sign * 10;
+                } else {
+                    // Semi-open file: only an opposing pawn remains.
+                    middle += sign * 10;
+                    end += sign * 5;
+                }
+            }
+        }
+
         // Both armies together contribute 24 phase units initially: four
         // queens' worth, four rooks, and eight minor pieces at their weights.
         let phase = phase.min(24);
         let white_score = (middle * phase + end * (24 - phase)) / 24;
-        let own_score = if position.side_to_move() == Color::White {
+        if position.side_to_move() == Color::White {
             white_score
         } else {
             -white_score
-        };
-
-        let own_mobility = position.generate_legal_moves().len() as Score;
-        let mut opponent_position = position.clone();
-        opponent_position.set_side_to_move(position.side_to_move().opposite());
-        // An en-passant target is only valid for the actual side to move.
-        opponent_position.set_en_passant_square(None);
-        let opponent_mobility = opponent_position.generate_legal_moves().len() as Score;
-
-        return own_score + 2 * (own_mobility - opponent_mobility);
+        }
     }
 }
 
@@ -297,6 +310,20 @@ mod tests {
         assert!(
             ExperimentalEvaluator.evaluate(&connected) > ExperimentalEvaluator.evaluate(&isolated)
         );
+    }
+
+    #[test]
+    fn experimental_evaluator_rewards_rooks_on_open_and_semi_open_files() {
+        let open = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let semi_open = Position::from_fen("4k3/p7/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let closed = Position::from_fen("4k3/8/8/8/8/8/P7/R3K3 w - - 0 1").unwrap();
+
+        let bonus_over_positional = |position: &Position| {
+            ExperimentalEvaluator.evaluate(position) - PositionalEvaluator.evaluate(position)
+        };
+        assert!((9..=11).contains(&bonus_over_positional(&open)));
+        assert!((4..=6).contains(&bonus_over_positional(&semi_open)));
+        assert_eq!(bonus_over_positional(&closed), 0);
     }
 
     #[test]

@@ -166,6 +166,10 @@ pub enum ParticipantInfo {
 pub struct Game {
     pub id: GameId,
     position: Position,
+    /// Zobrist hash of the initial position and every position reached after
+    /// it. Halfmove/fullmove counters are intentionally absent from the hash,
+    /// matching the chess definition of a repeated position.
+    position_history: Vec<u64>,
     moves: Vec<String>,
     status: GameStatus,
     white_participant: ParticipantInfo,
@@ -209,9 +213,12 @@ impl Game {
     /// `white`/`black` recorded as this game's participants (see
     /// `ParticipantInfo`).
     pub fn new(white: ParticipantInfo, black: ParticipantInfo) -> Self {
+        let position = Position::startpos();
+        let position_history = vec![position.zobrist_hash()];
         Game {
             id: GameId::new(),
-            position: Position::startpos(),
+            position,
+            position_history,
             moves: Vec::new(),
             status: GameStatus::Running,
             white_participant: white,
@@ -229,9 +236,11 @@ impl Game {
     /// exists to test.
     #[cfg(test)]
     fn from_position(position: Position) -> Self {
+        let position_history = vec![position.zobrist_hash()];
         let mut game = Game {
             id: GameId::new(),
             position,
+            position_history,
             moves: Vec::new(),
             status: GameStatus::Running,
             white_participant: ParticipantInfo::Human,
@@ -316,27 +325,40 @@ impl Game {
             .ok_or(ApplyMoveError::IllegalMove)?;
 
         self.position.make_move(matching_move);
+        self.position_history.push(self.position.zobrist_hash());
         self.moves.push(uci.to_string());
         self.update_status_after_move();
         Ok(())
     }
 
     fn update_status_after_move(&mut self) {
-        if !self.position.generate_legal_moves().is_empty() {
+        if self.position.generate_legal_moves().is_empty() {
+            self.status = GameStatus::Finished {
+                result: if self.position.in_check() {
+                    // The side to move is checkmated -- the *other* side won.
+                    if self.position.side_to_move() == bee_chess_core::Color::White {
+                        GameResult::BlackWins
+                    } else {
+                        GameResult::WhiteWins
+                    }
+                } else {
+                    GameResult::Draw // stalemate
+                },
+            };
             return;
         }
-        self.status = GameStatus::Finished {
-            result: if self.position.in_check() {
-                // The side to move is checkmated -- the *other* side won.
-                if self.position.side_to_move() == bee_chess_core::Color::White {
-                    GameResult::BlackWins
-                } else {
-                    GameResult::WhiteWins
-                }
-            } else {
-                GameResult::Draw // stalemate
-            },
-        };
+
+        let current_hash = self.position.zobrist_hash();
+        let repetitions = self
+            .position_history
+            .iter()
+            .filter(|&&hash| hash == current_hash)
+            .count();
+        if self.position.halfmove_clock() >= 100 || repetitions >= 3 {
+            self.status = GameStatus::Finished {
+                result: GameResult::Draw,
+            };
+        }
     }
 }
 
@@ -537,7 +559,7 @@ impl GameStore {
     /// that a real scenario in practice -- still, the engine loop
     /// shouldn't panic over it). Broadcasts `GameEvent::Updated` if the
     /// game existed.
-    fn abort(&self, id: GameId, reason: impl Into<String>) {
+    pub(crate) fn abort(&self, id: GameId, reason: impl Into<String>) {
         let snapshot = {
             let mut games = self.games.lock().expect("game store mutex poisoned");
             let Some(game) = games.get_mut(&id) else {
@@ -846,6 +868,41 @@ mod tests {
         assert!(!position.in_check(), "test setup: stalemate, not checkmate");
 
         let game = Game::from_position(position);
+
+        assert_eq!(
+            game.status(),
+            &GameStatus::Finished {
+                result: GameResult::Draw
+            }
+        );
+    }
+
+    #[test]
+    fn hundred_halfmoves_without_a_pawn_move_or_capture_finishes_as_a_draw() {
+        let position = Position::from_fen("7k/8/8/8/8/8/N7/K7 w - - 99 50").expect("valid FEN");
+        let mut game = Game::from_position(position);
+        assert_eq!(game.status(), &GameStatus::Running);
+
+        game.apply_move("a2b4")
+            .expect("quiet knight move should be legal");
+
+        assert_eq!(
+            game.status(),
+            &GameStatus::Finished {
+                result: GameResult::Draw
+            }
+        );
+    }
+
+    #[test]
+    fn third_occurrence_of_a_position_finishes_as_a_draw() {
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+
+        for mv in [
+            "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+        ] {
+            game.apply_move(mv).expect("knight shuffle should be legal");
+        }
 
         assert_eq!(
             game.status(),
