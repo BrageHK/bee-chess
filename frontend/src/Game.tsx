@@ -73,6 +73,7 @@ export function Game({
   source,
   onGameCreated,
   onBackToSetup,
+  onOpenExperiment,
 }: {
   source: GameSource;
   /** Called once with the game's id, as soon as it's known -- for a
@@ -83,6 +84,12 @@ export function Game({
    * one. */
   onGameCreated: (gameId: string) => void;
   onBackToSetup: () => void;
+  /** Called with the game's `experiment_id` when the user asks to go
+   * back to it -- only ever offered when the snapshot actually has one
+   * (see the "Back to experiment" button below), i.e. this game was
+   * created by an A/B experiment (#109/#111) rather than started from
+   * the ordinary setup screen. */
+  onOpenExperiment: (experimentId: string) => void;
 }) {
   const gameIdRef = useRef<string | null>(null);
   // Every raw GameEvent this game has seen, for EvalBar/SearchStatsPanel/
@@ -246,12 +253,18 @@ export function Game({
   const orientation = snapshot?.black.kind === "human" ? "black" : "white";
   const dests = canMoveColor ? chessgroundDestsFromFen(fen) : new Map<Key, Key[]>();
   const finished = snapshot ? snapshot.status !== "running" : false;
+  const experimentId = snapshot?.experiment_id ?? null;
 
   return (
     <Stack gap={2} align="center" className="w-full text-center">
       <h1 className="text-2xl font-medium">
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
+      {experimentId && (
+        <Button variant="secondary" onClick={() => onOpenExperiment(experimentId)}>
+          ← Back to experiment
+        </Button>
+      )}
       <Inline gap={2} align="start" className="justify-center">
         {participantInfoFor("white")?.kind === "engine" && (
           <EvalBar color="white" subscribe={logSubscribeFor(logListenersRef, "white")} />

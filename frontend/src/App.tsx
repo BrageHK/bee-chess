@@ -196,6 +196,7 @@ export default function App() {
                 )
               }
               onBackToSetup={() => setScreen({ phase: "dashboard" })}
+              onOpenExperiment={(experimentId) => setScreen({ phase: "experiment", experimentId })}
             />
           ) : screen.phase === "experiment-setup" ? (
             <ExperimentSetup onStarted={(experimentId) => setScreen({ phase: "experiment", experimentId })} />
