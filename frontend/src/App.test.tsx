@@ -17,6 +17,7 @@ vi.mock("./labClient", async () => {
     // on real game/experiment data.
     getExperiment: vi.fn().mockReturnValue(new Promise(() => {})),
     getGame: vi.fn().mockReturnValue(new Promise(() => {})),
+    subscribeToGameEvents: vi.fn().mockReturnValue(() => {}),
   };
 });
 
@@ -123,5 +124,45 @@ describe("App navigation history", () => {
 
     await user.click(screen.getByRole("button", { name: /bee chess/i }));
     expect(await screen.findByText(/nothing running/i)).toBeInTheDocument();
+  });
+
+  it("a game created by an experiment offers a way back to it, and clicking it navigates there", async () => {
+    vi.mocked(labClient.getGame).mockResolvedValue({
+      id: "game-123",
+      fen: "start",
+      moves: [],
+      status: "running",
+      white: { kind: "engine", name: "Baseline", debug: false },
+      black: { kind: "engine", name: "Candidate", debug: false },
+      experiment_id: "exp-42",
+    });
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/?game=game-123");
+
+    render(<App />);
+
+    const backLink = await screen.findByRole("button", { name: /back to experiment/i });
+    await user.click(backLink);
+
+    expect(await screen.findByText(/loading experiment/i)).toBeInTheDocument();
+    expect(window.location.search).toBe("?experiment=exp-42");
+  });
+
+  it("an ordinary game (no experiment_id) does not offer a way back to an experiment", async () => {
+    vi.mocked(labClient.getGame).mockResolvedValue({
+      id: "game-456",
+      fen: "start",
+      moves: [],
+      status: "running",
+      white: { kind: "human" },
+      black: { kind: "human" },
+      experiment_id: null,
+    });
+    window.history.replaceState(null, "", "/?game=game-456");
+
+    render(<App />);
+    await screen.findByText(/your move|thinking|connecting/i);
+
+    expect(screen.queryByRole("button", { name: /back to experiment/i })).not.toBeInTheDocument();
   });
 });
