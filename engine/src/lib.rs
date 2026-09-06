@@ -30,6 +30,7 @@
 //! `use crate::chess::...` in this crate keeps working unchanged.
 
 pub use bee_chess_core as chess;
+pub mod book;
 pub mod diagnostics;
 pub mod engine;
 pub mod eval;

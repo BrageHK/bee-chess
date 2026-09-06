@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
-use crate::engine::{Engine, EvaluatorKind};
+use crate::engine::{Engine, EvaluatorKind, OpeningBookKind};
 use crate::search::mate_in_plies;
 
 pub const ENGINE_NAME: &str = "bee-chess";
@@ -348,6 +348,13 @@ pub fn run<R: BufRead, W: Write>(
                 // not a permanent engine configuration.
                 writeln!(output, "option name UseTT type check default true")?;
                 writeln!(output, "option name UseQuiescence type check default true")?;
+                // See `crate::book`'s module docs -- `None` is the
+                // default (a book is an opt-in experiment), `Cow` is
+                // the first, deliberately small opening book.
+                writeln!(
+                    output,
+                    "option name OpeningBook type combo default None var None var Cow"
+                )?;
                 writeln!(output, "uciok")?;
             }
             UciCommand::IsReady => {
@@ -381,6 +388,15 @@ pub fn run<R: BufRead, W: Write>(
                             DiagnosticLevel::Warn,
                             format!("ignored invalid UseQuiescence value: {value}"),
                         ),
+                    }
+                } else if name.eq_ignore_ascii_case("OpeningBook") {
+                    if let Some(book) = OpeningBookKind::parse(&value) {
+                        engine.set_opening_book(book);
+                    } else {
+                        engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid OpeningBook value: {value}"),
+                        );
                     }
                 } else {
                     engine.emit_diagnostic(
@@ -421,7 +437,14 @@ pub fn run<R: BufRead, W: Write>(
                         let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
                         let start = Instant::now();
                         let result = engine.search(depth);
-                        write_search_info(&mut output, &result, start.elapsed())?;
+                        // depth == 0 means this was a book hit (see
+                        // `Engine::book_move`'s docs), not a real
+                        // search -- there's no depth/node count to
+                        // report, so writing an "info depth 0 ..."
+                        // line for it would misrepresent it as one.
+                        if result.depth > 0 {
+                            write_search_info(&mut output, &result, start.elapsed())?;
+                        }
                         result
                     }
                 };
@@ -729,6 +752,7 @@ mod tests {
         assert!(text.contains("option name Evaluator type combo default Positional"));
         assert!(text.contains("option name UseTT type check default true"));
         assert!(text.contains("option name UseQuiescence type check default true"));
+        assert!(text.contains("option name OpeningBook type combo default None"));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
     }
@@ -758,6 +782,37 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert!(!engine.search_options().use_quiescence);
+    }
+
+    #[test]
+    fn setoption_enables_the_cow_opening_book() {
+        let input = b"setoption name OpeningBook value Cow\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.opening_book_kind(), OpeningBookKind::Cow);
+    }
+
+    #[test]
+    fn invalid_opening_book_value_keeps_the_current_setting() {
+        let input = b"setoption name OpeningBook value NotARealBook\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.opening_book_kind(), OpeningBookKind::None);
+    }
+
+    #[test]
+    fn cow_opening_book_plays_e3_instantly_via_the_real_uci_protocol() {
+        let input = b"setoption name OpeningBook value Cow\ngo depth 4\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("bestmove e2e3"));
+        // A book hit has no real search depth -- no "info depth ..."
+        // line should have been written for it.
+        assert!(!text.contains("info depth"));
     }
 
     #[test]
