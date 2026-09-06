@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode } from "react";
+import type { HTMLAttributes } from "react";
 
 export type PanelProps = HTMLAttributes<HTMLDivElement>;
 
@@ -13,19 +13,24 @@ export function Panel({ className = "", ...props }: PanelProps) {
   );
 }
 
-export function PanelHeader({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function PanelHeader({ children, className = "", ...props }: HTMLAttributes<HTMLDivElement>) {
   return (
     <div
       className={[
         "border-b border-border px-4 py-2 text-sm font-medium text-text",
         className,
       ].join(" ")}
+      {...props}
     >
       {children}
     </div>
   );
 }
 
-export function PanelBody({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <div className={["p-4", className].join(" ")}>{children}</div>;
+export function PanelBody({ children, className = "", ...props }: HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={["p-4", className].join(" ")} {...props}>
+      {children}
+    </div>
+  );
 }

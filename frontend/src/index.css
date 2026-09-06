@@ -62,6 +62,14 @@
 
     --color-accent: #a78bfa;
     --color-accent-hover: #c4b5fd;
+
+    /* Lightened so danger/success/warning text stays legible against
+     * the dark surfaces above -- the light-mode values are calibrated
+     * for a white background and read as low-contrast (near-)black on
+     * one this dark. */
+    --color-danger: #f87171;
+    --color-success: #4ade80;
+    --color-warning: #fbbf24;
   }
 }
 
