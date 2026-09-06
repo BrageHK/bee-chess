@@ -79,7 +79,7 @@ def build_model(config: TrainConfig) -> ChessMamba:
 
 
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-                     global_step: int, config: TrainConfig, best_val_loss: float) -> None:
+                     global_step: int, config: TrainConfig, best_val_loss: float = float("inf")) -> None:
     """Writes to a temp file then atomically renames into place (`os.replace`
     is atomic on the same filesystem), so a crash mid-write can never leave
     `latest.pt` itself truncated/corrupt -- worst case you lose the
