@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -28,6 +29,129 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub enum UciDirection {
     Sent,
     Received,
+}
+
+/// One `option` line an engine advertised during the `uci` handshake,
+/// parsed into UCI's own generic type vocabulary rather than anything
+/// engine-specific -- this is the whole point (see the module docs on
+/// `options()`): Bee Lab, and everything downstream of it, discovers
+/// what an engine supports instead of hardcoding option names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum UciOption {
+    Check {
+        name: String,
+        default: bool,
+    },
+    Spin {
+        name: String,
+        default: i64,
+        min: i64,
+        max: i64,
+    },
+    Combo {
+        name: String,
+        default: String,
+        values: Vec<String>,
+    },
+    /// `button` (a fire-and-forget action, no value) intentionally has
+    /// no case here: `set_option` always sends a value, and a button
+    /// option isn't something an A/B experiment configures -- see
+    /// `parse_option_line`'s docs on why it's the one UCI option type
+    /// this type doesn't represent.
+    String {
+        name: String,
+        default: String,
+    },
+}
+
+/// Parses one `option name <name> type <type> ...` line (the exact
+/// text an engine writes to stdout during the `uci` handshake) into a
+/// typed `UciOption`. Returns `None` for a `button`-type option (see
+/// `UciOption`'s docs) or anything malformed -- an engine advertising
+/// something this parser doesn't understand shouldn't take down
+/// discovery for every option it *does* understand, so `spawn` (which
+/// calls this once per `option` line) simply skips a line this returns
+/// `None` for rather than failing the whole handshake.
+///
+/// UCI's own grammar for this line is `option name <name> type <type>
+/// [default <value>] [min <value>] [max <value>] [var <value>]...` --
+/// `<name>` and `<default>`'s value may themselves contain spaces, so
+/// this walks token-by-token rather than splitting naively, using each
+/// keyword (`type`/`default`/`min`/`max`/`var`) as the next field's
+/// delimiter, exactly as engines rely on GUIs already doing.
+fn parse_option_line(line: &str) -> Option<UciOption> {
+    let rest = line.strip_prefix("option name ")?;
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+
+    let type_index = tokens.iter().position(|&t| t == "type")?;
+    let name = tokens[..type_index].join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    let kind = *tokens.get(type_index + 1)?;
+
+    let field = |keyword: &str| -> Option<String> {
+        let start = tokens.iter().position(|&t| t == keyword)? + 1;
+        let stop_words = ["default", "min", "max", "var"];
+        let end = tokens[start..]
+            .iter()
+            .position(|t| stop_words.contains(t))
+            .map_or(tokens.len(), |offset| start + offset);
+        if start >= end {
+            return None;
+        }
+        Some(tokens[start..end].join(" "))
+    };
+
+    match kind {
+        "check" => Some(UciOption::Check {
+            name,
+            default: field("default")?.eq_ignore_ascii_case("true"),
+        }),
+        "spin" => Some(UciOption::Spin {
+            name,
+            default: field("default")?.parse().ok()?,
+            min: field("min")?.parse().ok()?,
+            max: field("max")?.parse().ok()?,
+        }),
+        "combo" => {
+            let default = field("default")?;
+            let mut values = Vec::new();
+            let mut search_from = type_index;
+            while let Some(offset) = tokens[search_from..].iter().position(|&t| t == "var") {
+                let start = search_from + offset + 1;
+                let end = tokens[start..]
+                    .iter()
+                    .position(|&t| t == "var")
+                    .map_or(tokens.len(), |o| start + o);
+                if start < end {
+                    values.push(tokens[start..end].join(" "));
+                }
+                search_from = end;
+            }
+            Some(UciOption::Combo {
+                name,
+                default,
+                values,
+            })
+        }
+        "string" => Some(UciOption::String {
+            name,
+            // `field` stops at the next keyword, but a string value is
+            // free text and could legitimately contain a word like
+            // "min" -- there is no further field after `default` for
+            // a string option, so it's safe to take everything after
+            // it verbatim instead.
+            default: {
+                let start = tokens.iter().position(|&t| t == "default")? + 1;
+                tokens[start..].join(" ")
+            },
+        }),
+        // "button" (no value) and anything unrecognized -- see this
+        // function's docs.
+        _ => None,
+    }
 }
 
 /// A running engine process, mid-UCI-conversation.
@@ -44,6 +168,9 @@ pub struct UciProcess {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     on_line: Option<OnLine>,
+    /// Every `option` line advertised during the handshake, parsed via
+    /// `parse_option_line` -- see `options()`.
+    options: Vec<UciOption>,
 }
 
 /// A callback invoked with every line `UciProcess` sends or receives --
@@ -107,14 +234,26 @@ impl UciProcess {
             stdin,
             stdout,
             on_line,
+            options: Vec::new(),
         };
 
         process.send("uci").await?;
-        process.wait_for("uciok").await?;
+        process.wait_for_uciok().await?;
         process.send("isready").await?;
         process.wait_for("readyok").await?;
 
         Ok(process)
+    }
+
+    /// Every option this engine advertised during the `uci` handshake,
+    /// parsed into UCI's own generic type vocabulary (see `UciOption`)
+    /// rather than anything engine-specific -- e.g. the `GET
+    /// /api/engines/:name/options` endpoint returns exactly this,
+    /// letting Bee Lab (and the frontend beyond it) render/offer
+    /// whatever options an engine happens to support without either
+    /// one knowing the option's name ahead of time.
+    pub fn options(&self) -> &[UciOption] {
+        &self.options
     }
 
     /// Sends `setoption name <name> value <value>` and waits for the
@@ -208,6 +347,23 @@ impl UciProcess {
             }
         }
     }
+
+    /// Same as `wait_for("uciok")`, but also parses every `option`
+    /// line seen along the way into `self.options` -- per UCI, an
+    /// engine advertises `id`/`option` lines after `uci` and before
+    /// `uciok`, never after, so this is the one place discovery needs
+    /// to happen.
+    async fn wait_for_uciok(&mut self) -> Result<(), UciProcessError> {
+        loop {
+            let line = self.read_line().await?;
+            if line.trim() == "uciok" {
+                return Ok(());
+            }
+            if let Some(option) = parse_option_line(line.trim()) {
+                self.options.push(option);
+            }
+        }
+    }
 }
 
 impl Drop for UciProcess {
@@ -230,6 +386,128 @@ mod tests {
     /// not any particular engine's actual chess strength.
     fn fake_engine_argv(script: &str) -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+    }
+
+    #[test]
+    fn parses_a_check_option() {
+        assert_eq!(
+            parse_option_line("option name UseTT type check default true"),
+            Some(UciOption::Check {
+                name: "UseTT".to_string(),
+                default: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_check_option_defaulting_to_false() {
+        assert_eq!(
+            parse_option_line("option name Ponder type check default false"),
+            Some(UciOption::Check {
+                name: "Ponder".to_string(),
+                default: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_spin_option() {
+        assert_eq!(
+            parse_option_line("option name UCI_Elo type spin default 1600 min 1320 max 3190"),
+            Some(UciOption::Spin {
+                name: "UCI_Elo".to_string(),
+                default: 1600,
+                min: 1320,
+                max: 3190,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_combo_option_with_multiple_values() {
+        assert_eq!(
+            parse_option_line(
+                "option name Evaluator type combo default Positional var Positional var Material"
+            ),
+            Some(UciOption::Combo {
+                name: "Evaluator".to_string(),
+                default: "Positional".to_string(),
+                values: vec!["Positional".to_string(), "Material".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_string_option() {
+        assert_eq!(
+            parse_option_line("option name ModelFile type string default "),
+            Some(UciOption::String {
+                name: "ModelFile".to_string(),
+                default: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_multi_word_option_name() {
+        // UCI names can contain spaces (e.g. Stockfish's real "Move
+        // Overhead") -- everything before the `type` keyword is the
+        // name, not just the first token.
+        assert_eq!(
+            parse_option_line("option name Move Overhead type spin default 10 min 0 max 5000"),
+            Some(UciOption::Spin {
+                name: "Move Overhead".to_string(),
+                default: 10,
+                min: 0,
+                max: 5000,
+            })
+        );
+    }
+
+    #[test]
+    fn button_options_are_not_represented() {
+        assert_eq!(
+            parse_option_line("option name Clear Hash type button"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_option_line_is_none() {
+        assert_eq!(parse_option_line("option name Broken type"), None);
+        assert_eq!(parse_option_line("not an option line at all"), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_captures_options_advertised_before_uciok() {
+        let argv = fake_engine_argv(
+            r#"
+            read _
+            echo "id name fake"
+            echo "option name UseTT type check default true"
+            echo "option name Evaluator type combo default Positional var Positional var Material"
+            echo "uciok"
+            read _; echo "readyok"
+            "#,
+        );
+        let process = UciProcess::spawn(&argv, std::env::temp_dir().as_path(), None)
+            .await
+            .expect("handshake should succeed");
+
+        assert_eq!(
+            process.options(),
+            &[
+                UciOption::Check {
+                    name: "UseTT".to_string(),
+                    default: true,
+                },
+                UciOption::Combo {
+                    name: "Evaluator".to_string(),
+                    default: "Positional".to_string(),
+                    values: vec!["Positional".to_string(), "Material".to_string()],
+                },
+            ]
+        );
     }
 
     #[tokio::test]
