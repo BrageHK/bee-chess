@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ExperimentView } from "./ExperimentView";
 import * as labClient from "./labClient";
-import type { ExperimentSnapshot } from "./labClient";
+import type { ExperimentGame } from "./labClient";
+import { experimentSnapshotFixture } from "./testFixtures";
 
 vi.mock("./labClient", async () => {
   const actual = await vi.importActual<typeof labClient>("./labClient");
@@ -13,19 +14,14 @@ vi.mock("./labClient", async () => {
   };
 });
 
-function runningSnapshot(overrides: Partial<ExperimentSnapshot> = {}): ExperimentSnapshot {
+function game(overrides: Partial<ExperimentGame> = {}): ExperimentGame {
   return {
-    id: "exp-1",
-    status: "running",
-    label_a: "Baseline",
-    label_b: "Candidate",
-    requested_games: 2,
-    completed_games: 0,
-    wins_a: 0,
-    draws: 0,
-    wins_b: 0,
-    score_a: null,
-    games: [],
+    game_id: "g1",
+    variant_a_is_white: true,
+    outcome: { status: "finished", result: "white_wins" },
+    started_at: "2026-01-01T00:00:00Z",
+    finished_at: "2026-01-01T00:00:30Z",
+    plies: 42,
     ...overrides,
   };
 }
@@ -33,15 +29,16 @@ function runningSnapshot(overrides: Partial<ExperimentSnapshot> = {}): Experimen
 describe("ExperimentView", () => {
   it("renders the current tally and progress once the snapshot loads", async () => {
     vi.mocked(labClient.getExperiment).mockResolvedValue(
-      runningSnapshot({
+      experimentSnapshotFixture({
         status: "completed",
+        requested_games: 2,
         completed_games: 2,
         wins_a: 1,
         draws: 1,
         score_a: 0.75,
         games: [
-          { game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } },
-          { game_id: "g2", variant_a_is_white: false, outcome: { status: "finished", result: "draw" } },
+          game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } }),
+          game({ game_id: "g2", variant_a_is_white: false, outcome: { status: "finished", result: "draw" } }),
         ],
       }),
     );
@@ -55,13 +52,48 @@ describe("ExperimentView", () => {
     expect(screen.getByText(/^draw$/i)).toBeInTheDocument();
   });
 
-  it("clicking a game row calls onOpenGame with that game's id", async () => {
+  it("renders the stats summary (avg duration, avg plies, games/hour)", async () => {
     vi.mocked(labClient.getExperiment).mockResolvedValue(
-      runningSnapshot({
+      experimentSnapshotFixture({
         status: "completed",
         completed_games: 1,
         wins_a: 1,
-        games: [{ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } }],
+        games: [game()],
+        stats: {
+          avg_game_duration_ms: 30_000,
+          avg_plies: 42,
+          runtime_ms: 45_000,
+          games_per_hour: 120,
+        },
+      }),
+    );
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    expect(await screen.findByText("30.0s")).toBeInTheDocument();
+    expect(screen.getByText("45.0s")).toBeInTheDocument();
+    expect(screen.getByText("42")).toBeInTheDocument();
+    expect(screen.getByText("120.0")).toBeInTheDocument();
+  });
+
+  it("shows a placeholder for stats that have no data yet", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(experimentSnapshotFixture());
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    await screen.findByText(/0 \/ 20 games/);
+    // avg duration / avg plies / games-per-hour all render "—" rather
+    // than a misleading 0 while nothing has settled yet.
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("clicking a game row calls onOpenGame with that game's id", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(
+      experimentSnapshotFixture({
+        status: "completed",
+        completed_games: 1,
+        wins_a: 1,
+        games: [game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } })],
       }),
     );
     const onOpenGame = vi.fn();
@@ -76,13 +108,15 @@ describe("ExperimentView", () => {
 
   it("keeps polling while the experiment is still running", async () => {
     vi.mocked(labClient.getExperiment)
-      .mockResolvedValueOnce(runningSnapshot({ completed_games: 0 }))
-      .mockResolvedValueOnce(runningSnapshot({ status: "completed", completed_games: 2, draws: 2, score_a: 0.5 }));
+      .mockResolvedValueOnce(experimentSnapshotFixture({ completed_games: 0 }))
+      .mockResolvedValueOnce(
+        experimentSnapshotFixture({ status: "completed", completed_games: 2, draws: 2, score_a: 0.5 }),
+      );
 
     render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
 
-    await screen.findByText("0 / 2 games");
-    await waitFor(() => expect(screen.getByText("2 / 2 games")).toBeInTheDocument(), { timeout: 3000 });
+    await screen.findByText("0 / 20 games");
+    await waitFor(() => expect(screen.getByText("2 / 20 games")).toBeInTheDocument(), { timeout: 3000 });
     expect(vi.mocked(labClient.getExperiment).mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Dashboard } from "./Dashboard";
 import * as labClient from "./labClient";
 import type { ExperimentSnapshot, GameSnapshot } from "./labClient";
+import { experimentSnapshotFixture } from "./testFixtures";
 
 vi.mock("./labClient", async () => {
   const actual = await vi.importActual<typeof labClient>("./labClient");
@@ -28,20 +29,7 @@ function game(overrides: Partial<GameSnapshot> = {}): GameSnapshot {
 }
 
 function experiment(overrides: Partial<ExperimentSnapshot> = {}): ExperimentSnapshot {
-  return {
-    id: "e1",
-    status: "running",
-    label_a: "A",
-    label_b: "B",
-    requested_games: 5,
-    completed_games: 0,
-    wins_a: 0,
-    draws: 0,
-    wins_b: 0,
-    score_a: null,
-    games: [],
-    ...overrides,
-  };
+  return experimentSnapshotFixture({ id: "e1", label_a: "A", label_b: "B", requested_games: 5, ...overrides });
 }
 
 describe("Dashboard", () => {
