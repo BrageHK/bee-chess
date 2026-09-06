@@ -143,7 +143,7 @@ describe("App navigation history", () => {
     render(<App />);
 
     const backLink = await screen.findByRole("button", { name: /back to experiment/i });
-    expect(await screen.findByText("historical line")).toBeInTheDocument();
+    expect(await screen.findByText(/historical line/)).toHaveTextContent("← historical line");
     await user.click(backLink);
 
     expect(await screen.findByText(/loading experiment/i)).toBeInTheDocument();
