@@ -137,7 +137,18 @@ pub struct Experiment {
     pub id: ExperimentId,
     pub spec: ExperimentSpec,
     pub games: Vec<ExperimentGame>,
+    /// Monotonically increasing creation order, used only by
+    /// `ExperimentStore::list` to sort newest-first -- an
+    /// `ExperimentId` is a random `Uuid::new_v4`, so it carries no
+    /// creation-order information of its own to sort by instead. Same
+    /// reasoning as `game::Game::created_seq`.
+    created_seq: u64,
 }
+
+/// Source for `Experiment::created_seq` -- see `game::next_game_seq`'s
+/// docs; same reasoning, a separate counter since experiments and
+/// games are ordered independently of each other.
+static NEXT_EXPERIMENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Experiment {
     fn new(id: ExperimentId, spec: ExperimentSpec) -> Self {
@@ -145,6 +156,7 @@ impl Experiment {
             id,
             spec,
             games: Vec::new(),
+            created_seq: NEXT_EXPERIMENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -265,6 +277,23 @@ impl ExperimentStore {
         snapshot
     }
 
+    /// Every experiment the server currently knows about, newest
+    /// first -- the shape `GET /api/experiments` returns for the
+    /// dashboard's running/past experiment lists. Same point-in-time,
+    /// no-persistence caveat as `GameStore::list`.
+    pub fn list(&self) -> Vec<ExperimentSnapshot> {
+        let experiments = self
+            .experiments
+            .lock()
+            .expect("experiment store mutex poisoned");
+        let mut ordered: Vec<&Experiment> = experiments.values().collect();
+        ordered.sort_by_key(|experiment| std::cmp::Reverse(experiment.created_seq));
+        ordered
+            .iter()
+            .map(|experiment| ExperimentSnapshot::from(*experiment))
+            .collect()
+    }
+
     pub fn snapshot(&self, id: ExperimentId) -> Option<ExperimentSnapshot> {
         self.experiments
             .lock()
@@ -349,7 +378,7 @@ pub async fn run_experiment(
 
         let white_info = engine_participant_info(white);
         let black_info = engine_participant_info(black);
-        let snapshot = store.create(white_info, black_info);
+        let snapshot = store.create_for_experiment(white_info, black_info, id);
         experiments.record_game_started(id, snapshot.id, variant_a_is_white);
 
         let slots = EngineSlots {
@@ -442,6 +471,24 @@ mod tests {
         assert_eq!(snapshot.completed_games, 0);
         assert_eq!(snapshot.score_a, None);
         assert!(snapshot.games.is_empty());
+    }
+
+    #[test]
+    fn list_returns_every_experiment_newest_first() {
+        let store = ExperimentStore::new();
+        let first = store.create(fake_spec(1));
+        let second = store.create(fake_spec(1));
+        let third = store.create(fake_spec(1));
+
+        let listed: Vec<ExperimentId> = store.list().into_iter().map(|e| e.id).collect();
+
+        assert_eq!(listed, vec![third.id, second.id, first.id]);
+    }
+
+    #[test]
+    fn list_is_empty_for_a_fresh_store() {
+        let store = ExperimentStore::new();
+        assert!(store.list().is_empty());
     }
 
     #[test]
@@ -627,5 +674,33 @@ mod tests {
             ExperimentStatus::Completed,
             "every game settled (by aborting), so there's nothing left to run"
         );
+    }
+
+    #[tokio::test]
+    async fn run_experiment_tags_every_game_it_creates_with_the_experiment_id() {
+        let game_store = GameStore::new();
+        let experiments = ExperimentStore::new();
+        let created = experiments.create(fake_spec(2));
+
+        run_experiment(
+            game_store.clone(),
+            experiments.clone(),
+            created.id,
+            fake_spec(2),
+        )
+        .await;
+
+        let snapshot = experiments.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.games.len(), 2);
+        for game in &snapshot.games {
+            let game_snapshot = game_store
+                .snapshot(game.game_id)
+                .expect("game should still exist in the game store");
+            assert_eq!(
+                game_snapshot.experiment_id,
+                Some(created.id),
+                "a game run_experiment created should link back to its own experiment"
+            );
+        }
     }
 }

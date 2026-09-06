@@ -80,12 +80,15 @@ struct ApiState {
 
 pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
     Router::new()
-        .route("/api/games", post(create_game))
+        .route("/api/games", get(list_games).post(create_game))
         .route("/api/games/{id}", get(get_game))
         .route("/api/games/{id}/moves", post(apply_move))
         .route("/ws/games/{id}", get(game_events_ws))
         .route("/api/engines/{name}/options", get(get_engine_options))
-        .route("/api/experiments", post(create_experiment))
+        .route(
+            "/api/experiments",
+            get(list_experiments).post(create_experiment),
+        )
         .route("/api/experiments/{id}", get(get_experiment))
         .with_state(ApiState {
             store,
@@ -248,6 +251,13 @@ async fn create_experiment(
     (StatusCode::CREATED, Json(snapshot)).into_response()
 }
 
+/// `GET /api/experiments`: every experiment the server currently knows
+/// about, newest first -- same "one list, filter client-side by
+/// status" reasoning as `list_games`.
+async fn list_experiments(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(state.experiments.list())
+}
+
 async fn get_experiment(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -403,6 +413,14 @@ fn participant_info(participant: &Option<ParticipantRequest>) -> ParticipantInfo
             debug: participant.debug(),
         },
     }
+}
+
+/// `GET /api/games`: every game the server currently knows about,
+/// newest first -- the dashboard's running/past game lists filter this
+/// client-side by `status` rather than the server offering separate
+/// endpoints for each, since it's the same underlying list either way.
+async fn list_games(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(state.store.list())
 }
 
 async fn get_game(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -576,6 +594,7 @@ impl ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::GameStatus;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
@@ -587,6 +606,181 @@ mod tests {
             .await
             .expect("read body");
         serde_json::from_slice(&bytes).expect("valid JSON body")
+    }
+
+    #[tokio::test]
+    async fn get_games_lists_every_created_game_newest_first() {
+        let store = GameStore::new();
+        let app = router(store.clone(), EngineRegistry::new());
+
+        let first = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let second = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/games")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let ids: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec![second.id.to_string(), first.id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_games_is_empty_for_a_fresh_server() {
+        let app = router(GameStore::new(), EngineRegistry::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/games")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_experiments_lists_every_created_experiment_newest_first() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let first = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/experiments")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "engine": "fake",
+                                "variant_a": {"label": "A1"},
+                                "variant_b": {"label": "B1"},
+                                "games": 1,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let second = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/experiments")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "engine": "fake",
+                                "variant_a": {"label": "A2"},
+                                "variant_b": {"label": "B2"},
+                                "games": 1,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/experiments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let ids: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                second["id"].as_str().unwrap(),
+                first["id"].as_str().unwrap()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_game_created_by_an_experiment_carries_its_experiment_id() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let store = GameStore::new();
+        let app = router(store.clone(), registry);
+
+        let created = body_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experiments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "engine": "fake",
+                            "variant_a": {"label": "A"},
+                            "variant_b": {"label": "B"},
+                            "games": 1,
+                            "move_time_ms": 20,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let experiment_id = created["id"].as_str().unwrap().to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let games = store.list();
+            if let Some(game) = games
+                .iter()
+                .find(|g| g.experiment_id.map(|id| id.to_string()) == Some(experiment_id.clone()))
+            {
+                assert!(!game.moves.is_empty() || game.status != GameStatus::Running);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no game tagged with this experiment appeared in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
