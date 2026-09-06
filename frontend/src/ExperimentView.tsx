@@ -108,6 +108,16 @@ export function ExperimentView({
         </PanelBody>
       </Panel>
 
+      <Panel className="w-full">
+        <PanelHeader>Stats</PanelHeader>
+        <PanelBody className="grid grid-cols-4 gap-2 text-center font-mono text-sm">
+          <Stat label="Avg game length" value={formatDurationSeconds(snapshot.stats.avg_game_duration_ms)} />
+          <Stat label="Avg plies" value={formatRounded(snapshot.stats.avg_plies)} />
+          <Stat label="Runtime" value={formatDurationSeconds(snapshot.stats.runtime_ms)} />
+          <Stat label="Games/hour" value={formatOneDecimal(snapshot.stats.games_per_hour)} />
+        </PanelBody>
+      </Panel>
+
       <Panel className="w-full text-left">
         <PanelHeader>Games</PanelHeader>
         <PanelBody className="grid gap-1 p-0">
@@ -122,6 +132,7 @@ export function ExperimentView({
               <span>
                 #{index + 1} — {game.variant_a_is_white ? snapshot.label_a : snapshot.label_b} (white) vs{" "}
                 {game.variant_a_is_white ? snapshot.label_b : snapshot.label_a} (black)
+                {game.plies !== null && <span className="text-subtle"> · {game.plies} plies</span>}
               </span>
               <OutcomeBadge outcome={game.outcome} />
             </button>
@@ -132,6 +143,22 @@ export function ExperimentView({
       <Button onClick={onBackToSetup}>New experiment</Button>
     </Stack>
   );
+}
+
+/** `null`/`undefined` render as "—" throughout this view -- see
+ * `ExperimentStats`'s own docs on why an average with no data yet is
+ * `null` rather than a misleading `0`. */
+function formatDurationSeconds(ms: number | null): string {
+  if (ms === null) return "—";
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatRounded(value: number | null): string {
+  return value === null ? "—" : String(Math.round(value));
+}
+
+function formatOneDecimal(value: number | null): string {
+  return value === null ? "—" : value.toFixed(1);
 }
 
 function Stat({ label, value }: { label: string; value: string | number }) {

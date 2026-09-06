@@ -116,6 +116,33 @@ export interface ExperimentGame {
   game_id: string;
   variant_a_is_white: boolean;
   outcome: GameOutcome;
+  started_at: string;
+  /** `null` while the game is still running. */
+  finished_at: string | null;
+  /** `null` for a still-running game, or one that aborted before a
+   * final snapshot was available -- see the Rust type's own docs. */
+  plies: number | null;
+}
+
+/** Mirrors `lab::experiment::ExperimentMetadata`'s JSON shape exactly
+ * -- enough about how/when an experiment ran to make its numbers
+ * interpretable again later. */
+export interface ExperimentMetadata {
+  lab_git_commit: string;
+  variant_a_argv: string[];
+  variant_b_argv: string[];
+  started_at: string;
+  finished_at: string | null;
+}
+
+/** Mirrors `lab::experiment::ExperimentStats`'s JSON shape exactly.
+ * Every average is `null` (not `0`) with no settled games yet, same
+ * reasoning as `ExperimentSnapshot.score_a`. */
+export interface ExperimentStats {
+  avg_game_duration_ms: number | null;
+  avg_plies: number | null;
+  runtime_ms: number;
+  games_per_hour: number | null;
 }
 
 /** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly
@@ -137,6 +164,8 @@ export interface ExperimentSnapshot {
   wins_b: number;
   score_a: number | null;
   games: ExperimentGame[];
+  metadata: ExperimentMetadata;
+  stats: ExperimentStats;
 }
 
 class LabError extends Error {}

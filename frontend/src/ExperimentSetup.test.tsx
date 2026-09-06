@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ExperimentSetup } from "./ExperimentSetup";
 import * as labClient from "./labClient";
+import { experimentSnapshotFixture } from "./testFixtures";
 
 vi.mock("./labClient", async () => {
   const actual = await vi.importActual<typeof labClient>("./labClient");
@@ -15,19 +16,7 @@ vi.mock("./labClient", async () => {
 
 describe("ExperimentSetup", () => {
   it("starts with Baseline/Candidate labels and calls onStarted with the new experiment's id", async () => {
-    vi.mocked(labClient.createExperiment).mockResolvedValue({
-      id: "exp-1",
-      status: "running",
-      label_a: "Baseline",
-      label_b: "Candidate",
-      requested_games: 20,
-      completed_games: 0,
-      wins_a: 0,
-      draws: 0,
-      wins_b: 0,
-      score_a: null,
-      games: [],
-    });
+    vi.mocked(labClient.createExperiment).mockResolvedValue(experimentSnapshotFixture());
     const onStarted = vi.fn();
     const user = userEvent.setup();
 
