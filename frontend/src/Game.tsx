@@ -276,6 +276,14 @@ export function Game({
           ← Back to experiment
         </Button>
       )}
+      {snapshot && (snapshot.white_clock_ms !== null || snapshot.black_clock_ms !== null) && (
+        <GameClocks
+          whiteName={nameFor("white")}
+          blackName={nameFor("black")}
+          whiteClockMs={snapshot.white_clock_ms}
+          blackClockMs={snapshot.black_clock_ms}
+        />
+      )}
       <Inline gap={2} align="start" className="justify-center">
         {participantInfoFor("white")?.kind === "engine" && (
           <EvalBar color="white" subscribe={whiteLogSubscribe} />
@@ -311,6 +319,44 @@ export function Game({
 /** Renders the stats + log panels for one slot, if it's engine-driven
  * -- a human slot has no engine traffic and so nothing to show here.
  * `info` is `null` until the initial snapshot arrives. */
+/** Renders each side's live remaining clock, server-authoritative --
+ * see `GameSnapshot.white_clock_ms`/`black_clock_ms`'s docs: these
+ * numbers only update when a new snapshot arrives (a move, or a live
+ * `GameEvent`), never ticked down client-side, so this deliberately
+ * does not animate between snapshots. Only rendered at all for a
+ * `fischer` game (see the caller) -- a `move_time` game has no clock
+ * to show. */
+function GameClocks({
+  whiteName,
+  blackName,
+  whiteClockMs,
+  blackClockMs,
+}: {
+  whiteName: string;
+  blackName: string;
+  whiteClockMs: number | null;
+  blackClockMs: number | null;
+}) {
+  return (
+    <Inline gap={4} align="center" className="justify-center font-mono text-sm">
+      <span>
+        {whiteName} {formatClock(whiteClockMs)}
+      </span>
+      <span>
+        {blackName} {formatClock(blackClockMs)}
+      </span>
+    </Inline>
+  );
+}
+
+function formatClock(ms: number | null): string {
+  if (ms === null) return "—";
+  const totalSeconds = Math.max(0, ms) / 1000;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = (totalSeconds % 60).toFixed(1).padStart(4, "0");
+  return `${minutes}:${seconds}`;
+}
+
 function BotPanels({
   color,
   info,

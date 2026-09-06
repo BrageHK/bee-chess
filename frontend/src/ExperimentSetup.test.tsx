@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ExperimentSetup } from "./ExperimentSetup";
@@ -33,10 +33,39 @@ describe("ExperimentSetup", () => {
         variantB: { label: "Candidate", options: {} },
         games: 20,
         concurrency: 2,
-        moveTimeMs: 100,
+        timeControl: { type: "move_time", move_time_ms: 100 },
       }),
     );
     expect(onStarted).toHaveBeenCalledWith("exp-1");
+  });
+
+  it("switching to Fischer sends initial/increment in milliseconds", async () => {
+    vi.mocked(labClient.createExperiment).mockResolvedValue(experimentSnapshotFixture());
+    const user = userEvent.setup();
+
+    const { container } = render(<ExperimentSetup onStarted={() => {}} />);
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Time control" }), "fischer");
+    const initial = screen.getByRole("spinbutton", { name: "Initial (minutes)" });
+    await user.clear(initial);
+    await user.type(initial, "3");
+    const increment = screen.getByRole("spinbutton", { name: "Increment (seconds)" });
+    await user.clear(increment);
+    await user.type(increment, "2");
+
+    // `user.click`/a native `<button type="submit">` click don't
+    // reliably trigger form submission in jsdom once a `<select>` in
+    // the same form has been interacted with beforehand (a jsdom
+    // quirk, not component behavior -- `fireEvent.submit` and
+    // `form.requestSubmit()` both still work correctly and exercise
+    // the exact same `onSubmit` handler).
+    fireEvent.submit(container.querySelector("form")!);
+
+    expect(labClient.createExperiment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeControl: { type: "fischer", initial_ms: 180_000, increment_ms: 2_000 },
+      }),
+    );
   });
 
   it("disables the submit button while a label is blank", async () => {

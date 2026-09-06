@@ -24,6 +24,9 @@ function game(overrides: Partial<GameSnapshot> = {}): GameSnapshot {
     white: { kind: "human" },
     black: { kind: "human" },
     experiment_id: null,
+    time_control: { type: "move_time", move_time_ms: 100 },
+    white_clock_ms: null,
+    black_clock_ms: null,
     status: "running",
     ...overrides,
   } as GameSnapshot;

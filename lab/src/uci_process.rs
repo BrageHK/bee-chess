@@ -21,6 +21,48 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+/// What to actually send as a `go` command's arguments -- the UCI-text
+/// form of `crate::game::TimeControl`, resolved for one side's move
+/// request. Kept separate from `TimeControl` itself since `TimeControl`
+/// describes a whole game's *policy* while this describes one
+/// concrete `go`, already carrying that side's authoritative current
+/// clock (see `game::GameClock`) rather than a policy to derive it
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoSpec {
+    /// `go movetime <budget_ms>` -- a fixed thinking budget,
+    /// independent of any clock. Used for `TimeControl::MoveTime`
+    /// games.
+    MoveTime { budget_ms: u64 },
+    /// `go wtime <..> btime <..> winc <..> binc <..>` -- both sides'
+    /// authoritative remaining clocks and increments, exactly as a
+    /// real UCI GUI would send them. Used for `TimeControl::Fischer`
+    /// games; `Engine::search_with_clock` (bee-engine) is what
+    /// resolves this down to the mover's own side.
+    Clock {
+        white_time_ms: u64,
+        black_time_ms: u64,
+        white_increment_ms: u64,
+        black_increment_ms: u64,
+    },
+}
+
+impl GoSpec {
+    fn to_go_line(self) -> String {
+        match self {
+            GoSpec::MoveTime { budget_ms } => format!("go movetime {budget_ms}"),
+            GoSpec::Clock {
+                white_time_ms,
+                black_time_ms,
+                white_increment_ms,
+                black_increment_ms,
+            } => format!(
+                "go wtime {white_time_ms} btime {black_time_ms} winc {white_increment_ms} binc {black_increment_ms}"
+            ),
+        }
+    }
+}
+
 /// Which direction a line of raw UCI traffic went -- passed to
 /// `UciProcess`'s `on_line` callback so a caller building an event
 /// stream (see `game::run_engine_loop`, #69's 69c-1a) can tag it
@@ -281,13 +323,18 @@ impl UciProcess {
 
     /// Sets the position to `startpos` plus `moves` (UCI long
     /// algebraic notation, e.g. `["e2e4", "e7e5"]`), then asks for a
-    /// move with a `budget_ms` time limit, returning the move it
-    /// picks (or `None` for `bestmove 0000`, meaning no legal move --
-    /// checkmate/stalemate, which the engine itself detected).
-    pub async fn best_move(
+    /// move under `go_spec` -- the real UCI clock fields (`wtime`/
+    /// `btime`/`winc`/`binc`) for `TimeControl::Fischer` games, or a
+    /// fixed `movetime` for `TimeControl::MoveTime` ones (see
+    /// `crate::game::TimeControl`) -- returning the move it picks (or
+    /// `None` for `bestmove 0000`, meaning no legal move -- checkmate/
+    /// stalemate, which the engine itself detected). This is the one
+    /// place that turns a `GoSpec` into the actual `go` line text sent
+    /// to the engine.
+    pub async fn go_for_move(
         &mut self,
         moves: &[String],
-        budget_ms: u64,
+        go_spec: &GoSpec,
     ) -> Result<Option<String>, UciProcessError> {
         let position_cmd = if moves.is_empty() {
             "position startpos".to_string()
@@ -295,7 +342,7 @@ impl UciProcess {
             format!("position startpos moves {}", moves.join(" "))
         };
         self.send(&position_cmd).await?;
-        self.send(&format!("go movetime {budget_ms}")).await?;
+        self.send(&go_spec.to_go_line()).await?;
 
         loop {
             let line = self.read_line().await?;
@@ -386,6 +433,28 @@ mod tests {
     /// not any particular engine's actual chess strength.
     fn fake_engine_argv(script: &str) -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+    }
+
+    #[test]
+    fn go_spec_move_time_formats_as_go_movetime() {
+        assert_eq!(
+            GoSpec::MoveTime { budget_ms: 250 }.to_go_line(),
+            "go movetime 250"
+        );
+    }
+
+    #[test]
+    fn go_spec_clock_formats_all_four_fields() {
+        assert_eq!(
+            GoSpec::Clock {
+                white_time_ms: 60_000,
+                black_time_ms: 55_000,
+                white_increment_ms: 1_000,
+                black_increment_ms: 2_000,
+            }
+            .to_go_line(),
+            "go wtime 60000 btime 55000 winc 1000 binc 2000"
+        );
     }
 
     #[test]
@@ -536,7 +605,7 @@ mod tests {
             .expect("handshake should succeed");
 
         let mv = process
-            .best_move(&[], 100)
+            .go_for_move(&[], &GoSpec::MoveTime { budget_ms: 100 })
             .await
             .expect("should get a bestmove");
         assert_eq!(mv, Some("e2e4".to_string()));
@@ -558,7 +627,7 @@ mod tests {
             .expect("handshake should succeed");
 
         let mv = process
-            .best_move(&[], 100)
+            .go_for_move(&[], &GoSpec::MoveTime { budget_ms: 100 })
             .await
             .expect("should get a bestmove");
         assert_eq!(mv, Some("e2e4".to_string()));
@@ -578,7 +647,7 @@ mod tests {
             .expect("handshake should succeed");
 
         let mv = process
-            .best_move(&[], 100)
+            .go_for_move(&[], &GoSpec::MoveTime { budget_ms: 100 })
             .await
             .expect("should get a bestmove");
         assert_eq!(mv, None);
@@ -604,7 +673,9 @@ mod tests {
             .await
             .expect("handshake should succeed");
 
-        let result = process.best_move(&[], 100).await;
+        let result = process
+            .go_for_move(&[], &GoSpec::MoveTime { budget_ms: 100 })
+            .await;
         // Two distinct real races can both legitimately fire here,
         // depending on exactly when the already-`exit 0`'d process's
         // pipes actually close relative to our writes: `read_line`
@@ -652,7 +723,7 @@ mod tests {
         .expect("handshake should succeed");
 
         process
-            .best_move(&[], 100)
+            .go_for_move(&[], &GoSpec::MoveTime { budget_ms: 100 })
             .await
             .expect("should get a bestmove");
 
