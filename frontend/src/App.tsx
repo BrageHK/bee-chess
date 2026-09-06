@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { GameSetup } from "./GameSetup";
 import { Game, type GameSource } from "./Game";
+import { AppShell } from "./components/ui/AppShell";
+import { Toolbar } from "./components/ui/Toolbar";
 import "@lichess-org/chessground/assets/chessground.base.css";
 import "@lichess-org/chessground/assets/chessground.brown.css";
 import "@lichess-org/chessground/assets/chessground.cburnett.css";
@@ -52,44 +54,33 @@ export default function App() {
   }, [screen]);
 
   return (
-    <main
-      style={{
-        display: "grid",
-        // An explicit 1fr column (rather than relying on the default
-        // auto-sized implicit track) makes every child's available
-        // width equal to <main>'s own width, not the width of the
-        // widest child -- otherwise the grid track itself grows and
-        // shrinks with content, and everything centered inside it
-        // reflows along with it.
-        gridTemplateColumns: "1fr",
-        justifyItems: "center",
-        alignItems: "center",
-        gap: 8,
-        padding: 24,
-        textAlign: "center",
-        // Nothing here is meant to be copy-pasted, so a drag anywhere
-        // on the page (e.g. overshooting a piece drag past the board's
-        // edge) shouldn't fan out into a multi-element text selection
-        // (#52). UciLogPanel opts back in locally -- its raw traffic is
-        // worth copying for debugging.
-        userSelect: "none",
-      }}
-    >
-      <h1>Bee Chess</h1>
-      {screen.phase === "setup" ? (
-        <GameSetup
-          onStart={(white, black) =>
-            setScreen({ phase: "playing", source: { kind: "start", white, black }, gameSeq: Date.now() })
-          }
-        />
-      ) : (
-        <Game
-          key={screen.gameSeq}
-          source={screen.source}
-          onGameCreated={(gameId) => setGameIdInUrl(gameId)}
-          onBackToSetup={() => setScreen({ phase: "setup" })}
-        />
-      )}
+    // Nothing here is meant to be copy-pasted, so a drag anywhere on
+    // the page (e.g. overshooting a piece drag past the board's edge)
+    // shouldn't fan out into a multi-element text selection (#52).
+    // UciLogPanel opts back in locally -- its raw traffic is worth
+    // copying for debugging.
+    <main className="select-none">
+      <AppShell>
+        <Toolbar>
+          <h1 className="text-xl font-medium">Bee Chess</h1>
+        </Toolbar>
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
+          {screen.phase === "setup" ? (
+            <GameSetup
+              onStart={(white, black) =>
+                setScreen({ phase: "playing", source: { kind: "start", white, black }, gameSeq: Date.now() })
+              }
+            />
+          ) : (
+            <Game
+              key={screen.gameSeq}
+              source={screen.source}
+              onGameCreated={(gameId) => setGameIdInUrl(gameId)}
+              onBackToSetup={() => setScreen({ phase: "setup" })}
+            />
+          )}
+        </div>
+      </AppShell>
     </main>
   );
 }

@@ -7,6 +7,8 @@ import { Chessground } from "./Chessground";
 import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
 import { EvalBar } from "./EvalBar";
+import { Button } from "./components/ui/Button";
+import { Inline, Stack } from "./components/ui/Stack";
 import type { UciLogLine } from "./engine";
 import type { Participant } from "./participant";
 import {
@@ -229,10 +231,10 @@ export function Game({
 
   if (unavailable) {
     return (
-      <section style={{ display: "grid", gap: 8, textAlign: "center" }}>
-        <p>{unavailable}</p>
-        <button onClick={onBackToSetup}>Back to setup</button>
-      </section>
+      <Stack gap={2} align="center" className="text-center">
+        <p className="m-0 text-sm text-text">{unavailable}</p>
+        <Button onClick={onBackToSetup}>Back to setup</Button>
+      </Stack>
     );
   }
 
@@ -246,20 +248,11 @@ export function Game({
   const finished = snapshot ? snapshot.status !== "running" : false;
 
   return (
-    <section
-      style={{
-        display: "grid",
-        gridTemplateColumns: "1fr",
-        justifyItems: "center",
-        alignItems: "center",
-        gap: 8,
-        textAlign: "center",
-      }}
-    >
-      <h1>
+    <Stack gap={2} align="center" className="w-full text-center">
+      <h1 className="text-2xl font-medium">
         {nameFor("white")} (white) vs {nameFor("black")} (black)
       </h1>
-      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+      <Inline gap={2} align="start" className="justify-center">
         {participantInfoFor("white")?.kind === "engine" && (
           <EvalBar color="white" subscribe={logSubscribeFor(logListenersRef, "white")} />
         )}
@@ -282,12 +275,12 @@ export function Game({
         {participantInfoFor("black")?.kind === "engine" && (
           <EvalBar color="black" subscribe={logSubscribeFor(logListenersRef, "black")} />
         )}
-      </div>
-      <p>{status}</p>
-      {finished && <button onClick={onBackToSetup}>New game</button>}
+      </Inline>
+      <p className="m-0 text-sm text-muted">{status}</p>
+      {finished && <Button onClick={onBackToSetup}>New game</Button>}
       <BotPanels color="white" info={participantInfoFor("white")} logListenersRef={logListenersRef} />
       <BotPanels color="black" info={participantInfoFor("black")} logListenersRef={logListenersRef} />
-    </section>
+    </Stack>
   );
 }
 
@@ -308,10 +301,10 @@ function BotPanels({
   const subscribe = logSubscribeFor(logListenersRef, color);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%", maxWidth: 900 }}>
+    <Stack gap={2} className="w-full max-w-[900px]">
       <SearchStatsPanel name={`${info.name} (${color})`} subscribe={subscribe} />
       <UciLogPanel name={`${info.name} (${color})`} subscribe={subscribe} />
-    </div>
+    </Stack>
   );
 }
 
