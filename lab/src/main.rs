@@ -41,6 +41,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 mod api;
+mod experiment;
 mod game;
 mod uci_process;
 
