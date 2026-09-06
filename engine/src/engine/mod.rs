@@ -504,9 +504,20 @@ impl Engine {
     /// no real search depth to report, so a `depth 0` `info` line
     /// would only misrepresent a book move as some kind of search
     /// result.
+    ///
+    /// `stop` (see `crate::search::StopSignal`'s docs) lets a caller
+    /// cancel this search from another thread -- the UCI event loop's
+    /// `stop`/shutdown handling, primarily. A fresh, never-requested
+    /// `StopSignal::new()` behaves exactly like this method did before
+    /// `stop` existed. Since `search::search_iterative_with_stop` can
+    /// abort even depth 1 once a stop is possible at all, this falls
+    /// back to the current position's first legal move -- exactly the
+    /// same safety net `search_with_clock` already relies on -- if
+    /// `stop` was already requested before even one depth completed.
     pub fn search_for_time(
         &mut self,
         budget: std::time::Duration,
+        stop: search::StopSignal,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         let book_result = match self.evaluator {
@@ -517,32 +528,51 @@ impl Engine {
         if let Some(result) = book_result {
             return result;
         }
-        match self.evaluator {
-            EvaluatorKind::Experimental => search::search_iterative_with_options(
+
+        let fallback = self.position.generate_legal_moves().into_iter().next();
+        let searched = match self.evaluator {
+            EvaluatorKind::Experimental => search::search_iterative_with_stop(
                 &mut self.position,
                 budget,
                 &ExperimentalEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
-            EvaluatorKind::Material => search::search_iterative_with_options(
+            EvaluatorKind::Material => search::search_iterative_with_stop(
                 &mut self.position,
                 budget,
                 &MaterialEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
-            EvaluatorKind::Positional => search::search_iterative_with_options(
+            EvaluatorKind::Positional => search::search_iterative_with_stop(
                 &mut self.position,
                 budget,
                 &PositionalEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
-        }
+        };
+
+        searched.unwrap_or_else(|| {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                "search stopped before depth 1 completed; playing the first legal move instead of a searched one",
+            );
+            SearchResult {
+                best_move: fallback,
+                score: 0,
+                nodes: 0,
+                depth: 0,
+                pv: fallback.into_iter().collect(),
+            }
+        })
     }
 
     /// Searches the current position under a real UCI clock -- `go
@@ -567,9 +597,17 @@ impl Engine {
     /// exactly like `search_for_time` -- a clean book hit returns
     /// immediately without consuming any of the clock budget computed
     /// here.
+    ///
+    /// `stop` (see `crate::search::StopSignal`'s docs) lets a caller
+    /// cancel this search from another thread, exactly like
+    /// `search_for_time`'s -- attached to both the soft and hard
+    /// deadlines (see `search_iterative_with_budget`'s docs), so a
+    /// UCI `stop` is indistinguishable from crossing the hard limit as
+    /// far as this method's own fallback handling is concerned.
     pub fn search_with_clock(
         &mut self,
         control: ClockTimeControl,
+        stop: search::StopSignal,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         let book_result = match self.evaluator {
@@ -591,6 +629,7 @@ impl Engine {
                 &ExperimentalEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
             EvaluatorKind::Material => search::search_iterative_with_budget(
@@ -599,6 +638,7 @@ impl Engine {
                 &MaterialEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
             EvaluatorKind::Positional => search::search_iterative_with_budget(
@@ -607,6 +647,7 @@ impl Engine {
                 &PositionalEvaluator,
                 &self.position_history,
                 self.search_options,
+                stop,
                 on_depth_complete,
             ),
         };
@@ -923,9 +964,13 @@ mod tests {
         engine.set_opening_book(OpeningBookKind::Cow);
         let mut depths_reported = Vec::new();
 
-        let result = engine.search_for_time(std::time::Duration::from_millis(50), |r| {
-            depths_reported.push(r.depth);
-        });
+        let result = engine.search_for_time(
+            std::time::Duration::from_millis(50),
+            search::StopSignal::new(),
+            |r| {
+                depths_reported.push(r.depth);
+            },
+        );
 
         assert!(
             depths_reported.is_empty(),
@@ -941,7 +986,11 @@ mod tests {
         let mut engine = Engine::new();
         let before = engine.position().clone();
 
-        let result = engine.search_for_time(std::time::Duration::from_millis(50), |_| {});
+        let result = engine.search_for_time(
+            std::time::Duration::from_millis(50),
+            search::StopSignal::new(),
+            |_| {},
+        );
 
         assert!(result.best_move.is_some());
         assert_eq!(engine.position(), &before);
@@ -952,9 +1001,13 @@ mod tests {
         let mut engine = Engine::new();
         let mut depths_seen = Vec::new();
 
-        engine.search_for_time(std::time::Duration::from_millis(200), |result| {
-            depths_seen.push(result.depth);
-        });
+        engine.search_for_time(
+            std::time::Duration::from_millis(200),
+            search::StopSignal::new(),
+            |result| {
+                depths_seen.push(result.depth);
+            },
+        );
 
         assert!(
             depths_seen.len() >= 2,
@@ -973,7 +1026,7 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, |_| {});
+        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some());
         assert_eq!(engine.position(), &before);
@@ -992,7 +1045,7 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, |_| {});
+        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some(), "must still return a legal move");
         assert_eq!(
@@ -1015,7 +1068,7 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, |_| {});
+        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         assert!(result.best_move.is_some());
         assert_eq!(result.depth, 0);
@@ -1031,7 +1084,7 @@ mod tests {
             moves_to_go: None,
         };
 
-        let result = engine.search_with_clock(control, |_| {});
+        let result = engine.search_with_clock(control, search::StopSignal::new(), |_| {});
 
         let best_move = result.best_move.expect("should hit the book");
         assert_eq!(best_move.from(), "e2".parse().unwrap());
