@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { UciLogLine } from "./engine";
 import { formatCount, formatNps, formatScore, parseUciInfo, type UciInfo } from "./uciInfo";
+import { Panel, PanelBody, PanelHeader } from "./components/ui/Panel";
 
 /**
  * Live search-stats panel: the most recently reported depth/eval/
@@ -34,20 +35,16 @@ export function SearchStatsPanel({ name, subscribe }: SearchStatsPanelProps) {
   const score = formatScore(info);
 
   return (
-    <section style={{ display: "grid", gap: 4, flex: "1 1 0", minWidth: 0, textAlign: "left" }}>
-      <strong>{name}</strong>
-      <div
-        style={{
-          background: "#111",
-          color: "#ddd",
-          fontFamily: "monospace",
-          fontSize: 12,
-          padding: 8,
-          borderRadius: 4,
-          display: "grid",
-          gridTemplateColumns: `${ROW_LABEL_WIDTH}px 1fr`,
-          rowGap: 2,
-        }}
+    // See UciLogPanel's comment on min-w-0 + flex-1 -- same reasoning
+    // applies here (a long PV shouldn't force this panel wider than
+    // its share of the row).
+    <Panel className="min-w-0 flex-1 text-left">
+      <PanelHeader>
+        <strong className="font-medium text-text">{name}</strong>
+      </PanelHeader>
+      <PanelBody
+        className="grid bg-surface-subtle font-mono text-xs"
+        style={{ gridTemplateColumns: `${ROW_LABEL_WIDTH}px 1fr`, rowGap: 2 }}
       >
         <Row label="Depth" value={formatDepth(info)} />
         <Row label="Eval" value={score} />
@@ -59,8 +56,8 @@ export function SearchStatsPanel({ name, subscribe }: SearchStatsPanelProps) {
           value={info.pv && info.pv.length > 0 ? info.pv.join(" ") : undefined}
           truncate
         />
-      </div>
-    </section>
+      </PanelBody>
+    </Panel>
   );
 }
 
@@ -80,14 +77,8 @@ function Row({
 }) {
   return (
     <>
-      <span style={{ color: "#777" }}>{label}</span>
-      <span
-        style={
-          truncate
-            ? { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }
-            : undefined
-        }
-      >
+      <span className="text-subtle">{label}</span>
+      <span className={truncate ? "overflow-hidden text-ellipsis whitespace-nowrap" : undefined}>
         {value ?? "—"}
       </span>
     </>

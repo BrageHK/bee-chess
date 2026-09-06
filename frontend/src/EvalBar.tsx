@@ -39,34 +39,20 @@ export function EvalBar({ color, subscribe }: EvalBarProps) {
   const label = formatScore(white);
 
   return (
+    // Fixed light/dark colors, not theme tokens -- like chessground's
+    // own piece/board colors, this bar is a literal light-vs-dark
+    // visual metaphor (white's advantage vs. black's) rather than page
+    // chrome, so it shouldn't flip with the app's light/dark theme.
     <div
       title="Stockfish's evaluation, from white's perspective"
-      style={{
-        width: 28,
-        height: HEIGHT,
-        display: "flex",
-        flexDirection: "column-reverse",
-        background: "#3a3a3a",
-        borderRadius: 4,
-        overflow: "hidden",
-        flexShrink: 0,
-      }}
+      className="flex w-7 shrink-0 flex-col-reverse overflow-hidden rounded-md bg-[#3a3a3a]"
+      style={{ height: HEIGHT }}
     >
       <div
-        style={{
-          height: `${whiteFraction * 100}%`,
-          background: "#f0f0f0",
-          display: "flex",
-          alignItems: "flex-start",
-          justifyContent: "center",
-          transition: "height 200ms ease-out",
-        }}
+        className="flex items-start justify-center bg-[#f0f0f0] transition-[height] duration-200 ease-out"
+        style={{ height: `${whiteFraction * 100}%` }}
       >
-        {label && (
-          <span style={{ fontSize: 10, fontFamily: "monospace", color: "#111", padding: "2px 0" }}>
-            {label}
-          </span>
-        )}
+        {label && <span className="py-0.5 font-mono text-[10px] text-[#111]">{label}</span>}
       </div>
     </div>
   );
