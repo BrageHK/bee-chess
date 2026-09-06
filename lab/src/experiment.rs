@@ -148,6 +148,23 @@ pub struct ExperimentGame {
     /// did) -- see the module docs' pairing scheme.
     pub variant_a_is_white: bool,
     pub outcome: GameOutcome,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the game is still running -- set alongside
+    /// `outcome` once `run_experiment` sees it settle. Together with
+    /// `started_at`, this is what `ExperimentStats` derives average
+    /// game duration from, rather than re-deriving it from
+    /// `ExperimentMetadata`'s experiment-wide `started_at`/
+    /// `finished_at` (which span every game plus the gaps between
+    /// them, not any one game's own duration).
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Plies played, i.e. `GameSnapshot::moves.len()` at the point the
+    /// game settled -- `None` for a game that's still running or that
+    /// aborted before recording a final snapshot was possible. Stored
+    /// here rather than re-fetched from `GameStore` at stats time so
+    /// `ExperimentStats` doesn't depend on the underlying game still
+    /// existing in memory (there's no persistence yet -- see
+    /// `GameStore`'s docs).
+    pub plies: Option<usize>,
 }
 
 /// How one experiment game ended, if it has -- deliberately distinct
@@ -282,6 +299,92 @@ pub struct ExperimentSnapshot {
     pub score_a: Option<f64>,
     pub games: Vec<ExperimentGame>,
     pub metadata: ExperimentMetadata,
+    pub stats: ExperimentStats,
+}
+
+/// Summary numbers a human skimming an experiment actually wants,
+/// beyond the raw win/draw/loss tally: how long games take, how far
+/// they go, and how fast the whole run is moving -- the first slice
+/// of the strength-measurement milestone (before an estimated Elo
+/// delta, confidence interval, or SPRT, which build on this same
+/// `ExperimentSnapshot` in later PRs).
+///
+/// Every average here is `None` rather than `0.0`/`NaN` when there's
+/// nothing to average yet (no game has settled), for the same reason
+/// `score_a` is `Option` -- a `0.0` would misleadingly claim "instant
+/// games," not "no data yet."
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExperimentStats {
+    /// Mean wall-clock duration of a settled game (one with both
+    /// `started_at` and `finished_at` -- i.e. `Finished` or `Aborted`,
+    /// not `Pending`), in milliseconds. Aborted games are included:
+    /// an abort still took real wall-clock time, even though it
+    /// contributes no chess result to `wins_a`/`draws`/`wins_b`.
+    pub avg_game_duration_ms: Option<f64>,
+    /// Mean plies played per settled game with a known ply count --
+    /// see `ExperimentGame::plies`'s docs on why an aborted game may
+    /// have `None` here instead of a real count.
+    pub avg_plies: Option<f64>,
+    /// Wall-clock time since the experiment started: `finished_at -
+    /// started_at` once complete, or `now - started_at` while still
+    /// running -- a `None` here (rather than "N/A" for a running
+    /// experiment) would be a strictly less useful answer to "how
+    /// long has this been going," so this is never `None`.
+    pub runtime_ms: i64,
+    /// Settled games (see `avg_game_duration_ms`) per hour of
+    /// `runtime_ms` so far -- `None` if no game has settled yet or
+    /// `runtime_ms` rounds to zero (can't meaningfully divide by it).
+    pub games_per_hour: Option<f64>,
+}
+
+impl ExperimentStats {
+    fn compute(experiment: &Experiment) -> Self {
+        let settled: Vec<&ExperimentGame> = experiment
+            .games
+            .iter()
+            .filter(|g| g.outcome.is_settled())
+            .collect();
+
+        let durations_ms: Vec<i64> = settled
+            .iter()
+            .filter_map(|g| {
+                g.finished_at
+                    .map(|finished| (finished - g.started_at).num_milliseconds())
+            })
+            .collect();
+        let avg_game_duration_ms = mean(&durations_ms);
+
+        let plies: Vec<usize> = settled.iter().filter_map(|g| g.plies).collect();
+        let avg_plies = mean(&plies.iter().map(|&p| p as i64).collect::<Vec<_>>());
+
+        let runtime_ms = (experiment.metadata.finished_at.unwrap_or_else(Utc::now)
+            - experiment.metadata.started_at)
+            .num_milliseconds();
+
+        let games_per_hour = if settled.is_empty() || runtime_ms <= 0 {
+            None
+        } else {
+            let hours = runtime_ms as f64 / 3_600_000.0;
+            Some(settled.len() as f64 / hours)
+        };
+
+        ExperimentStats {
+            avg_game_duration_ms,
+            avg_plies,
+            runtime_ms,
+            games_per_hour,
+        }
+    }
+}
+
+/// Arithmetic mean of `values`, or `None` for an empty slice -- shared
+/// by `ExperimentStats::compute`'s two averages rather than each
+/// hand-rolling "empty means None, else sum/len."
+fn mean(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<i64>() as f64 / values.len() as f64)
 }
 
 impl From<&Experiment> for ExperimentSnapshot {
@@ -306,6 +409,7 @@ impl From<&Experiment> for ExperimentSnapshot {
             score_a,
             games: experiment.games.clone(),
             metadata: experiment.metadata.clone(),
+            stats: ExperimentStats::compute(experiment),
         }
     }
 }
@@ -372,18 +476,29 @@ impl ExperimentStore {
                 game_id,
                 variant_a_is_white,
                 outcome: GameOutcome::Pending,
+                started_at: Utc::now(),
+                finished_at: None,
+                plies: None,
             });
         }
     }
 
     /// Records `game_id`'s final outcome (a real chess result or an
-    /// abort -- see `GameOutcome`) against `id`'s experiment. Silently
+    /// abort -- see `GameOutcome`), its ply count (`None` if a final
+    /// snapshot wasn't available -- see `ExperimentGame::plies`'s
+    /// docs), and its finish time, against `id`'s experiment. Silently
     /// does nothing if either the experiment or that particular game
     /// entry isn't found -- mirrors `GameStore::abort`'s "the caller
     /// shouldn't panic over state that vanished" stance; there's no
     /// persistence yet to make that likely, but nothing here should
     /// crash the orchestration task over it either.
-    fn record_game_outcome(&self, id: ExperimentId, game_id: GameId, outcome: GameOutcome) {
+    fn record_game_outcome(
+        &self,
+        id: ExperimentId,
+        game_id: GameId,
+        outcome: GameOutcome,
+        plies: Option<usize>,
+    ) {
         let mut experiments = self
             .experiments
             .lock()
@@ -393,6 +508,8 @@ impl ExperimentStore {
         };
         if let Some(game) = experiment.games.iter_mut().find(|g| g.game_id == game_id) {
             game.outcome = outcome;
+            game.finished_at = Some(Utc::now());
+            game.plies = plies;
         }
     }
 
@@ -476,7 +593,12 @@ pub async fn run_experiment(
                     unreachable!("run_engine_loop only returns once the game is no longer Running")
                 }
             };
-            experiments.record_game_outcome(id, snapshot.id, outcome);
+            experiments.record_game_outcome(
+                id,
+                snapshot.id,
+                outcome,
+                Some(final_snapshot.moves.len()),
+            );
         }
     }
 
@@ -565,6 +687,117 @@ mod tests {
     }
 
     #[test]
+    fn stats_are_none_with_no_settled_games_yet() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+
+        assert_eq!(created.stats.avg_game_duration_ms, None);
+        assert_eq!(created.stats.avg_plies, None);
+        assert_eq!(created.stats.games_per_hour, None);
+        assert!(created.stats.runtime_ms >= 0);
+    }
+
+    #[test]
+    fn avg_plies_averages_across_settled_games_only() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(3));
+        let a: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let b: GameId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+        let c: GameId = "33333333-3333-3333-3333-333333333333".parse().unwrap();
+
+        store.record_game_started(created.id, a, true);
+        store.record_game_outcome(
+            created.id,
+            a,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+            Some(40),
+        );
+        store.record_game_started(created.id, b, false);
+        store.record_game_outcome(
+            created.id,
+            b,
+            GameOutcome::Finished {
+                result: GameResult::Draw,
+            },
+            Some(80),
+        );
+        // A pending (still-running) game must not drag the average
+        // down/up with a phantom zero -- only settled games with a
+        // known ply count count.
+        store.record_game_started(created.id, c, true);
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(snapshot.stats.avg_plies, Some(60.0));
+    }
+
+    #[test]
+    fn avg_plies_excludes_an_aborted_game_with_no_known_ply_count() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(2));
+        let finished: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let aborted: GameId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+
+        store.record_game_started(created.id, finished, true);
+        store.record_game_outcome(
+            created.id,
+            finished,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+            Some(50),
+        );
+        store.record_game_started(created.id, aborted, false);
+        store.record_game_outcome(created.id, aborted, GameOutcome::Aborted, None);
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(
+            snapshot.stats.avg_plies,
+            Some(50.0),
+            "the aborted game's None ply count shouldn't count as 0"
+        );
+    }
+
+    #[test]
+    fn game_duration_and_runtime_are_recorded_in_real_wall_clock_time() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.record_game_outcome(
+            created.id,
+            game_id,
+            GameOutcome::Finished {
+                result: GameResult::Draw,
+            },
+            Some(10),
+        );
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        let avg_duration = snapshot
+            .stats
+            .avg_game_duration_ms
+            .expect("one settled game should produce a duration");
+        assert!(
+            avg_duration >= 5.0,
+            "should reflect the real ~5ms sleep, got {avg_duration}"
+        );
+        assert!(snapshot.stats.runtime_ms >= 5);
+        let expected_games_per_hour = 3_600_000.0 / snapshot.stats.runtime_ms as f64;
+        let actual_games_per_hour = snapshot
+            .stats
+            .games_per_hour
+            .expect("one settled game should give a rate");
+        assert!(
+            (actual_games_per_hour - expected_games_per_hour).abs() < 1e-6,
+            "expected ~{expected_games_per_hour}, got {actual_games_per_hour}"
+        );
+    }
+
+    #[test]
     fn list_returns_every_experiment_newest_first() {
         let store = ExperimentStore::new();
         let first = store.create(fake_spec(1));
@@ -607,6 +840,7 @@ mod tests {
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
             },
+            Some(42),
         );
         let after = store.snapshot(created.id).unwrap();
         assert_eq!(
@@ -615,6 +849,8 @@ mod tests {
                 result: GameResult::WhiteWins
             }
         );
+        assert_eq!(after.games[0].plies, Some(42));
+        assert!(after.games[0].finished_at.is_some());
         assert_eq!(after.wins_a, 1, "A played White in this game and White won");
         assert_eq!(after.completed_games, 1);
         assert_eq!(after.score_a, Some(1.0));
@@ -635,6 +871,7 @@ mod tests {
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
             },
+            Some(30),
         );
         // Game 2: A is Black, White wins -- B wins (B was White).
         store.record_game_started(created.id, game_a_black, false);
@@ -644,6 +881,7 @@ mod tests {
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
             },
+            Some(50),
         );
 
         let snapshot = store.snapshot(created.id).unwrap();
@@ -666,6 +904,7 @@ mod tests {
             GameOutcome::Finished {
                 result: GameResult::Draw,
             },
+            Some(80),
         );
 
         let snapshot = store.snapshot(created.id).unwrap();
@@ -682,10 +921,11 @@ mod tests {
         let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
 
         store.record_game_started(created.id, game_id, true);
-        store.record_game_outcome(created.id, game_id, GameOutcome::Aborted);
+        store.record_game_outcome(created.id, game_id, GameOutcome::Aborted, None);
 
         let snapshot = store.snapshot(created.id).unwrap();
         assert_eq!(snapshot.games[0].outcome, GameOutcome::Aborted);
+        assert_eq!(snapshot.games[0].plies, None);
         assert_eq!(snapshot.wins_a, 0);
         assert_eq!(snapshot.wins_b, 0);
         assert_eq!(snapshot.draws, 0);
@@ -716,6 +956,7 @@ mod tests {
             GameOutcome::Finished {
                 result: GameResult::Draw,
             },
+            Some(60),
         );
         assert_eq!(
             store.snapshot(created.id).unwrap().status,
