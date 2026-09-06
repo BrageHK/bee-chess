@@ -23,12 +23,16 @@ describe("defaultParticipant", () => {
     expect(p).toMatchObject({ kind: "stockfish", elo: 1600, moveTimeMs: 100, debug: false });
   });
 
-  it("bee defaults to 100ms, debug off", () => {
+  it("bee defaults to 100ms, debug off, and no options yet", () => {
+    // `options` starts empty -- it's seeded from GET /api/engines/bee/
+    // options once that resolves (see GameSetup.tsx), not hardcoded
+    // here. See participant.ts's own docs on why this module no longer
+    // knows Bee's option names.
     expect(defaultParticipant("bee")).toMatchObject({
       kind: "bee",
       moveTimeMs: 100,
       debug: false,
-      settings: { Evaluator: "Positional" },
+      options: {},
     });
   });
 
@@ -39,24 +43,14 @@ describe("defaultParticipant", () => {
 
 describe("validateParticipant", () => {
   it("rejects zero or negative move time for every bot kind", () => {
-    const zero: Participant = {
-      kind: "bee",
-      moveTimeMs: 0,
-      debug: false,
-      settings: { Evaluator: "Positional" },
-    };
+    const zero: Participant = { kind: "bee", moveTimeMs: 0, debug: false, options: {} };
     const negative: Participant = { kind: "bee-mamba", moveTimeMs: -1 };
     expect(validateParticipant(zero)).not.toBeNull();
     expect(validateParticipant(negative)).not.toBeNull();
   });
 
   it("rejects a non-integer move time", () => {
-    const p: Participant = {
-      kind: "bee",
-      moveTimeMs: 50.5,
-      debug: false,
-      settings: { Evaluator: "Positional" },
-    };
+    const p: Participant = { kind: "bee", moveTimeMs: 50.5, debug: false, options: {} };
     expect(validateParticipant(p)).not.toBeNull();
   });
 
@@ -99,13 +93,16 @@ describe("validateParticipant", () => {
     expect(validateParticipant(p)).toBeNull();
   });
 
-  it("rejects an unknown Bee evaluator", () => {
+  it("does not validate the contents of a bee participant's options map", () => {
+    // Deliberately not this module's job anymore -- see
+    // validateParticipant's docs. An unrecognized/invalid option value
+    // is Lab/the engine's problem to reject, not the setup screen's.
     const p: Participant = {
       kind: "bee",
       moveTimeMs: 100,
       debug: false,
-      settings: { Evaluator: "Unknown" },
+      options: { Evaluator: "NotARealEvaluator" },
     };
-    expect(validateParticipant(p)).toMatch(/valid Bee evaluator/);
+    expect(validateParticipant(p)).toBeNull();
   });
 });

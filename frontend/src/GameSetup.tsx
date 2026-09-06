@@ -1,21 +1,21 @@
 import { useEffect, useState } from "react";
-import { checkLabAvailable } from "./labClient";
+import { checkLabAvailable, getEngineOptions, type EngineOption } from "./labClient";
 import {
   MAX_STOCKFISH_ELO,
-  ENGINE_SETTING_DEFINITIONS,
   MIN_MOVE_TIME_MS,
   MIN_STOCKFISH_ELO,
   PARTICIPANT_LABELS,
   defaultParticipant,
   validateParticipant,
+  type EngineOptionValue,
+  type EngineOptions,
   type Participant,
   type ParticipantKind,
-  type EngineSettingDefinition,
-  type EngineSettingValue,
 } from "./participant";
 import { Button } from "./components/ui/Button";
 import { Checkbox } from "./components/ui/Checkbox";
 import { Field } from "./components/ui/Field";
+import { Input } from "./components/ui/Input";
 import { NumberInput } from "./components/ui/NumberInput";
 import { Panel, PanelBody, PanelHeader } from "./components/ui/Panel";
 import { Select } from "./components/ui/Select";
@@ -168,42 +168,94 @@ function ParticipantFields({
           onChange={(e) => onChange({ ...participant, debug: e.target.checked })}
         />
       )}
-      {"settings" in participant && (
-        <AdvancedEngineSettings
-          definitions={ENGINE_SETTING_DEFINITIONS[participant.kind] ?? []}
-          values={participant.settings}
-          onChange={(key, value) =>
-            onChange({ ...participant, settings: { ...participant.settings, [key]: value } })
-          }
+      {participant.kind === "bee" && (
+        <EngineOptionsFields
+          engineName="bee"
+          values={participant.options}
+          onChange={(options) => onChange({ ...participant, options })}
         />
       )}
     </div>
   );
 }
 
-/** Generic renderer for engine-specific options. The engine schema owns the
- * labels, help text and input types; this component only edits an option map. */
-function AdvancedEngineSettings({
-  definitions,
+/**
+ * Renders whichever UCI options an engine happens to advertise
+ * (`GET /api/engines/:name/options`, see `labClient.ts`'s
+ * `EngineOption`) as form controls -- `check` -> `Checkbox`, `spin` ->
+ * a bounded `NumberInput`, `combo` -> `Select`, `string` -> a bare
+ * `Field`+`NumberInput`-free text field. Nothing here is hardcoded to
+ * a particular option's name: adding `option name UseLMR type check
+ * default true` to Bee makes a `UseLMR` checkbox appear here with no
+ * change to this component, which is the entire point (see the
+ * design-system milestone's UCI-option-discovery plan).
+ *
+ * Also seeds `values` with each discovered option's own reported
+ * default the first time they're seen (via `onChange`, once the fetch
+ * resolves) -- `defaultParticipant("bee")` starts with an empty
+ * `options` map rather than guessing at option names/defaults itself.
+ */
+function EngineOptionsFields({
+  engineName,
   values,
   onChange,
 }: {
-  definitions: EngineSettingDefinition[];
-  values: Record<string, EngineSettingValue>;
-  onChange: (key: string, value: EngineSettingValue) => void;
+  engineName: string;
+  values: EngineOptions;
+  onChange: (values: EngineOptions) => void;
 }) {
-  if (definitions.length === 0) return null;
+  const [options, setOptions] = useState<EngineOption[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setOptions(null);
+    setError(null);
+    getEngineOptions(engineName).then(
+      (discovered) => {
+        if (cancelled) return;
+        setOptions(discovered);
+        const seeded = { ...values };
+        let changed = false;
+        for (const option of discovered) {
+          if (!(option.name in seeded)) {
+            seeded[option.name] = option.default;
+            changed = true;
+          }
+        }
+        if (changed) onChange(seeded);
+      },
+      () => {
+        if (!cancelled) setError(`Couldn't load ${engineName}'s options.`);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+    // Deliberately only re-runs when the engine itself changes, not on
+    // every `values`/`onChange` change -- this fetches the engine's
+    // *schema* once per engine, not on every keystroke in the form it
+    // renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineName]);
+
+  if (error) {
+    return <p className="m-0 text-xs text-danger">{error}</p>;
+  }
+  if (!options || options.length === 0) {
+    return null;
+  }
 
   return (
     <details open className="w-full rounded-md border border-border p-2.5 text-left">
       <summary className="cursor-pointer font-medium text-text">Advanced settings</summary>
       <div className="mt-3 grid gap-3">
-        {definitions.map((definition) => (
-          <EngineSettingField
-            key={definition.key}
-            definition={definition}
-            value={values[definition.key]}
-            onChange={(value) => onChange(definition.key, value)}
+        {options.map((option) => (
+          <EngineOptionField
+            key={option.name}
+            option={option}
+            value={values[option.name]}
+            onChange={(value) => onChange({ ...values, [option.name]: value })}
           />
         ))}
       </div>
@@ -211,45 +263,48 @@ function AdvancedEngineSettings({
   );
 }
 
-function EngineSettingField({
-  definition,
+function EngineOptionField({
+  option,
   value,
   onChange,
 }: {
-  definition: EngineSettingDefinition;
-  value: EngineSettingValue | undefined;
-  onChange: (value: EngineSettingValue) => void;
+  option: EngineOption;
+  value: EngineOptionValue | undefined;
+  onChange: (value: EngineOptionValue) => void;
 }) {
-  const control = definition.control;
-
-  if (control.type === "boolean") {
+  if (option.type === "check") {
     return (
-      <div className="grid gap-1.5">
-        <Checkbox
-          label={definition.label}
-          checked={Boolean(value)}
-          onChange={(e) => onChange(e.target.checked)}
-        />
-        <p className="text-xs text-muted">{definition.description}</p>
-      </div>
+      <Checkbox
+        label={option.name}
+        checked={typeof value === "boolean" ? value : option.default}
+        onChange={(e) => onChange(e.target.checked)}
+      />
     );
   }
 
   return (
-    <Field label={definition.label} description={definition.description}>
-      {control.type === "select" ? (
-        <Select value={String(value ?? "")} onChange={(e) => onChange(e.target.value)}>
-          {control.options.map((option) => (
-            <option key={option.value} value={option.value}>{option.label}</option>
+    <Field label={option.name}>
+      {option.type === "combo" ? (
+        <Select value={String(value ?? option.default)} onChange={(e) => onChange(e.target.value)}>
+          {option.values.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
           ))}
         </Select>
-      ) : (
+      ) : option.type === "spin" ? (
         <NumberInput
-          value={typeof value === "number" ? value : 0}
-          min={control.min}
-          max={control.max}
-          step={control.step}
+          value={typeof value === "number" ? value : option.default}
+          min={option.min}
+          max={option.max}
+          step={1}
           onChange={onChange}
+        />
+      ) : (
+        <Input
+          type="text"
+          value={typeof value === "string" ? value : option.default}
+          onChange={(e) => onChange(e.target.value)}
         />
       )}
     </Field>

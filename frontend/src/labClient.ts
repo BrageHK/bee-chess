@@ -62,6 +62,20 @@ export interface CreateGameRequest {
   moveTimeMs?: number;
 }
 
+/** Mirrors `lab::uci_process::UciOption`'s JSON shape exactly (a
+ * `#[serde(tag = "type", rename_all = "lowercase")]` enum) -- UCI's
+ * own generic option vocabulary, not anything engine-specific. This is
+ * the whole point: a config UI renders whichever of these an engine
+ * happens to advertise (`check` -> a checkbox, `spin` -> a bounded
+ * number field, `combo` -> a dropdown, `string` -> free text) without
+ * needing to know the option's name ahead of time. See
+ * `GameSetup.tsx`'s `EngineOptionsFields`. */
+export type EngineOption =
+  | { type: "check"; name: string; default: boolean }
+  | { type: "spin"; name: string; default: number; min: number; max: number }
+  | { type: "combo"; name: string; default: string; values: string[] }
+  | { type: "string"; name: string; default: string };
+
 class LabError extends Error {}
 
 async function parseJsonOrThrow<T>(response: Response, what: string): Promise<T> {
@@ -94,6 +108,15 @@ export async function createGame(request: CreateGameRequest = {}): Promise<GameS
 export async function getGame(id: string): Promise<GameSnapshot> {
   const response = await fetch(`${LAB_BASE_URL}/api/games/${id}`);
   return parseJsonOrThrow(response, "get game");
+}
+
+/** `GET /api/engines/:name/options` -- the UCI options `name` (e.g.
+ * `"bee"`) advertises during its own handshake. See `EngineOption`'s
+ * docs for why the frontend renders this generically rather than
+ * hardcoding any option's name. */
+export async function getEngineOptions(name: string): Promise<EngineOption[]> {
+  const response = await fetch(`${LAB_BASE_URL}/api/engines/${name}/options`);
+  return parseJsonOrThrow(response, `get ${name} options`);
 }
 
 /**
