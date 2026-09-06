@@ -18,6 +18,7 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
     draws: 0,
     wins_b: 0,
     score_a: null,
+    elo_diff_a: null,
     games: [],
     metadata: {
       lab_git_commit: "abc123",
