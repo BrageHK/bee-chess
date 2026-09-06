@@ -254,6 +254,16 @@ fn parse_setoption(line: &str) -> Option<UciCommand> {
     })
 }
 
+/// Parses a UCI `check`-type option's value (`true`/`false`, per the
+/// protocol's own boolean spelling), case-insensitively.
+fn parse_uci_check(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Formats a move as UCI long algebraic notation, e.g. `e2e4` or
 /// `e7e8q`. The inverse of `UciMove::parse`'s promotion-letter mapping.
 fn format_uci_move(mv: Move) -> String {
@@ -331,6 +341,13 @@ pub fn run<R: BufRead, W: Write>(
                 writeln!(output, "id name {ENGINE_NAME}")?;
                 writeln!(output, "id author {ENGINE_AUTHOR}")?;
                 writeln!(output, "option name Evaluator type combo default Positional var Positional var Material")?;
+                // Experimental search feature switches -- see
+                // `SearchOptions`'s docs. Both default to `true` (the
+                // normal, strongest configuration); Bee Lab's A/B
+                // experiment runner is the intended way to turn one off,
+                // not a permanent engine configuration.
+                writeln!(output, "option name UseTT type check default true")?;
+                writeln!(output, "option name UseQuiescence type check default true")?;
                 writeln!(output, "uciok")?;
             }
             UciCommand::IsReady => {
@@ -348,6 +365,22 @@ pub fn run<R: BufRead, W: Write>(
                             DiagnosticLevel::Warn,
                             format!("ignored invalid Evaluator value: {value}"),
                         );
+                    }
+                } else if name.eq_ignore_ascii_case("UseTT") {
+                    match parse_uci_check(&value) {
+                        Some(use_tt) => engine.set_use_tt(use_tt),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseTT value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseQuiescence") {
+                    match parse_uci_check(&value) {
+                        Some(use_quiescence) => engine.set_use_quiescence(use_quiescence),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseQuiescence value: {value}"),
+                        ),
                     }
                 } else {
                     engine.emit_diagnostic(
@@ -694,6 +727,8 @@ mod tests {
         assert!(text.contains(&format!("id name {ENGINE_NAME}")));
         assert!(text.contains(&format!("id author {ENGINE_AUTHOR}")));
         assert!(text.contains("option name Evaluator type combo default Positional"));
+        assert!(text.contains("option name UseTT type check default true"));
+        assert!(text.contains("option name UseQuiescence type check default true"));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
     }
@@ -705,6 +740,36 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert_eq!(engine.evaluator(), EvaluatorKind::Material);
+    }
+
+    #[test]
+    fn setoption_disables_the_transposition_table() {
+        let input = b"setoption name UseTT value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_tt);
+    }
+
+    #[test]
+    fn setoption_disables_quiescence() {
+        let input = b"setoption name UseQuiescence value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_quiescence);
+    }
+
+    #[test]
+    fn invalid_use_tt_value_keeps_the_current_setting() {
+        let input = b"setoption name UseTT value maybe\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(
+            engine.search_options().use_tt,
+            "default is true; an invalid value must not change it"
+        );
     }
 
     #[test]
