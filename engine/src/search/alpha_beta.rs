@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::chess::{Move, MoveFlag, PieceKind, Position};
 use crate::eval::Evaluator;
 
-use super::deadline::Deadline;
+use super::deadline::{Deadline, StopSignal};
 use super::{Score, SearchOptions, SearchResult, SCORE_INF, SCORE_MATE};
 
 const MAX_TT_ENTRIES: usize = 1 << 20;
@@ -252,6 +252,58 @@ pub fn search_iterative_with_options(
     }
 }
 
+/// Same as `search_iterative_with_options`, but also honors `stop` --
+/// see `StopSignal`'s docs. Unlike `search_iterative_with_options`,
+/// depth 1 here is *not* given an unconditional `Deadline::none()`:
+/// once external cancellation is possible at all, even depth 1 must be
+/// abortable (an already-requested `stop` right as `go` starts, say),
+/// so this returns `Option<SearchResult>` the same way
+/// `search_iterative_with_budget` does -- `None` means not even depth
+/// 1 completed, and the caller (`Engine`) is responsible for having a
+/// fallback move ready, exactly as it already is for
+/// `search_iterative_with_budget`.
+pub fn search_iterative_with_stop(
+    position: &mut Position,
+    budget: std::time::Duration,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+    stop: StopSignal,
+    mut on_depth_complete: impl FnMut(&SearchResult),
+) -> Option<SearchResult> {
+    let deadline = Deadline::from_now(budget).with_stop_signal(stop);
+    let mut state = SearchState::new(options);
+    let mut path = normalized_history(position, history);
+
+    let mut depth = 1;
+    let mut last_completed =
+        search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path)?;
+    on_depth_complete(&last_completed);
+
+    if super::mate_in_plies(last_completed.score).is_some() {
+        return Some(last_completed);
+    }
+
+    loop {
+        depth += 1;
+        match search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path) {
+            Some(result) => {
+                let found_mate = super::mate_in_plies(result.score).is_some();
+                last_completed = result;
+                on_depth_complete(&last_completed);
+                if found_mate {
+                    return Some(last_completed);
+                }
+            }
+            None => return Some(last_completed),
+        }
+
+        if deadline.is_expired(0) {
+            return Some(last_completed);
+        }
+    }
+}
+
 /// Searches `position` with iterative deepening under a real soft/hard
 /// [`super::TimeBudget`] (see that type's docs for what each half
 /// means) -- the entry point `Engine` uses once it has a clock-aware
@@ -269,16 +321,24 @@ pub fn search_iterative_with_options(
 /// a legal move in hand *before* calling this, so a hard-limit abort
 /// partway through depth 1 (returning `None` as `last_completed`) is a
 /// well-defined, handleable outcome rather than "no move to report."
+///
+/// `stop` (see `StopSignal`'s docs) is attached to both the soft and
+/// hard deadlines, so an external UCI `stop` cancels this exactly like
+/// crossing the hard limit does -- the caller sees the same `None`-on-
+/// nothing-completed / `Some(last_completed)`-otherwise contract
+/// either way, with no separate "was this a stop or a timeout" signal
+/// needed at this layer.
 pub fn search_iterative_with_budget(
     position: &mut Position,
     budget: super::TimeBudget,
     evaluator: &impl Evaluator,
     history: &[u64],
     options: SearchOptions,
+    stop: StopSignal,
     mut on_depth_complete: impl FnMut(&SearchResult),
 ) -> Option<SearchResult> {
-    let soft_deadline = Deadline::from_now(budget.soft);
-    let hard_deadline = Deadline::from_now(budget.hard);
+    let soft_deadline = Deadline::from_now(budget.soft).with_stop_signal(stop.clone());
+    let hard_deadline = Deadline::from_now(budget.hard).with_stop_signal(stop);
     let mut state = SearchState::new(options);
     let mut path = normalized_history(position, history);
 
@@ -1041,6 +1101,7 @@ mod tests {
             &MaterialEvaluator,
             &history,
             SearchOptions::default(),
+            StopSignal::new(),
             |_| {},
         );
 
@@ -1069,6 +1130,7 @@ mod tests {
             &MaterialEvaluator,
             &history,
             SearchOptions::default(),
+            StopSignal::new(),
             |_| {},
         );
 

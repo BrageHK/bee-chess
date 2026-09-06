@@ -228,19 +228,27 @@ fn go_field<T: std::str::FromStr>(tokens: &[&str], name: &str) -> Option<T> {
 
 /// A parsed UCI command. Only a subset of the full protocol is
 /// implemented so far; unrecognized input is ignored rather than
-/// erroring, per the UCI convention of tolerating unknown commands. The
-/// full asynchronous state machine (`setoption`, `stop`, `ponderhit`,
-/// concurrent input handling while searching, and actual search) lands
-/// in a follow-up milestone.
+/// erroring, per the UCI convention of tolerating unknown commands.
+/// `ponder`/`ponderhit` are not implemented yet -- see `GoCommand`'s
+/// docs; `stop` (see `Stop` below) and concurrent input handling while
+/// searching are, via `run`'s event loop (see its own docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UciCommand {
     Uci,
     IsReady,
     Debug(bool),
-    SetOption { name: String, value: String },
+    SetOption {
+        name: String,
+        value: String,
+    },
     NewGame,
     Position(PositionCommand),
     Go(GoCommand),
+    /// Requests that an in-progress `go` stop as soon as possible and
+    /// report its `bestmove` -- see `crate::search::StopSignal`'s
+    /// docs. A `stop` with no search running is simply ignored, per
+    /// normal UCI tolerance of commands that don't currently apply.
+    Stop,
     Quit,
     Unknown(String),
 }
@@ -252,6 +260,7 @@ impl UciCommand {
             "uci" => UciCommand::Uci,
             "isready" => UciCommand::IsReady,
             "ucinewgame" => UciCommand::NewGame,
+            "stop" => UciCommand::Stop,
             "quit" => UciCommand::Quit,
             _ => {
                 if let Some(rest) = line.strip_prefix("position") {
@@ -346,211 +355,636 @@ fn write_search_info<W: Write>(
     writeln!(output)
 }
 
-/// Runs the UCI loop, reading commands from `input` and writing responses
-/// to `output`, until `quit` is received or input ends.
+/// One line of protocol output a search worker thread wants written,
+/// carried back to the event-loop thread over a channel rather than
+/// having the worker write to `output` itself -- see `run`'s module
+/// docs on why only the event-loop thread ever touches `output`
+/// (serializing all UCI text through one place avoids exactly the
+/// interleaving bugs a second writer thread would risk).
+#[derive(Debug)]
+enum SearchEvent {
+    /// One completed depth's `info depth ...` line, pre-rendered:
+    /// rendering happens on the worker thread (it has the `SearchResult`
+    /// and knows its own elapsed time), only the actual `write!` to
+    /// `output` happens on the event-loop thread.
+    Info(String),
+    /// The search has produced its final answer -- exactly one of
+    /// these is sent per `go`, always as the worker's last message.
+    Done(crate::search::SearchResult),
+}
+
+/// Everything that can wake `run`'s event loop up: a new line of input
+/// (or the input stream ending), or the active search worker producing
+/// another `SearchEvent`. Both a reader thread and a search worker
+/// thread send `Event`s into the *same* channel (via cloned senders),
+/// so the event loop never needs to poll or `select!` between two
+/// separate channels -- it just blocks on one `recv()` and reacts to
+/// whichever kind of `Event` arrives first. See the module docs on
+/// `run` for why this shape: it's what lets a search's natural
+/// completion (with no new command having arrived) still promptly
+/// produce a `bestmove`, and what lets a `stop`/new command arriving
+/// mid-search be seen immediately rather than only after the current
+/// line-read unblocks.
+#[derive(Debug)]
+enum Event {
+    Line(String),
+    /// The input stream ended (EOF) -- treated like an implicit `quit`
+    /// once any outstanding search is stopped and joined, same as
+    /// real UCI GUIs disconnecting.
+    InputEnded,
+    Search(SearchEvent),
+}
+
+/// A `go` running on its own thread: the join handle to reclaim
+/// `Engine` and the `StopSignal` `run`'s event loop uses to cancel it
+/// (on an explicit `stop`, on `quit`/EOF, or before handling any other
+/// command that needs exclusive access to `Engine`). Its `SearchEvent`s
+/// arrive as `Event::Search` on the event loop's own channel (see
+/// `Event`'s docs), not through a channel owned by this type.
+struct SearchWorker {
+    handle: std::thread::JoinHandle<Engine>,
+    stop: crate::search::StopSignal,
+}
+
+impl SearchWorker {
+    /// Spawns `go_command` as a new worker, taking ownership of
+    /// `engine` for the duration of the search (moved back out via
+    /// `join`) -- this is why `run`'s event loop holds `Option<Engine>`
+    /// rather than `Engine` directly: exactly one of "the main loop
+    /// owns it" or "a worker owns it" is true at any moment, never
+    /// both, so nothing else can call an `&mut Engine` method while a
+    /// search is in flight. Every `SearchEvent` (each completed
+    /// depth's info line, then exactly one final `Done`) is sent as an
+    /// `Event::Search` on `events` -- the same channel the event loop
+    /// already reads input lines from.
+    fn spawn(
+        mut engine: Engine,
+        go_command: GoCommand,
+        events: std::sync::mpsc::Sender<Event>,
+    ) -> Self {
+        let stop = crate::search::StopSignal::new();
+        let worker_stop = stop.clone();
+
+        let handle = std::thread::spawn(move || {
+            let side_to_move = engine.position().side_to_move();
+            let start = Instant::now();
+            let on_depth_complete = {
+                let events = events.clone();
+                move |result: &crate::search::SearchResult| {
+                    let mut line = Vec::new();
+                    // A rendering failure into an in-memory `Vec` is not a
+                    // realistic failure mode; silently skipping the info
+                    // line rather than panicking the worker is the
+                    // worst case if it somehow did happen.
+                    if write_search_info(&mut line, result, start.elapsed()).is_ok() {
+                        if let Ok(text) = String::from_utf8(line) {
+                            let _ = events.send(Event::Search(SearchEvent::Info(
+                                text.trim_end().to_string(),
+                            )));
+                        }
+                    }
+                }
+            };
+
+            let result = if let Some(movetime_ms) = go_command.movetime_ms {
+                let budget = std::time::Duration::from_millis(movetime_ms);
+                engine.search_for_time(budget, worker_stop, on_depth_complete)
+            } else if let Some(control) = go_command.clock_for(side_to_move) {
+                engine.search_with_clock(control, worker_stop, on_depth_complete)
+            } else {
+                // Default to a shallow depth when none of movetime/
+                // wtime/btime is given, since there's no time-based
+                // stopping condition (and so no `StopSignal` plumbing
+                // -- `Engine::search` is a fixed-depth, uninterruptible
+                // search, same as before) to fall back on instead.
+                const DEFAULT_DEPTH: u32 = 4;
+                let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
+                let result = engine.search(depth);
+                // depth == 0 means this was a book hit (see
+                // `Engine::book_move`'s docs), not a real search --
+                // there's no depth/node count to report, so sending an
+                // "info depth 0 ..." line for it would misrepresent it
+                // as one.
+                if result.depth > 0 {
+                    on_depth_complete(&result);
+                }
+                result
+            };
+
+            let _ = events.send(Event::Search(SearchEvent::Done(result)));
+            engine
+        });
+
+        SearchWorker { handle, stop }
+    }
+
+    /// Requests cancellation (see `StopSignal`'s docs) and blocks
+    /// until the worker finishes, reclaiming `Engine`. Used by an
+    /// explicit `stop`/`quit`/EOF, and by any other command that needs
+    /// `&mut Engine` while a search is still outstanding -- `run`'s
+    /// event loop always finishes the previous `go` before starting a
+    /// new one or touching `Engine` any other way. The worker's final
+    /// `SearchEvent::Done` (and, along the way, any `Info` lines still
+    /// in flight) still arrives as an ordinary `Event::Search` on the
+    /// event loop's channel -- this only blocks the *calling* thread
+    /// until that has happened, it doesn't consume or short-circuit
+    /// those events.
+    fn stop_and_join(self) -> Engine {
+        self.stop.request_stop();
+        self.handle
+            .join()
+            .expect("search worker thread should not panic")
+    }
+}
+
+/// Runs the UCI event loop against `input`/`output`, exactly like
+/// `run_stdio` (see its docs for the actual async semantics: natural
+/// completion, `stop`, `quit`/EOF, and every other command's join-
+/// first behavior) -- the difference is purely about thread ownership,
+/// not behavior.
 ///
-/// Diagnostics: engine/search code never writes UCI text directly (see
-/// `crate::diagnostics`); this is the one place that turns whatever
-/// `Engine::emit_diagnostic` accumulated into `info string ...` lines,
-/// and it only does so while `debug on` is in effect. With debug off,
-/// diagnostics are still drained (so they never pile up unboundedly)
-/// but simply discarded rather than written -- unknown commands and
-/// other diagnostics stay silent, per normal UCI behavior.
-pub fn run<R: BufRead, W: Write>(
+/// This spawns its reader thread *scoped* to this call
+/// (`std::thread::scope`), which is what lets `R` be a borrowed,
+/// non-`'static` type (e.g. `some_local_string.as_bytes()`) -- the
+/// large majority of this module's own tests use exactly that. The
+/// real cost of a scope is that it always joins every thread it
+/// spawned before returning, with no way to abandon one early: if
+/// `input` never reaches EOF and this event loop returns via `quit`
+/// (not EOF) while the reader is blocked inside a `read_line` syscall
+/// that has nothing left to read yet, this function will hang waiting
+/// for that syscall to return -- which real, never-closing process
+/// stdin can never provide, since nothing here can interrupt a
+/// blocking `read` from another thread. Every test in this module
+/// either sends `quit` only after EOF-reaching input, or otherwise
+/// lets its input naturally end, specifically to stay clear of this.
+///
+/// **This is why `bee.rs`'s real binary uses `run_stdio`, not this
+/// function**: real stdin from a GUI/Lichess bridge does not close
+/// when Bee itself decides to quit, so a hang here would be a real,
+/// user-visible bug (the process never exiting after `quit`), not just
+/// a testing footgun. Use this `run` directly only for tests (or any
+/// other caller than knows its `input` always reaches EOF promptly);
+/// use `run_stdio` for anything driven by a real, possibly-still-open
+/// input stream.
+pub fn run<R: BufRead + Send, W: Write>(
     input: R,
     mut output: W,
     engine: &mut Engine,
 ) -> std::io::Result<()> {
-    for line in input.lines() {
-        let line = line?;
+    let (sender, events) = std::sync::mpsc::channel::<Event>();
 
-        if engine.debug() {
-            engine.emit_diagnostic(DiagnosticLevel::Debug, format!("received: {line}"));
-        }
+    std::thread::scope(|scope| {
+        let reader_sender = sender.clone();
+        scope.spawn(move || read_lines_into(input, reader_sender));
 
-        match UciCommand::parse(&line) {
-            UciCommand::Uci => {
-                writeln!(output, "id name {ENGINE_NAME}")?;
-                writeln!(output, "id author {ENGINE_AUTHOR}")?;
-                writeln!(output, "option name Evaluator type combo default Positional var Positional var Material var Experimental")?;
-                // Experimental search feature switches -- see
-                // `SearchOptions`'s docs. These default to `true` (the
-                // normal, strongest configuration); Bee Lab's A/B
-                // experiment runner is the intended way to turn one off,
-                // not a permanent engine configuration.
-                writeln!(output, "option name UseTT type check default true")?;
-                writeln!(output, "option name UseQuiescence type check default true")?;
-                writeln!(
-                    output,
-                    "option name UseEnhancedQuiescence type check default true"
-                )?;
-                // See `crate::book`'s module docs -- `None` is the
-                // default (a book is an opt-in experiment), `Cow` is
-                // the first, deliberately small opening book.
-                writeln!(
-                    output,
-                    "option name OpeningBook type combo default None var None var Cow"
-                )?;
-                // See `crate::search::TimeManagerConfig::move_overhead`'s
-                // docs -- milliseconds reserved every move for
-                // protocol/process/network delay, never planned as
-                // thinking time. The right value depends on the
-                // deployment (a network round trip to a Lichess bridge
-                // needs more than a local GUI).
-                writeln!(
-                    output,
-                    "option name MoveOverhead type spin default {} min 0 max 1000",
-                    DEFAULT_MOVE_OVERHEAD_MS
-                )?;
-                writeln!(output, "uciok")?;
+        run_event_loop(&sender, &events, &mut output, engine)
+    })
+}
+
+/// Runs the UCI event loop against real process I/O (`bee.rs`'s actual
+/// `main`) -- see `run_event_loop`'s docs for the async semantics this
+/// provides (natural completion, `stop`, `quit`/EOF, and every other
+/// command joining an outstanding search first).
+///
+/// Unlike `run`, `input`'s reader thread here is **detached**
+/// (`std::thread::spawn`, not `std::thread::scope`) rather than joined
+/// before this function returns: real stdin from a GUI/Lichess bridge
+/// does not close just because Bee decided to `quit`, so the reader
+/// thread can still be blocked inside `read_line` -- with no portable
+/// way to cancel a blocking read from another thread in safe stable
+/// Rust -- at the exact moment `quit` (or the event loop's own error
+/// path) is ready to return. Waiting for that thread anyway (as a
+/// scoped thread would force) means the process would never actually
+/// exit on `quit` against real stdin, which is a real, user-visible
+/// hang, not just a test inconvenience -- see `run`'s own docs for the
+/// full explanation of why a scope can't selectively skip its join.
+/// Abandoning a reader thread that owns nothing but its own read
+/// buffer (no `Engine` access, no `output` writes -- see `Event`'s and
+/// `read_lines_into`'s docs) and leaving it to be torn down when the
+/// whole process exits right after `main` returns is the accepted
+/// trade-off: real UCI GUIs behave this way regardless of what
+/// language/threading model an engine uses.
+///
+/// Requires `R: 'static` (the detached thread must fully own `input`
+/// for as long as the process might run, not just for this call's
+/// duration) -- this is what actually forces the split from `run`:
+/// most of this module's own tests build their input from a local,
+/// non-`'static` byte slice/string and use `run` instead.
+pub fn run_stdio<R: BufRead + Send + 'static, W: Write>(
+    input: R,
+    mut output: W,
+    engine: &mut Engine,
+) -> std::io::Result<()> {
+    let (sender, events) = std::sync::mpsc::channel::<Event>();
+
+    let reader_sender = sender.clone();
+    std::thread::spawn(move || read_lines_into(input, reader_sender));
+
+    run_event_loop(&sender, &events, &mut output, engine)
+}
+
+/// Reads `input` line by line, sending each as an `Event::Line` (or
+/// `Event::InputEnded` once it ends) into `sender` -- the body shared
+/// by both `run`'s scoped reader thread and `run_stdio`'s detached
+/// one. Touches nothing but `input` and `sender`: no `Engine`, no
+/// `output` -- see `run`'s module-level docs on why only the event-
+/// loop thread itself ever writes protocol output.
+fn read_lines_into<R: BufRead>(mut input: R, sender: std::sync::mpsc::Sender<Event>) {
+    loop {
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) => {
+                let _ = sender.send(Event::InputEnded);
+                return;
             }
-            UciCommand::IsReady => {
-                writeln!(output, "readyok")?;
-            }
-            UciCommand::Debug(on) => {
-                engine.set_debug(on);
-            }
-            UciCommand::SetOption { name, value } => {
-                if name.eq_ignore_ascii_case("Evaluator") {
-                    if let Some(evaluator) = EvaluatorKind::parse(&value) {
-                        engine.set_evaluator(evaluator);
-                    } else {
-                        engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid Evaluator value: {value}"),
-                        );
-                    }
-                } else if name.eq_ignore_ascii_case("UseTT") {
-                    match parse_uci_check(&value) {
-                        Some(use_tt) => engine.set_use_tt(use_tt),
-                        None => engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid UseTT value: {value}"),
-                        ),
-                    }
-                } else if name.eq_ignore_ascii_case("UseQuiescence") {
-                    match parse_uci_check(&value) {
-                        Some(use_quiescence) => engine.set_use_quiescence(use_quiescence),
-                        None => engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid UseQuiescence value: {value}"),
-                        ),
-                    }
-                } else if name.eq_ignore_ascii_case("UseEnhancedQuiescence") {
-                    match parse_uci_check(&value) {
-                        Some(enabled) => engine.set_use_enhanced_quiescence(enabled),
-                        None => engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid UseEnhancedQuiescence value: {value}"),
-                        ),
-                    }
-                } else if name.eq_ignore_ascii_case("OpeningBook") {
-                    if let Some(book) = OpeningBookKind::parse(&value) {
-                        engine.set_opening_book(book);
-                    } else {
-                        engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid OpeningBook value: {value}"),
-                        );
-                    }
-                } else if name.eq_ignore_ascii_case("MoveOverhead") {
-                    match value.trim().parse::<u64>() {
-                        Ok(ms) => engine.set_move_overhead(std::time::Duration::from_millis(ms)),
-                        Err(_) => engine.emit_diagnostic(
-                            DiagnosticLevel::Warn,
-                            format!("ignored invalid MoveOverhead value: {value}"),
-                        ),
-                    }
-                } else {
-                    engine.emit_diagnostic(
-                        DiagnosticLevel::Info,
-                        format!("ignored unknown UCI option: {name}"),
-                    );
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+                if sender.send(Event::Line(trimmed)).is_err() {
+                    return; // event loop already exited
                 }
             }
-            UciCommand::NewGame => {
-                engine.new_game();
-            }
-            UciCommand::Position(command) => {
-                if let Err(error) = command.resolve(engine) {
-                    engine.emit_diagnostic(DiagnosticLevel::Warn, format!("{error:?}"));
-                }
-            }
-            UciCommand::Go(go_command) => {
-                // No real cancellation/threading yet (see GoCommand's
-                // docs and #6/#7) -- `go` runs to completion
-                // synchronously before this loop reads its next line.
-                // Priority when more than one applies: movetime, then
-                // the real UCI clock (wtime/btime/...), then depth --
-                // see `GoCommand`'s docs for why.
-                let side_to_move = engine.position().side_to_move();
-                let result = if let Some(movetime_ms) = go_command.movetime_ms {
-                    let budget = std::time::Duration::from_millis(movetime_ms);
-                    let start = Instant::now();
-                    engine.search_for_time(budget, |depth_result| {
-                        let _ = write_search_info(&mut output, depth_result, start.elapsed());
-                    })
-                } else if let Some(control) = go_command.clock_for(side_to_move) {
-                    let start = Instant::now();
-                    engine.search_with_clock(control, |depth_result| {
-                        let _ = write_search_info(&mut output, depth_result, start.elapsed());
-                    })
-                } else {
-                    // Default to a shallow depth when none of
-                    // movetime/wtime/btime is given, since there's no
-                    // time-based stopping condition to fall back on
-                    // instead.
-                    const DEFAULT_DEPTH: u32 = 4;
-                    let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
-                    let start = Instant::now();
-                    let result = engine.search(depth);
-                    // depth == 0 means this was a book hit (see
-                    // `Engine::book_move`'s docs), not a real
-                    // search -- there's no depth/node count to
-                    // report, so writing an "info depth 0 ..."
-                    // line for it would misrepresent it as one.
-                    if result.depth > 0 {
-                        write_search_info(&mut output, &result, start.elapsed())?;
-                    }
-                    result
-                };
-
-                match result.best_move {
-                    Some(mv) => writeln!(output, "bestmove {}", format_uci_move(mv))?,
-                    // No legal moves (checkmate/stalemate): UCI's
-                    // convention for "no move to make" is bestmove
-                    // 0000 rather than omitting the response.
-                    None => writeln!(output, "bestmove 0000")?,
-                }
-            }
-            UciCommand::Quit => {
-                break;
-            }
-            UciCommand::Unknown(ref command) => {
-                // Unrecognized commands are ignored, per UCI
-                // convention -- but worth a diagnostic when debug is
-                // on, since a silently-ignored typo (e.g. from a
-                // hand-typed test session) is otherwise invisible.
-                engine.emit_diagnostic(
-                    DiagnosticLevel::Info,
-                    format!("ignored unknown UCI command: {command}"),
-                );
+            Err(_) => {
+                let _ = sender.send(Event::InputEnded);
+                return;
             }
         }
-
-        for diagnostic in engine.take_diagnostics() {
-            if engine.debug() {
-                writeln!(output, "info string {}", diagnostic.message)?;
-            }
-        }
-        output.flush()?;
     }
-    Ok(())
+}
+
+/// Consumes `events` until `quit`/EOF, driving `engine` and writing to
+/// `output` -- the actual event loop `run` wraps with its input-reader
+/// thread. Kept separate (and taking a bare channel pair rather than
+/// owning any input source) specifically so tests can drive the exact
+/// command/search-result interleavings that matter for cancellation (a
+/// `stop` arriving mid-search, `quit` while searching, natural
+/// completion racing a `stop`, ...) by sending `Event`s directly,
+/// deterministically, instead of depending on real thread timing
+/// against a static input buffer.
+///
+/// `sender` is only ever used to hand a clone to each `SearchWorker`
+/// this loop spawns (so it can send its own `Event::Search`s back);
+/// this function never sends anything through it directly itself.
+/// Whoever calls this owns `sender`'s lifetime -- `run` keeps its own
+/// reader-thread clone until the reader exits, and a test typically
+/// keeps its `Sender` alive for as long as it wants `events.recv()` to
+/// block rather than immediately see a disconnected channel.
+fn run_event_loop<W: Write>(
+    sender: &std::sync::mpsc::Sender<Event>,
+    events: &std::sync::mpsc::Receiver<Event>,
+    output: &mut W,
+    engine: &mut Engine,
+) -> std::io::Result<()> {
+    // Exactly one of these is ever active at a time -- see
+    // `SearchWorker`'s docs on why `Engine` needs to move into (and
+    // back out of) a worker rather than being shared.
+    let mut active_search: Option<SearchWorker> = None;
+    // Events that arrived out of order relative to a search drain --
+    // see `drain_and_write_search_events`/`next_event`'s docs.
+    let mut pending: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+
+    loop {
+        match next_event(events, &mut pending) {
+            Ok(Event::Line(line)) => {
+                if engine.debug() {
+                    engine.emit_diagnostic(DiagnosticLevel::Debug, format!("received: {line}"));
+                }
+
+                let command = UciCommand::parse(&line);
+
+                // Every command except `Stop` itself needs exclusive
+                // access to `Engine` -- finish the outstanding search
+                // first (see `SearchWorker::stop_and_join`'s docs).
+                // `Stop` is handled inline below instead, since a
+                // `stop` with nothing running is a normal, silent
+                // no-op rather than something that should try to
+                // "finish" a search that doesn't exist.
+                if !matches!(command, UciCommand::Stop) {
+                    if let Some(worker) = active_search.take() {
+                        *engine = worker.stop_and_join();
+                        drain_and_write_search_events(events, &mut pending, output, engine)?;
+                    }
+                }
+
+                match command {
+                    UciCommand::Uci => {
+                        writeln!(output, "id name {ENGINE_NAME}")?;
+                        writeln!(output, "id author {ENGINE_AUTHOR}")?;
+                        writeln!(output, "option name Evaluator type combo default Positional var Positional var Material var Experimental")?;
+                        // Experimental search feature switches -- see
+                        // `SearchOptions`'s docs. These default to `true` (the
+                        // normal, strongest configuration); Bee Lab's A/B
+                        // experiment runner is the intended way to turn one off,
+                        // not a permanent engine configuration.
+                        writeln!(output, "option name UseTT type check default true")?;
+                        writeln!(output, "option name UseQuiescence type check default true")?;
+                        writeln!(
+                            output,
+                            "option name UseEnhancedQuiescence type check default true"
+                        )?;
+                        // See `crate::book`'s module docs -- `None` is the
+                        // default (a book is an opt-in experiment), `Cow` is
+                        // the first, deliberately small opening book.
+                        writeln!(
+                            output,
+                            "option name OpeningBook type combo default None var None var Cow"
+                        )?;
+                        // See `crate::search::TimeManagerConfig::move_overhead`'s
+                        // docs -- milliseconds reserved every move for
+                        // protocol/process/network delay, never planned as
+                        // thinking time. The right value depends on the
+                        // deployment (a network round trip to a Lichess bridge
+                        // needs more than a local GUI).
+                        writeln!(
+                            output,
+                            "option name MoveOverhead type spin default {} min 0 max 1000",
+                            DEFAULT_MOVE_OVERHEAD_MS
+                        )?;
+                        writeln!(output, "uciok")?;
+                    }
+                    UciCommand::IsReady => {
+                        writeln!(output, "readyok")?;
+                    }
+                    UciCommand::Debug(on) => {
+                        engine.set_debug(on);
+                    }
+                    UciCommand::SetOption { name, value } => {
+                        if name.eq_ignore_ascii_case("Evaluator") {
+                            if let Some(evaluator) = EvaluatorKind::parse(&value) {
+                                engine.set_evaluator(evaluator);
+                            } else {
+                                engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid Evaluator value: {value}"),
+                                );
+                            }
+                        } else if name.eq_ignore_ascii_case("UseTT") {
+                            match parse_uci_check(&value) {
+                                Some(use_tt) => engine.set_use_tt(use_tt),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid UseTT value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("UseQuiescence") {
+                            match parse_uci_check(&value) {
+                                Some(use_quiescence) => engine.set_use_quiescence(use_quiescence),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid UseQuiescence value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("UseEnhancedQuiescence") {
+                            match parse_uci_check(&value) {
+                                Some(enabled) => engine.set_use_enhanced_quiescence(enabled),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid UseEnhancedQuiescence value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("OpeningBook") {
+                            if let Some(book) = OpeningBookKind::parse(&value) {
+                                engine.set_opening_book(book);
+                            } else {
+                                engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid OpeningBook value: {value}"),
+                                );
+                            }
+                        } else if name.eq_ignore_ascii_case("MoveOverhead") {
+                            match value.trim().parse::<u64>() {
+                                Ok(ms) => {
+                                    engine.set_move_overhead(std::time::Duration::from_millis(ms))
+                                }
+                                Err(_) => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid MoveOverhead value: {value}"),
+                                ),
+                            }
+                        } else {
+                            engine.emit_diagnostic(
+                                DiagnosticLevel::Info,
+                                format!("ignored unknown UCI option: {name}"),
+                            );
+                        }
+                    }
+                    UciCommand::NewGame => {
+                        engine.new_game();
+                    }
+                    UciCommand::Position(command) => {
+                        if let Err(error) = command.resolve(engine) {
+                            engine.emit_diagnostic(DiagnosticLevel::Warn, format!("{error:?}"));
+                        }
+                    }
+                    UciCommand::Go(go_command) => {
+                        // Ownership of `engine` moves into the worker
+                        // for the duration of the search -- `*engine`
+                        // is a placeholder default until it's moved
+                        // back by whatever eventually joins this
+                        // worker (a later Done event below, or an
+                        // explicit stop/quit/EOF/next-command join
+                        // above). See `SearchWorker`'s docs.
+                        let taken = std::mem::take(engine);
+                        active_search =
+                            Some(SearchWorker::spawn(taken, go_command, sender.clone()));
+                    }
+                    UciCommand::Stop => {
+                        if let Some(worker) = active_search.take() {
+                            *engine = worker.stop_and_join();
+                            drain_and_write_search_events(events, &mut pending, output, engine)?;
+                        }
+                        // A stop with nothing running is a normal,
+                        // silent no-op, per UCI's general tolerance of
+                        // commands that don't currently apply.
+                    }
+                    UciCommand::Quit => {
+                        if let Some(worker) = active_search.take() {
+                            *engine = worker.stop_and_join();
+                            drain_and_write_search_events(events, &mut pending, output, engine)?;
+                        }
+                        return Ok(());
+                    }
+                    UciCommand::Unknown(ref command) => {
+                        // Unrecognized commands are ignored, per UCI
+                        // convention -- but worth a diagnostic when debug is
+                        // on, since a silently-ignored typo (e.g. from a
+                        // hand-typed test session) is otherwise invisible.
+                        engine.emit_diagnostic(
+                            DiagnosticLevel::Info,
+                            format!("ignored unknown UCI command: {command}"),
+                        );
+                    }
+                }
+
+                for diagnostic in engine.take_diagnostics() {
+                    if engine.debug() {
+                        writeln!(output, "info string {}", diagnostic.message)?;
+                    }
+                }
+                output.flush()?;
+            }
+            Ok(Event::Search(search_event)) => {
+                // A `Done` means the active worker has produced its
+                // final answer and is about to exit on its own (no
+                // `stop` needed) -- clear `active_search` now, or a
+                // later `stop_and_join`/next-command join would
+                // needlessly re-request cancellation on (and, worse,
+                // block forever trying to drain non-existent further
+                // events from) a worker that already finished and has
+                // nothing left to send.
+                let done = matches!(search_event, SearchEvent::Done(_));
+                write_search_event(output, engine, search_event)?;
+                if done {
+                    if let Some(worker) = active_search.take() {
+                        *engine = worker.stop_and_join();
+                    }
+                }
+                output.flush()?;
+            }
+            Ok(Event::InputEnded) | Err(_) => {
+                // EOF (a real GUI closing stdin) or the reader thread
+                // is gone -- same handling as `quit`: stop and join
+                // any outstanding search before exiting.
+                if let Some(worker) = active_search.take() {
+                    *engine = worker.stop_and_join();
+                    drain_and_write_search_events(events, &mut pending, output, engine)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Writes one `SearchEvent`'s protocol output. A `Done` result's
+/// `bestmove` line always follows immediately after any of its own
+/// `Info` lines this same event carries -- but `Info`/`Done` arrive as
+/// *separate* channel messages (one per completed depth, per
+/// `SearchWorker::spawn`'s docs), so this only ever renders one of
+/// them at a time; the ordering guarantee comes from the channel
+/// itself (a single `SearchWorker` always sends its own events in
+/// order) plus every event being fully written+flushed before the
+/// loop reads its next one.
+fn write_search_event<W: Write>(
+    output: &mut W,
+    engine: &mut Engine,
+    event: SearchEvent,
+) -> std::io::Result<()> {
+    match event {
+        SearchEvent::Info(line) => writeln!(output, "{line}"),
+        SearchEvent::Done(result) => {
+            let _ = engine; // reserved for future per-result engine bookkeeping
+            match result.best_move {
+                Some(mv) => writeln!(output, "bestmove {}", format_uci_move(mv)),
+                // No legal moves (checkmate/stalemate): UCI's
+                // convention for "no move to make" is bestmove
+                // 0000 rather than omitting the response.
+                None => writeln!(output, "bestmove 0000"),
+            }
+        }
+    }
+}
+
+/// After `stop_and_join` reclaims `Engine`, any `SearchEvent`s that
+/// worker sent (its remaining `Info` lines, then its final `Done`) are
+/// still sitting in `events`, not yet read -- `stop_and_join` itself
+/// doesn't consume them (see its docs). This drains up through that
+/// worker's final `Done` and writes each `Event::Search` in order, so
+/// its `bestmove` (and any `info` lines leading up to it) reach
+/// `output` before whatever triggered the join is itself handled.
+///
+/// A worker finishing is not the only thing that can produce an event,
+/// though: the reader thread's *next* line (or `InputEnded`) can be
+/// sent, and received here, before every one of the worker's own
+/// already-sent events has been (per-sender order is preserved, but
+/// there is no ordering guarantee *between* different senders -- see
+/// `Event`'s docs). Since `join()` returning guarantees the worker's
+/// thread has already made all of its `send` calls, its own events are
+/// guaranteed to all eventually arrive; anything else received while
+/// waiting for them (a `Line`/`InputEnded` that raced ahead) is pushed
+/// onto `pending` instead of being lost, for the main loop to consume
+/// next via `next_event` exactly as if it had arrived normally.
+fn drain_and_write_search_events<W: Write>(
+    events: &std::sync::mpsc::Receiver<Event>,
+    pending: &mut std::collections::VecDeque<Event>,
+    output: &mut W,
+    engine: &mut Engine,
+) -> std::io::Result<()> {
+    loop {
+        match events.recv() {
+            Ok(Event::Search(search_event)) => {
+                let done = matches!(search_event, SearchEvent::Done(_));
+                write_search_event(output, engine, search_event)?;
+                if done {
+                    return Ok(());
+                }
+            }
+            Ok(other) => pending.push_back(other),
+            Err(_) => return Ok(()), // channel disconnected -- nothing more to drain
+        }
+    }
+}
+
+/// The event loop's single point of receipt: always checks `pending`
+/// (events that arrived out of order relative to a search drain -- see
+/// `drain_and_write_search_events`'s docs) before blocking on `events`
+/// itself, so nothing sent to the channel is ever lost or processed
+/// out of the order it was actually sent in.
+fn next_event(
+    events: &std::sync::mpsc::Receiver<Event>,
+    pending: &mut std::collections::VecDeque<Event>,
+) -> Result<Event, std::sync::mpsc::RecvError> {
+    if let Some(event) = pending.pop_front() {
+        return Ok(event);
+    }
+    events.recv()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Read` that reads `text` in order, then blocks briefly before
+    /// reporting EOF -- wrap in `BufReader::new(..)` for `run`'s `R:
+    /// BufRead` bound (matching how `bee.rs`'s real `main` wraps real
+    /// `Stdin` -- see its own docs). See `run`'s docs on why EOF now
+    /// cancels an outstanding search exactly like `quit` does: a plain
+    /// `b"go movetime 200\nquit\n"` buffer would have `quit` (or EOF,
+    /// if `quit` is dropped) arrive as fast as the reader thread can
+    /// read it, almost certainly well before a 200ms search finishes,
+    /// cancelling it early rather than letting it complete naturally.
+    /// Tests that want to observe a *complete*, uninterrupted
+    /// `movetime` search use this instead of a bare byte slice, with
+    /// `eof_delay` comfortably longer than the budget under test.
+    struct SlowEofInput {
+        remaining: std::collections::VecDeque<u8>,
+        eof_delay: std::time::Duration,
+    }
+
+    impl SlowEofInput {
+        fn new(text: &str, eof_delay: std::time::Duration) -> Self {
+            SlowEofInput {
+                remaining: text.bytes().collect(),
+                eof_delay,
+            }
+        }
+    }
+
+    impl std::io::Read for SlowEofInput {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining.is_empty() {
+                std::thread::sleep(self.eof_delay);
+                return Ok(0);
+            }
+            let mut n = 0;
+            while n < buf.len() {
+                let Some(byte) = self.remaining.pop_front() else {
+                    break;
+                };
+                buf[n] = byte;
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
 
     #[test]
     fn parses_known_commands() {
@@ -1325,7 +1759,14 @@ mod tests {
 
     #[test]
     fn go_movetime_reports_one_info_line_per_completed_depth() {
-        let input = b"position startpos\ngo movetime 200\nquit\n".as_slice();
+        // No `quit`: EOF now cancels an outstanding search exactly
+        // like `quit` does (see `run`'s docs), so this must let the
+        // 200ms movetime search complete naturally before EOF arrives
+        // -- see `SlowEofInput`'s docs.
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            "position startpos\ngo movetime 200\n",
+            std::time::Duration::from_millis(300),
+        ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
@@ -1363,8 +1804,13 @@ mod tests {
     fn go_wtime_btime_drives_a_real_time_bounded_search() {
         // White to move, plenty of time -- should behave like any
         // other iterative-deepening search: multiple increasing
-        // depths, then a bestmove.
-        let input = b"position startpos\ngo wtime 5000 btime 5000\nquit\n".as_slice();
+        // depths, then a bestmove. No `quit`: see `SlowEofInput`'s
+        // docs on why EOF must be delayed for this to observe a
+        // naturally-completed search rather than one cancelled early.
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            "position startpos\ngo wtime 5000 btime 5000\n",
+            std::time::Duration::from_millis(300),
+        ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
@@ -1440,10 +1886,14 @@ mod tests {
     #[test]
     fn go_movetime_finds_mate_in_one_via_iterative_deepening() {
         let fen = "6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1";
-        let input = format!("position fen {fen}\ngo movetime 500\nquit\n");
+        // No `quit`: see `SlowEofInput`'s docs.
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            &format!("position fen {fen}\ngo movetime 500\n"),
+            std::time::Duration::from_millis(300),
+        ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
-        run(input.as_bytes(), &mut output, &mut engine).expect("run should succeed");
+        run(input, &mut output, &mut engine).expect("run should succeed");
         let text = String::from_utf8(output).expect("output should be valid utf8");
 
         assert!(
@@ -1457,7 +1907,11 @@ mod tests {
 
     #[test]
     fn go_movetime_info_line_includes_pv() {
-        let input = b"position startpos\ngo movetime 100\nquit\n".as_slice();
+        // No `quit`: see `SlowEofInput`'s docs.
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            "position startpos\ngo movetime 100\n",
+            std::time::Duration::from_millis(300),
+        ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
@@ -1475,7 +1929,11 @@ mod tests {
         // depth 1 alone would report only one info line; movetime
         // should win and drive iterative deepening across several
         // depths within its budget instead.
-        let input = b"position startpos\ngo depth 1 movetime 200\nquit\n".as_slice();
+        // No `quit`: see `SlowEofInput`'s docs.
+        let input = std::io::BufReader::new(SlowEofInput::new(
+            "position startpos\ngo depth 1 movetime 200\n",
+            std::time::Duration::from_millis(300),
+        ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
@@ -1485,6 +1943,266 @@ mod tests {
         assert!(
             info_lines >= 2,
             "expected movetime to drive iterative deepening past depth 1, got {info_lines} info lines"
+        );
+    }
+
+    // -- Cancellation/race tests, driven directly against
+    // `run_event_loop` by sending `Event`s through a channel, per the
+    // module docs on why this is the deterministic way to test races
+    // that would otherwise depend on real thread timing (a `stop`
+    // arriving mid-search, `quit` while searching, natural completion
+    // racing a `stop`, ...). Each test owns the `Sender` half so
+    // `events.recv()` blocks exactly as long as intended rather than
+    // ever seeing a spuriously disconnected channel.
+
+    fn count_bestmoves(output: &[u8]) -> usize {
+        String::from_utf8_lossy(output)
+            .lines()
+            .filter(|line| line.starts_with("bestmove"))
+            .count()
+    }
+
+    #[test]
+    fn event_loop_emits_exactly_one_bestmove_on_natural_completion() {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender.send(Event::Line("go depth 3".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        assert_eq!(count_bestmoves(&output), 1);
+    }
+
+    #[test]
+    fn event_loop_stop_mid_search_produces_exactly_one_bestmove() {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        // A very long movetime -- this search would not finish on its
+        // own within the test's lifetime without `stop`.
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender.send(Event::Line("stop".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        assert_eq!(
+            count_bestmoves(&output),
+            1,
+            "stop should cancel the search and report exactly one bestmove, not hang for 600s"
+        );
+    }
+
+    #[test]
+    fn event_loop_quit_mid_search_cancels_without_hanging() {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        // The real assertion here is that this returns at all (within
+        // the test harness's own timeout) rather than blocking for
+        // 600 seconds -- `quit` must cancel and join, not wait out the
+        // search.
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+    }
+
+    #[test]
+    fn event_loop_stop_racing_natural_completion_still_reports_one_bestmove() {
+        // A `stop` sent (and, crucially, still processed) after the
+        // search has *already* completed naturally: exercise the
+        // `SearchEvent::Done` early-clear path (see `Event::Search`'s
+        // handling) plus `Stop`'s own "nothing running" no-op path,
+        // one after the other, rather than assuming they can't
+        // coexist in the same run.
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender.send(Event::Line("go depth 2".to_string())).unwrap();
+        // Give the (fast, depth-2) search a moment to genuinely finish
+        // before `stop` is even read, so this exercises "stop with
+        // nothing running" rather than "stop mid-search" (already
+        // covered above).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        sender.send(Event::Line("stop".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        assert_eq!(count_bestmoves(&output), 1);
+    }
+
+    #[test]
+    fn event_loop_a_stopped_search_does_not_leak_cancellation_into_the_next_go() {
+        // If `go`'s `StopSignal` weren't fresh per search (see
+        // `SearchWorker::spawn`'s docs), a second `go` after a `stop`
+        // could see a signal that's already been requested and abort
+        // instantly instead of actually searching.
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender.send(Event::Line("stop".to_string())).unwrap();
+        sender.send(Event::Line("go depth 3".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("bestmove")).count(),
+            2,
+            "both the stopped first search and the second search should each report a bestmove"
+        );
+        // The second `go depth 3` must have actually searched (not
+        // instantly aborted by a leaked stop signal) -- a real depth-3
+        // search reports real info lines.
+        assert!(
+            text.lines().any(|l| l.starts_with("info depth 3")),
+            "the second go should have run a real, uncancelled search; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn event_loop_position_is_restored_after_a_cancelled_search() {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        let before = engine.position().clone();
+
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender.send(Event::Line("stop".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        assert_eq!(
+            engine.position(),
+            &before,
+            "a stopped search must not leave the position mutated -- search always \
+             restores it via make/unmake, including on early cancellation"
+        );
+    }
+
+    #[test]
+    fn event_loop_isready_while_a_search_is_active_finishes_the_search_first() {
+        // `isready` (like any other command) needs exclusive access to
+        // `Engine`, so it must join the outstanding search -- exactly
+        // like `position`/`setoption`/another `go` would -- rather
+        // than replying `readyok` while a worker still owns `Engine`.
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender.send(Event::Line("isready".to_string())).unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        let text = String::from_utf8(output).unwrap();
+        let bestmove_index = text.find("bestmove").expect("should have a bestmove");
+        let readyok_index = text.find("readyok").expect("should have a readyok");
+        assert!(
+            bestmove_index < readyok_index,
+            "the outstanding search's bestmove must be reported before readyok, \
+             since isready had to join it first to get exclusive access to Engine; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn event_loop_a_new_position_command_joins_the_outstanding_search_first() {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        sender
+            .send(Event::Line("position startpos".to_string()))
+            .unwrap();
+        sender
+            .send(Event::Line("go movetime 600000".to_string()))
+            .unwrap();
+        sender
+            .send(Event::Line("position startpos moves e2e4".to_string()))
+            .unwrap();
+        sender.send(Event::Line("quit".to_string())).unwrap();
+
+        run_event_loop(&sender, &events, &mut output, &mut engine).expect("should succeed");
+
+        assert_eq!(
+            count_bestmoves(&output),
+            1,
+            "the first go's search must be joined and report its bestmove"
+        );
+        assert_eq!(
+            engine.position().to_fen(),
+            {
+                let mut position = crate::chess::Position::startpos();
+                let mv = position
+                    .generate_legal_moves()
+                    .into_iter()
+                    .find(|mv| {
+                        mv.from() == "e2".parse().unwrap() && mv.to() == "e4".parse().unwrap()
+                    })
+                    .unwrap();
+                position.make_move(mv);
+                position.to_fen()
+            },
+            "the new position command must still take effect after joining the old search"
+        );
+    }
+
+    #[test]
+    fn stop_with_nothing_running_is_a_silent_no_op() {
+        let input = b"stop\nisready\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.contains("readyok"),
+            "stop must not disrupt the rest of the session"
+        );
+        assert!(
+            !text.lines().any(|l| l.starts_with("bestmove")),
+            "a stop with no search running must not conjure a bestmove out of nowhere"
         );
     }
 }
