@@ -67,10 +67,12 @@ describe("ExperimentView", () => {
           variant_a_search: {
             searches: 21, total_nodes: 210_000, avg_nodes: 10_000, avg_time_ms: 50,
             avg_depth: 8.5, max_depth: 11, effective_nps: 200_000, avg_eval_cp: 32,
+            time_management: null,
           },
           variant_b_search: {
             searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
             avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
+            time_management: null,
           },
           timeouts: 0,
         },
@@ -85,6 +87,52 @@ describe("ExperimentView", () => {
     expect(screen.getByText("120.0")).toBeInTheDocument();
     expect(screen.getByText("8.5 / 11")).toBeInTheDocument();
     expect(screen.getByText("+0.32")).toBeInTheDocument();
+    expect(screen.queryByText("Time management")).not.toBeInTheDocument();
+  });
+
+  it("renders the time management panel only when at least one variant has bee-tm telemetry", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(
+      experimentSnapshotFixture({
+        status: "completed",
+        completed_games: 1,
+        wins_a: 1,
+        games: [game()],
+        stats: {
+          avg_game_duration_ms: 30_000,
+          avg_plies: 42,
+          runtime_ms: 45_000,
+          games_per_hour: 120,
+          variant_a_search: {
+            searches: 21, total_nodes: 210_000, avg_nodes: 10_000, avg_time_ms: 50,
+            avg_depth: 8.5, max_depth: 11, effective_nps: 200_000, avg_eval_cp: 32,
+            time_management: {
+              searches_with_telemetry: 21,
+              avg_soft_ms: 164,
+              avg_hard_ms: 492,
+              total_aborted_ms: 354,
+              avg_aborted_ms: 16.9,
+              max_aborted_ms: 354,
+              searches_with_aborted_iteration: 1,
+              avg_best_move_changes: 0.3,
+              avg_score_delta_cp: -5,
+            },
+          },
+          variant_b_search: {
+            searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
+            avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
+            time_management: null,
+          },
+          timeouts: 0,
+        },
+      }),
+    );
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    expect(await screen.findByText("Time management")).toBeInTheDocument();
+    expect(screen.getByText("164 ms")).toBeInTheDocument();
+    expect(screen.getByText("492 ms")).toBeInTheDocument();
+    expect(screen.getByText("no bee-tm telemetry")).toBeInTheDocument();
   });
 
   it("shows a placeholder for stats that have no data yet", async () => {
