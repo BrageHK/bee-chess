@@ -181,6 +181,7 @@ impl Evaluator for PositionalEvaluator {
         let mut phase = 0;
         let mut bishops = [0u8; 2];
         let mut pawns = [[0u8; 8]; 2];
+        let mut rooks = Vec::new();
 
         for index in 0..Square::COUNT as u8 {
             let square = Square::new(index);
@@ -207,6 +208,9 @@ impl Evaluator for PositionalEvaluator {
             if piece.kind == PieceKind::Pawn {
                 pawns[color][square.file() as usize] += 1;
             }
+            if piece.kind == PieceKind::Rook {
+                rooks.push((piece.color, square.file() as usize));
+            }
         }
 
         for color in [Color::White, Color::Black] {
@@ -229,6 +233,24 @@ impl Evaluator for PositionalEvaluator {
                 {
                     middle -= sign * 10 * Score::from(count);
                     end -= sign * 8 * Score::from(count);
+                }
+            }
+        }
+
+        for (color, file) in rooks {
+            let own = color_index(color);
+            let opponent = color_index(color.opposite());
+            let sign = if color == Color::White { 1 } else { -1 };
+
+            if pawns[own][file] == 0 {
+                if pawns[opponent][file] == 0 {
+                    // Open file: no pawn of either color blocks the rook.
+                    middle += sign * 20;
+                    end += sign * 10;
+                } else {
+                    // Semi-open file: only an opposing pawn remains.
+                    middle += sign * 10;
+                    end += sign * 5;
                 }
             }
         }
