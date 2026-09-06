@@ -21,7 +21,7 @@
 //! are real follow-ups once this seam has proven itself, not
 //! prerequisites for it.
 
-use crate::chess::{Color, Move, MoveFlag, Position, Square};
+use crate::chess::{Color, Move, MoveFlag, PieceKind, Position, Square};
 
 /// Looks up a known-good move for `position`, if any. Implementations
 /// must return a currently *legal* move or `None` -- the caller
@@ -63,17 +63,31 @@ impl OpeningBook for NoBook {
 /// already been played: e-pawn to e3, d-pawn to d3, king knight to e2,
 /// queen knight to d2, then the knight on e2 continues to g3 and the
 /// knight on d2 continues to b3. `probe` walks this list and returns
-/// the first step that (a) hasn't happened yet -- checked by looking
-/// at the position's actual piece placement, not a move counter, so
-/// this is genuinely keyed by position, not "which ply is this" -- and
-/// (b) is currently a legal move. If the pending step isn't legal
-/// right now (the opponent is doing something that makes it
-/// impossible, e.g. `e3` blocked or the knight's target square
-/// defended in a way that matters, or, plainly, it's simply not this
-/// side's move), this returns `None` rather than forcing the setup
-/// through, and `Engine` falls back to a normal search -- the Cow
-/// setup is a starting point Bee commits to only while it stays
-/// reasonable, never a script it plays blindly.
+/// the first step that (a) hasn't happened yet and (b) is currently a
+/// legal move.
+///
+/// "Hasn't happened yet" is checked by looking for the *expected piece
+/// kind* still sitting on the step's `from` square -- not just whether
+/// `from` is occupied at all. That distinction matters here
+/// specifically because two steps share a square: the e-pawn vacates
+/// e2 (step 0) and the king's knight later arrives on e2 (step 2) to
+/// continue on to g3 (step 4). Checking bare occupancy would read "a
+/// piece is on e2" once the knight gets there and wrongly conclude
+/// step 0 (the pawn push) still needs playing, sending `probe` off to
+/// try an already-completed (and by then illegal) pawn move instead of
+/// reaching the real pending step. Checking "is there still a *pawn*
+/// on e2" instead correctly reads that step as done and moves on. This
+/// is still genuinely keyed by the position's actual piece placement,
+/// not a move counter -- just checking placement precisely enough to
+/// handle the setup's own square reuse.
+///
+/// If the pending step isn't legal right now (the opponent is doing
+/// something that makes it impossible, e.g. `e3` blocked or the
+/// knight's target square defended in a way that matters, or,
+/// plainly, it's simply not this side's move), this returns `None`
+/// rather than forcing the setup through, and `Engine` falls back to
+/// a normal search -- the Cow setup is a starting point Bee commits to
+/// only while it stays reasonable, never a script it plays blindly.
 ///
 /// Symmetric for both colors: the shape is mirrored (rank 2->3 for
 /// White becomes rank 7->6 for Black, etc.) via `Color`-relative
@@ -86,42 +100,57 @@ impl OpeningBook for CowOpeningBook {
         let side = position.side_to_move();
         let legal_moves = position.generate_legal_moves();
 
-        for (from, to) in cow_setup_squares(side) {
-            // Already played this step -- move on to the next one
-            // rather than getting stuck offering the same move forever.
-            if position.piece_at(from).is_none() {
+        for step in cow_setup_steps(side) {
+            // Already played this step (a piece of `step.piece` no
+            // longer sits on `step.from`, having moved to `step.to` or
+            // been captured) -- move on to the next one rather than
+            // getting stuck offering the same move forever. See this
+            // book's docs on why this checks piece *kind*, not just
+            // occupancy: e2 is both the e-pawn's start and the king
+            // knight's later stop, so occupancy alone can't tell two
+            // different steps apart.
+            let piece_still_pending = position
+                .piece_at(step.from)
+                .is_some_and(|piece| piece.kind == step.piece && piece.color == side);
+            if !piece_still_pending {
                 continue;
             }
-            let mv = Move::new(from, to, MoveFlag::Quiet);
+            let mv = Move::new(step.from, step.to, MoveFlag::Quiet);
             if legal_moves.contains(&mv) {
                 return Some(mv);
             }
-            // The next pending step isn't legal right now (blocked,
-            // the piece that belongs on `from` isn't actually there
-            // despite the square being non-empty, or -- since this
-            // loop only reaches here on a genuine mismatch -- the
-            // setup has effectively been abandoned). Rather than
-            // skipping ahead to a later step out of setup order (which
-            // could make an already-questionable setup actively
-            // unsound), treat this as a book miss.
+            // The next pending step isn't legal right now (blocked, or
+            // the expected piece has been captured/promoted away
+            // without technically "moving" in a way the check above
+            // would catch). Rather than skipping ahead to a later step
+            // out of setup order (which could make an
+            // already-questionable setup actively unsound), treat this
+            // as a book miss.
             return None;
         }
 
-        // Every setup step has already been played (or was never this
-        // side's own piece to move in the first place) -- the Cow is
+        // Every setup step has already been played -- the Cow is
         // fully built, nothing left for this book to offer.
         None
     }
 }
 
-/// The Cow's six setup squares for `side`, in the order they should be
-/// played, as `(from, to)` pairs -- see `CowOpeningBook`'s docs.
-/// White's shape (e2-e3, d2-d3, Ng1-e2, Nb1-d2, Ne2-g3, Nd2-b3)
-/// mirrored vertically for Black (e7-e6, d7-d6, Ng8-e7, Nb8-d7,
-/// Ne7-g6, Nd7-b6). Ranks are numbered from each side's own back rank
-/// (0), forward being `+1` for White and `-1` for Black, so the six
-/// pairs below read the same regardless of color.
-fn cow_setup_squares(side: Color) -> [(Square, Square); 6] {
+/// One pending step of the Cow setup: move the piece of kind `piece`
+/// currently expected on `from` to `to`. See `CowOpeningBook`'s docs.
+struct CowSetupStep {
+    from: Square,
+    to: Square,
+    piece: PieceKind,
+}
+
+/// The Cow's six setup steps for `side`, in the order they should be
+/// played -- see `CowOpeningBook`'s docs. White's shape (e2-e3, d2-d3,
+/// Ng1-e2, Nb1-d2, Ne2-g3, Nd2-b3) mirrored vertically for Black
+/// (e7-e6, d7-d6, Ng8-e7, Nb8-d7, Ne7-g6, Nd7-b6). Ranks are numbered
+/// from each side's own back rank (0), forward being `+1` for White
+/// and `-1` for Black, so the six steps below read the same regardless
+/// of color.
+fn cow_setup_steps(side: Color) -> [CowSetupStep; 6] {
     let back_rank = match side {
         Color::White => 0i8,
         Color::Black => 7,
@@ -134,32 +163,39 @@ fn cow_setup_squares(side: Color) -> [(Square, Square); 6] {
     // White's 2nd rank / Black's 7th rank, `rank(2)` is White's 3rd /
     // Black's 6th.
     let rank = |n: i8| (back_rank + step * n) as u8;
+    let sq = Square::from_file_rank;
 
     [
-        (
-            Square::from_file_rank(4, rank(1)),
-            Square::from_file_rank(4, rank(2)),
-        ), // e2-e3 / e7-e6
-        (
-            Square::from_file_rank(3, rank(1)),
-            Square::from_file_rank(3, rank(2)),
-        ), // d2-d3 / d7-d6
-        (
-            Square::from_file_rank(6, rank(0)),
-            Square::from_file_rank(4, rank(1)),
-        ), // Ng1-e2 / Ng8-e7
-        (
-            Square::from_file_rank(1, rank(0)),
-            Square::from_file_rank(3, rank(1)),
-        ), // Nb1-d2 / Nb8-d7
-        (
-            Square::from_file_rank(4, rank(1)),
-            Square::from_file_rank(6, rank(2)),
-        ), // Ne2-g3 / Ne7-g6
-        (
-            Square::from_file_rank(3, rank(1)),
-            Square::from_file_rank(1, rank(2)),
-        ), // Nd2-b3 / Nd7-b6
+        CowSetupStep {
+            from: sq(4, rank(1)),
+            to: sq(4, rank(2)),
+            piece: PieceKind::Pawn,
+        }, // e2-e3 / e7-e6
+        CowSetupStep {
+            from: sq(3, rank(1)),
+            to: sq(3, rank(2)),
+            piece: PieceKind::Pawn,
+        }, // d2-d3 / d7-d6
+        CowSetupStep {
+            from: sq(6, rank(0)),
+            to: sq(4, rank(1)),
+            piece: PieceKind::Knight,
+        }, // Ng1-e2 / Ng8-e7
+        CowSetupStep {
+            from: sq(1, rank(0)),
+            to: sq(3, rank(1)),
+            piece: PieceKind::Knight,
+        }, // Nb1-d2 / Nb8-d7
+        CowSetupStep {
+            from: sq(4, rank(1)),
+            to: sq(6, rank(2)),
+            piece: PieceKind::Knight,
+        }, // Ne2-g3 / Ne7-g6
+        CowSetupStep {
+            from: sq(3, rank(1)),
+            to: sq(1, rank(2)),
+            piece: PieceKind::Knight,
+        }, // Nd2-b3 / Nd7-b6
     ]
 }
 
@@ -244,6 +280,64 @@ mod tests {
         let mv = CowOpeningBook.probe(&e3_nf6_d3).expect("should hit");
         assert_eq!(mv.from(), "e7".parse().unwrap());
         assert_eq!(mv.to(), "e6".parse().unwrap());
+    }
+
+    #[test]
+    fn cow_book_offers_nb1d2_once_the_king_knight_has_already_rerouted_to_e2() {
+        // Regression test: e2 is both the e-pawn's vacated square
+        // (step 0) and the king knight's later stop (step 2, on its
+        // way to g3 in step 4). A real game (1.e3 e5 2.d3 d5 3.Ne2
+        // Nf6) reaching this exact position used to make `probe`
+        // wrongly conclude "step 0 (e2-e3) still pending" the instant
+        // a knight sat on e2 -- occupancy alone can't distinguish "the
+        // pawn never left" from "a knight arrived after" -- try the
+        // now-illegal pawn push, and give up instead of reaching the
+        // real pending step (Nb1-d2).
+        let position =
+            Position::from_fen("rnbqkb1r/ppp2ppp/5n2/3pp3/8/3PP3/PPP1NPPP/RNBQKB1R w KQkq - 0 4")
+                .unwrap();
+
+        let mv = CowOpeningBook.probe(&position).expect("should hit");
+
+        assert_eq!(mv.from(), "b1".parse().unwrap());
+        assert_eq!(mv.to(), "d2".parse().unwrap());
+    }
+
+    #[test]
+    fn cow_book_completes_the_full_setup_move_by_move() {
+        // The full six-step Cow, played out one legal move at a time
+        // from the real start position (not hand-built FENs), with
+        // the book itself choosing every White move and a fixed
+        // symmetric-ish Black reply each time -- this is the actual
+        // end-to-end scenario the earlier regression above was found
+        // in, covering every step (and every square-reuse point) in
+        // one game rather than one isolated position.
+        let mut position = Position::startpos();
+        let black_replies = ["e7e5", "d7d5", "g8f6", "b8c6", "f6e4", "c6d4"];
+        let mut white_moves = Vec::new();
+
+        for black_reply in black_replies {
+            let white_mv = CowOpeningBook
+                .probe(&position)
+                .unwrap_or_else(|| panic!("book should still have a move; got to {white_moves:?}"));
+            white_moves.push(format!("{}{}", white_mv.from(), white_mv.to()));
+            position.make_move(white_mv);
+
+            let black_mv = position
+                .generate_legal_moves()
+                .into_iter()
+                .find(|mv| format!("{}{}", mv.from(), mv.to()) == black_reply)
+                .unwrap_or_else(|| panic!("{black_reply} should be legal"));
+            position.make_move(black_mv);
+        }
+
+        assert_eq!(
+            white_moves,
+            vec!["e2e3", "d2d3", "g1e2", "b1d2", "e2g3", "d2b3"]
+        );
+        // The setup is now complete -- nothing left for the book to
+        // offer, Engine would fall back to a real search from here.
+        assert_eq!(CowOpeningBook.probe(&position), None);
     }
 
     #[test]
