@@ -13,6 +13,12 @@ import {
   type EngineSettingDefinition,
   type EngineSettingValue,
 } from "./participant";
+import { Button } from "./components/ui/Button";
+import { Checkbox } from "./components/ui/Checkbox";
+import { Field } from "./components/ui/Field";
+import { NumberInput } from "./components/ui/NumberInput";
+import { Panel, PanelBody, PanelHeader } from "./components/ui/Panel";
+import { Select } from "./components/ui/Select";
 
 const PARTICIPANT_KINDS: ParticipantKind[] = ["human", "stockfish", "bee", "bee-mamba"];
 
@@ -57,20 +63,20 @@ export function GameSetup({
 
   return (
     <form
-      style={{ display: "grid", gap: 16, justifyItems: "center" }}
+      className="grid justify-items-center gap-4"
       onSubmit={(e) => {
         e.preventDefault();
         if (!error) onStart(white, black);
       }}
     >
-      <div style={{ display: "flex", gap: 24, flexWrap: "wrap", justifyContent: "center" }}>
+      <div className="flex flex-wrap justify-center gap-6">
         <SlotPicker label="White" participant={white} onChange={setWhite} labUnavailable={labUnavailable} />
         <SlotPicker label="Black" participant={black} onChange={setBlack} labUnavailable={labUnavailable} />
       </div>
-      {error && <p style={{ color: "crimson", margin: 0 }}>{error}</p>}
-      <button type="submit" disabled={error !== null}>
+      {error && <p className="m-0 text-sm text-danger">{error}</p>}
+      <Button type="submit" variant="primary" disabled={error !== null}>
         Start Game
-      </button>
+      </Button>
     </form>
   );
 }
@@ -97,38 +103,31 @@ function SlotPicker({
   const unavailable = isUnavailable(participant.kind, labUnavailable);
 
   return (
-    <fieldset
-      style={{
-        display: "grid",
-        gap: 8,
-        justifyItems: "start",
-        padding: 12,
-        borderRadius: 8,
-        minWidth: 220,
-      }}
-    >
-      <legend>{label}</legend>
-      <select
-        value={participant.kind}
-        onChange={(e) => onChange(defaultParticipant(e.target.value as ParticipantKind))}
-      >
-        {PARTICIPANT_KINDS.map((kind) => (
-          <option key={kind} value={kind}>
-            {PARTICIPANT_LABELS[kind]}
-            {isUnavailable(kind, labUnavailable) ? " (unavailable?)" : ""}
-          </option>
-        ))}
-      </select>
-      {unavailable && (
-        <p style={{ color: "#b45309", margin: 0, fontSize: 13 }}>
-          {participant.kind === "bee-mamba"
-            ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
-            : "Bee Lab doesn't seem to be running (see lab/README.md)."}{" "}
-          You can still try to start the game.
-        </p>
-      )}
-      <ParticipantFields participant={participant} onChange={onChange} />
-    </fieldset>
+    <Panel className="min-w-[220px] text-left">
+      <PanelHeader>{label}</PanelHeader>
+      <PanelBody className="grid gap-3">
+        <Select
+          value={participant.kind}
+          onChange={(e) => onChange(defaultParticipant(e.target.value as ParticipantKind))}
+        >
+          {PARTICIPANT_KINDS.map((kind) => (
+            <option key={kind} value={kind}>
+              {PARTICIPANT_LABELS[kind]}
+              {isUnavailable(kind, labUnavailable) ? " (unavailable?)" : ""}
+            </option>
+          ))}
+        </Select>
+        {unavailable && (
+          <p className="m-0 text-xs leading-snug text-warning">
+            {participant.kind === "bee-mamba"
+              ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
+              : "Bee Lab doesn't seem to be running (see lab/README.md)."}{" "}
+            You can still try to start the game.
+          </p>
+        )}
+        <ParticipantFields participant={participant} onChange={onChange} />
+      </PanelBody>
+    </Panel>
   );
 }
 
@@ -142,39 +141,32 @@ function ParticipantFields({
   if (participant.kind === "human") return null;
 
   return (
-    <div style={{ display: "grid", gap: 8, width: "100%" }}>
+    <div className="grid w-full gap-3">
       {participant.kind === "stockfish" && (
-        <label style={{ display: "grid", gap: 4 }}>
-          Elo
-          <input
-            type="number"
+        <Field label="Elo">
+          <NumberInput
             value={participant.elo}
             min={MIN_STOCKFISH_ELO}
             max={MAX_STOCKFISH_ELO}
             step={1}
-            onChange={(e) => onChange({ ...participant, elo: Number(e.target.value) })}
+            onChange={(value) => onChange({ ...participant, elo: value })}
           />
-        </label>
+        </Field>
       )}
-      <label style={{ display: "grid", gap: 4 }}>
-        Time per move (ms)
-        <input
-          type="number"
+      <Field label="Time per move (ms)">
+        <NumberInput
           value={participant.moveTimeMs}
           min={MIN_MOVE_TIME_MS}
           step={1}
-          onChange={(e) => onChange({ ...participant, moveTimeMs: Number(e.target.value) })}
+          onChange={(value) => onChange({ ...participant, moveTimeMs: value })}
         />
-      </label>
+      </Field>
       {"debug" in participant && (
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={participant.debug}
-            onChange={(e) => onChange({ ...participant, debug: e.target.checked })}
-          />
-          Debug logging
-        </label>
+        <Checkbox
+          label="Debug logging"
+          checked={participant.debug}
+          onChange={(e) => onChange({ ...participant, debug: e.target.checked })}
+        />
       )}
       {"settings" in participant && (
         <AdvancedEngineSettings
@@ -203,21 +195,9 @@ function AdvancedEngineSettings({
   if (definitions.length === 0) return null;
 
   return (
-    <details
-      open
-      style={{
-        width: "100%",
-        boxSizing: "border-box",
-        padding: 10,
-        border: "1px solid var(--border)",
-        borderRadius: 8,
-        textAlign: "left",
-      }}
-    >
-      <summary style={{ cursor: "pointer", color: "var(--text-h)", fontWeight: 600 }}>
-        Advanced settings
-      </summary>
-      <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
+    <details open className="w-full rounded-md border border-border p-2.5 text-left">
+      <summary className="cursor-pointer font-medium text-text">Advanced settings</summary>
+      <div className="mt-3 grid gap-3">
         {definitions.map((definition) => (
           <EngineSettingField
             key={definition.key}
@@ -241,30 +221,37 @@ function EngineSettingField({
   onChange: (value: EngineSettingValue) => void;
 }) {
   const control = definition.control;
+
+  if (control.type === "boolean") {
+    return (
+      <div className="grid gap-1.5">
+        <Checkbox
+          label={definition.label}
+          checked={Boolean(value)}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <p className="text-xs text-muted">{definition.description}</p>
+      </div>
+    );
+  }
+
   return (
-    <label style={{ display: "grid", gap: 4 }}>
-      <span>{definition.label}</span>
-      {control.type === "select" && (
-        <select value={String(value ?? "")} onChange={(e) => onChange(e.target.value)}>
+    <Field label={definition.label} description={definition.description}>
+      {control.type === "select" ? (
+        <Select value={String(value ?? "")} onChange={(e) => onChange(e.target.value)}>
           {control.options.map((option) => (
             <option key={option.value} value={option.value}>{option.label}</option>
           ))}
-        </select>
-      )}
-      {control.type === "number" && (
-        <input
-          type="number"
-          value={typeof value === "number" ? value : ""}
+        </Select>
+      ) : (
+        <NumberInput
+          value={typeof value === "number" ? value : 0}
           min={control.min}
           max={control.max}
           step={control.step}
-          onChange={(e) => onChange(Number(e.target.value))}
+          onChange={onChange}
         />
       )}
-      {control.type === "boolean" && (
-        <input type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
-      )}
-      <small style={{ color: "var(--text)", lineHeight: 1.35 }}>{definition.description}</small>
-    </label>
+    </Field>
   );
 }
