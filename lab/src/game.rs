@@ -170,6 +170,29 @@ pub struct Game {
     status: GameStatus,
     white_participant: ParticipantInfo,
     black_participant: ParticipantInfo,
+    /// The experiment that created this game, if any -- set once, at
+    /// creation, by `GameStore::create_for_experiment` (an ordinary
+    /// `POST /api/games` game has none). Exists purely so a client
+    /// viewing one of an experiment's games can link back to it (see
+    /// `GameSnapshot::experiment_id`); nothing in this module itself
+    /// reads it.
+    experiment_id: Option<crate::experiment::ExperimentId>,
+    /// Monotonically increasing creation order, used only by
+    /// `GameStore::list` to sort newest-first -- a `GameId` is a
+    /// random `Uuid::new_v4`, so it carries no creation-order
+    /// information of its own to sort by instead.
+    created_seq: u64,
+}
+
+/// Source for `Game::created_seq` -- process-lifetime only (like
+/// everything else in `GameStore`, there's no persistence yet, see
+/// #67's slice 5), so this only needs to be monotonic for the
+/// lifetime of one running server, not globally unique or stable
+/// across restarts.
+static NEXT_GAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_game_seq() -> u64 {
+    NEXT_GAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Why `Game::apply_move` refused a move -- carries enough detail for
@@ -193,6 +216,8 @@ impl Game {
             status: GameStatus::Running,
             white_participant: white,
             black_participant: black,
+            experiment_id: None,
+            created_seq: next_game_seq(),
         }
     }
 
@@ -211,6 +236,8 @@ impl Game {
             status: GameStatus::Running,
             white_participant: ParticipantInfo::Human,
             black_participant: ParticipantInfo::Human,
+            experiment_id: None,
+            created_seq: next_game_seq(),
         };
         game.update_status_after_move();
         game
@@ -226,6 +253,10 @@ impl Game {
 
     pub fn moves(&self) -> &[String] {
         &self.moves
+    }
+
+    pub fn experiment_id(&self) -> Option<crate::experiment::ExperimentId> {
+        self.experiment_id
     }
 
     pub fn white_participant(&self) -> &ParticipantInfo {
@@ -354,6 +385,13 @@ pub struct GameSnapshot {
     pub moves: Vec<String>,
     pub white: ParticipantInfo,
     pub black: ParticipantInfo,
+    /// The experiment that created this game, if any -- lets a client
+    /// viewing this game (however it got there: an experiment's own
+    /// game list, the dashboard, or a bookmarked/shared link) link
+    /// back to that experiment. `None` for an ordinary
+    /// `POST /api/games` game. See `Game::experiment_id`/
+    /// `GameStore::create_for_experiment`.
+    pub experiment_id: Option<crate::experiment::ExperimentId>,
     #[serde(flatten)]
     pub status: GameStatus,
 }
@@ -366,6 +404,7 @@ impl From<&Game> for GameSnapshot {
             moves: game.moves().to_vec(),
             white: game.white_participant().clone(),
             black: game.black_participant().clone(),
+            experiment_id: game.experiment_id(),
             status: game.status().clone(),
         }
     }
@@ -396,7 +435,25 @@ impl GameStore {
     /// Creates a new game with `white`/`black` as its participants
     /// (see `ParticipantInfo`) and returns its snapshot.
     pub fn create(&self, white: ParticipantInfo, black: ParticipantInfo) -> GameSnapshot {
-        let game = Game::new(white, black);
+        self.insert(Game::new(white, black))
+    }
+
+    /// Same as `create`, but records `experiment_id` as the game's
+    /// origin (see `Game::experiment_id`/`GameSnapshot::experiment_id`)
+    /// -- used only by `experiment::run_experiment`, once per game it
+    /// starts.
+    pub fn create_for_experiment(
+        &self,
+        white: ParticipantInfo,
+        black: ParticipantInfo,
+        experiment_id: crate::experiment::ExperimentId,
+    ) -> GameSnapshot {
+        let mut game = Game::new(white, black);
+        game.experiment_id = Some(experiment_id);
+        self.insert(game)
+    }
+
+    fn insert(&self, game: Game) -> GameSnapshot {
         let snapshot = GameSnapshot::from(&game);
         let id = game.id;
         self.games
@@ -409,6 +466,25 @@ impl GameStore {
             .expect("event channel map mutex poisoned")
             .insert(id, sender);
         snapshot
+    }
+
+    /// Every game the server currently knows about, newest first --
+    /// the shape `GET /api/games` returns for the dashboard's running/
+    /// past game lists. Like `snapshot`, this is a point-in-time view
+    /// with no persistence backing it (see #67's slice 5): a process
+    /// restart means an empty list, not stale history.
+    ///
+    /// Ordered by each game's `created_seq` (see `Game`'s docs), not
+    /// `GameId` -- a `GameId` is a random `Uuid::new_v4`, which carries
+    /// no creation-order information to sort by.
+    pub fn list(&self) -> Vec<GameSnapshot> {
+        let games = self.games.lock().expect("game store mutex poisoned");
+        let mut ordered: Vec<&Game> = games.values().collect();
+        ordered.sort_by_key(|game| std::cmp::Reverse(game.created_seq));
+        ordered
+            .iter()
+            .map(|game| GameSnapshot::from(*game))
+            .collect()
     }
 
     /// Returns `id`'s current snapshot, or `None` if no such game
@@ -790,6 +866,51 @@ mod tests {
         assert_eq!(snapshot.id, created.id);
         assert_eq!(snapshot.fen, Position::startpos().to_fen());
         assert!(snapshot.moves.is_empty());
+    }
+
+    #[test]
+    fn a_game_created_directly_has_no_experiment_id() {
+        let store = GameStore::new();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        assert_eq!(created.experiment_id, None);
+    }
+
+    #[test]
+    fn create_for_experiment_records_the_experiment_id() {
+        let store = GameStore::new();
+        let experiment_id: crate::experiment::ExperimentId =
+            "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        let created = store.create_for_experiment(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            experiment_id,
+        );
+
+        assert_eq!(created.experiment_id, Some(experiment_id));
+        assert_eq!(
+            store.snapshot(created.id).unwrap().experiment_id,
+            Some(experiment_id),
+            "experiment_id should still be there on a fresh snapshot() call, not just the create() return"
+        );
+    }
+
+    #[test]
+    fn list_returns_every_game_newest_first() {
+        let store = GameStore::new();
+        let first = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let second = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let third = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+
+        let listed: Vec<GameId> = store.list().into_iter().map(|g| g.id).collect();
+
+        assert_eq!(listed, vec![third.id, second.id, first.id]);
+    }
+
+    #[test]
+    fn list_is_empty_for_a_fresh_store() {
+        let store = GameStore::new();
+        assert!(store.list().is_empty());
     }
 
     #[test]
