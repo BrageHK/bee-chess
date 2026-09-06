@@ -76,6 +76,62 @@ export type EngineOption =
   | { type: "combo"; name: string; default: string; values: string[] }
   | { type: "string"; name: string; default: string };
 
+/** One side of an experiment being requested -- mirrors `api::
+ * ExperimentVariantRequest`'s JSON shape. No `engine` field here
+ * (unlike `ParticipantRequest`): v1 experiments are Bee-vs-Bee only
+ * (see `lab::experiment`'s module docs), so `CreateExperimentRequest`
+ * names the engine once for the whole experiment, not per variant. */
+export interface ExperimentVariantRequest {
+  label: string;
+  options?: Record<string, string | number | boolean>;
+}
+
+export interface CreateExperimentRequest {
+  /** Defaults to `"bee"` server-side if omitted -- see `api::
+   * CreateExperimentRequest`'s docs. */
+  engine?: string;
+  variantA: ExperimentVariantRequest;
+  variantB: ExperimentVariantRequest;
+  games: number;
+  moveTimeMs?: number;
+  debug?: boolean;
+}
+
+/** Mirrors `lab::experiment::GameOutcome`'s JSON shape exactly (a
+ * `#[serde(tag = "status", rename_all = "snake_case")]` enum). */
+export type GameOutcome =
+  | { status: "pending" }
+  | { status: "finished"; result: "white_wins" | "black_wins" | "draw" }
+  | { status: "aborted" };
+
+/** Mirrors `lab::experiment::ExperimentGame`'s JSON shape exactly. */
+export interface ExperimentGame {
+  game_id: string;
+  variant_a_is_white: boolean;
+  outcome: GameOutcome;
+}
+
+/** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly
+ * -- the complete, self-sufficient resync payload
+ * `GET /api/experiments/:id` returns, same "authoritative snapshot"
+ * philosophy as `GameSnapshot`. Field names stay the server's own
+ * snake_case (no camelCase re-mapping) to match how this module
+ * already treats `GameSnapshot`/`ExperimentGame` -- one direct mirror
+ * of the wire shape, not a second naming convention layered on top. */
+export interface ExperimentSnapshot {
+  id: string;
+  status: "running" | "completed";
+  label_a: string;
+  label_b: string;
+  requested_games: number;
+  completed_games: number;
+  wins_a: number;
+  draws: number;
+  wins_b: number;
+  score_a: number | null;
+  games: ExperimentGame[];
+}
+
 class LabError extends Error {}
 
 async function parseJsonOrThrow<T>(response: Response, what: string): Promise<T> {
@@ -117,6 +173,38 @@ export async function getGame(id: string): Promise<GameSnapshot> {
 export async function getEngineOptions(name: string): Promise<EngineOption[]> {
   const response = await fetch(`${LAB_BASE_URL}/api/engines/${name}/options`);
   return parseJsonOrThrow(response, `get ${name} options`);
+}
+
+/** `POST /api/experiments`. Returns immediately with the experiment's
+ * id (status `"running"`, no games yet) -- Lab runs it to completion
+ * in the background; see `getExperiment` for the resync mechanism
+ * that follows its progress. */
+export async function createExperiment(request: CreateExperimentRequest): Promise<ExperimentSnapshot> {
+  const body: Record<string, unknown> = {
+    variant_a: request.variantA,
+    variant_b: request.variantB,
+    games: request.games,
+  };
+  if (request.engine !== undefined) body.engine = request.engine;
+  if (request.moveTimeMs !== undefined) body.move_time_ms = request.moveTimeMs;
+  if (request.debug !== undefined) body.debug = request.debug;
+
+  const response = await fetch(`${LAB_BASE_URL}/api/experiments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseJsonOrThrow(response, "create experiment");
+}
+
+/** `GET /api/experiments/:id` -- the authoritative resync mechanism
+ * for an experiment's progress. No live WebSocket stream exists for
+ * experiments (unlike games); a caller that wants to follow progress
+ * polls this, the same fallback `Game.tsx` already relies on for a
+ * game's own snapshot. */
+export async function getExperiment(id: string): Promise<ExperimentSnapshot> {
+  const response = await fetch(`${LAB_BASE_URL}/api/experiments/${id}`);
+  return parseJsonOrThrow(response, "get experiment");
 }
 
 /**
