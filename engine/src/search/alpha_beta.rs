@@ -21,7 +21,7 @@ use crate::chess::{Move, MoveFlag, PieceKind, Position};
 use crate::eval::Evaluator;
 
 use super::deadline::Deadline;
-use super::{Score, SearchResult, SCORE_INF, SCORE_MATE};
+use super::{Score, SearchOptions, SearchResult, SCORE_INF, SCORE_MATE};
 
 const MAX_TT_ENTRIES: usize = 1 << 20;
 
@@ -41,20 +41,28 @@ struct TtEntry {
 }
 
 struct SearchState {
+    options: SearchOptions,
     table: HashMap<(u64, u32, u8), TtEntry>,
     killers: Vec<[Option<Move>; 2]>,
     history: [i32; 64 * 64],
     root_best: Option<Move>,
 }
 
-impl Default for SearchState {
-    fn default() -> Self {
+impl SearchState {
+    fn new(options: SearchOptions) -> Self {
         Self {
+            options,
             table: HashMap::new(),
             killers: Vec::new(),
             history: [0; 64 * 64],
             root_best: None,
         }
+    }
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self::new(SearchOptions::default())
     }
 }
 
@@ -107,7 +115,29 @@ pub fn search_with_history(
     evaluator: &impl Evaluator,
     history: &[u64],
 ) -> SearchResult {
-    let mut state = SearchState::default();
+    search_with_options(
+        position,
+        depth,
+        evaluator,
+        history,
+        SearchOptions::default(),
+    )
+}
+
+/// Same as `search_with_history`, with explicit `SearchOptions` -- see
+/// that type's docs. `Engine` uses this to honor the `UseTT`/
+/// `UseQuiescence` UCI options; every other caller (including every
+/// existing test) goes through `search`/`search_with_history` and gets
+/// `SearchOptions::default()` (both features on), so this is purely
+/// additive.
+pub fn search_with_options(
+    position: &mut Position,
+    depth: u32,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+) -> SearchResult {
+    let mut state = SearchState::new(options);
     let mut path = normalized_history(position, history);
     // A fixed-depth search never times out: same code path as
     // search_iterative's per-depth search, just with an unlimited
@@ -151,10 +181,31 @@ pub fn search_iterative_with_history(
     budget: std::time::Duration,
     evaluator: &impl Evaluator,
     history: &[u64],
+    on_depth_complete: impl FnMut(&SearchResult),
+) -> SearchResult {
+    search_iterative_with_options(
+        position,
+        budget,
+        evaluator,
+        history,
+        SearchOptions::default(),
+        on_depth_complete,
+    )
+}
+
+/// Same as `search_iterative_with_history`, with explicit
+/// `SearchOptions` -- see `search_with_options`'s docs for why this
+/// exists alongside the unchanged, default-options entry points.
+pub fn search_iterative_with_options(
+    position: &mut Position,
+    budget: std::time::Duration,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
     mut on_depth_complete: impl FnMut(&SearchResult),
 ) -> SearchResult {
     let deadline = Deadline::from_now(budget);
-    let mut state = SearchState::default();
+    let mut state = SearchState::new(options);
     let mut path = normalized_history(position, history);
 
     let mut depth = 1;
@@ -338,21 +389,31 @@ fn negamax(
         position.halfmove_clock(),
         repetition,
     );
-    let tt_move = state.table.get(&tt_key).and_then(|entry| entry.best_move);
-    if let Some(entry) = state
-        .table
-        .get(&tt_key)
-        .copied()
-        .filter(|entry| entry.depth >= depth)
-    {
-        let score = score_from_tt(entry.score, ply);
-        match entry.bound {
-            Bound::Exact => return Some((score, entry.best_move.into_iter().collect())),
-            Bound::Lower => alpha = alpha.max(score),
-            Bound::Upper => beta = beta.min(score),
-        }
-        if alpha >= beta {
-            return Some((score, Vec::new()));
+    // `UseTT` off means never probing or storing (see the store below):
+    // `tt_move` simply stays `None`, so move ordering falls back to
+    // MVV-LVA/killers/history alone, exactly as if no entry had ever
+    // been found.
+    let tt_move = if state.options.use_tt {
+        state.table.get(&tt_key).and_then(|entry| entry.best_move)
+    } else {
+        None
+    };
+    if state.options.use_tt {
+        if let Some(entry) = state
+            .table
+            .get(&tt_key)
+            .copied()
+            .filter(|entry| entry.depth >= depth)
+        {
+            let score = score_from_tt(entry.score, ply);
+            match entry.bound {
+                Bound::Exact => return Some((score, entry.best_move.into_iter().collect())),
+                Bound::Lower => alpha = alpha.max(score),
+                Bound::Upper => beta = beta.min(score),
+            }
+            if alpha >= beta {
+                return Some((score, Vec::new()));
+            }
         }
     }
 
@@ -362,9 +423,13 @@ fn negamax(
     }
 
     if depth == 0 {
-        let score = quiescence(
-            position, alpha, beta, ply, ply, evaluator, nodes, deadline, path,
-        )?;
+        let score = if state.options.use_quiescence {
+            quiescence(
+                position, alpha, beta, ply, ply, evaluator, nodes, deadline, path,
+            )?
+        } else {
+            evaluator.evaluate(position)
+        };
         return Some((score, Vec::new()));
     }
 
@@ -442,30 +507,32 @@ fn negamax(
         }
     }
 
-    let bound = if best <= original_alpha {
-        Bound::Upper
-    } else if best >= original_beta {
-        Bound::Lower
-    } else {
-        Bound::Exact
-    };
-    let should_replace = state
-        .table
-        .get(&tt_key)
-        .is_none_or(|entry| depth >= entry.depth);
-    if should_replace {
-        if state.table.len() >= MAX_TT_ENTRIES {
-            state.table.clear();
+    if state.options.use_tt {
+        let bound = if best <= original_alpha {
+            Bound::Upper
+        } else if best >= original_beta {
+            Bound::Lower
+        } else {
+            Bound::Exact
+        };
+        let should_replace = state
+            .table
+            .get(&tt_key)
+            .is_none_or(|entry| depth >= entry.depth);
+        if should_replace {
+            if state.table.len() >= MAX_TT_ENTRIES {
+                state.table.clear();
+            }
+            state.table.insert(
+                tt_key,
+                TtEntry {
+                    depth,
+                    score: score_to_tt(best, ply),
+                    bound,
+                    best_move,
+                },
+            );
         }
-        state.table.insert(
-            tt_key,
-            TtEntry {
-                depth,
-                score: score_to_tt(best, ply),
-                bound,
-                best_move,
-            },
-        );
     }
 
     Some((best, best_pv))
@@ -1052,6 +1119,83 @@ mod tests {
             nodes - first_nodes,
             1,
             "the second search should hit the TT at its root"
+        );
+    }
+
+    #[test]
+    fn use_tt_false_disables_transposition_table_reuse() {
+        // Same setup as `transposition_table_reuses_a_completed_search`,
+        // but with `UseTT` off: repeating the identical search must not
+        // short-circuit at the root the way a TT hit would, since
+        // nothing was ever stored for this position.
+        let mut position = Position::startpos();
+        let mut state = SearchState::new(SearchOptions {
+            use_tt: false,
+            use_quiescence: true,
+        });
+        let mut path = vec![position.zobrist_hash()];
+        let mut nodes = 0;
+        negamax(
+            &mut position,
+            3,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+        )
+        .unwrap();
+        let first_nodes = nodes;
+        negamax(
+            &mut position,
+            3,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+        )
+        .unwrap();
+        assert!(
+            nodes - first_nodes > 1,
+            "with UseTT off, repeating the search must redo the full node count, not hit a cached root"
+        );
+    }
+
+    #[test]
+    fn use_quiescence_false_reintroduces_the_horizon_effect() {
+        // Same position as `quiescence_avoids_the_horizon_effect_of_a_
+        // losing_trade`, but with `UseQuiescence` off: depth-1 negamax
+        // now evaluates the position with material alone the instant it
+        // hits depth 0, the same way it would before quiescence existed
+        // -- so it should walk right into the rook-for-knight trade that
+        // quiescence would otherwise see through.
+        let mut position =
+            Position::from_fen("4k3/8/4p3/3n4/3R4/8/8/4K3 w - - 0 1").expect("valid FEN");
+        let history = [position.zobrist_hash()];
+
+        let result = search_with_options(
+            &mut position,
+            1,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions {
+                use_tt: true,
+                use_quiescence: false,
+            },
+        );
+
+        let best_move = result.best_move.expect("should find a move");
+        assert_eq!(
+            (best_move.from(), best_move.to()),
+            ("d4".parse().unwrap(), "d5".parse().unwrap()),
+            "with quiescence off, depth 1 should walk into the losing trade quiescence normally avoids"
         );
     }
 }

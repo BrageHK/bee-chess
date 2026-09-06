@@ -12,8 +12,40 @@ mod alpha_beta;
 mod deadline;
 
 pub use alpha_beta::{
-    search, search_iterative, search_iterative_with_history, search_with_history,
+    search, search_iterative, search_iterative_with_history, search_iterative_with_options,
+    search_with_history, search_with_options,
 };
+
+/// Toggles for experimental search features, exposed to UCI as
+/// `setoption`s (see `EngineOptions` in `crate::engine`) so Bee Lab can
+/// A/B one feature at a time without any frontend/Lab code needing to
+/// know what the feature is -- see the design-system milestone's
+/// engine-option-discovery plan. Every field defaults to `true`
+/// (search's normal, strongest configuration); turning one off is
+/// always a deliberate experiment, never the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Whether to probe/store the transposition table. Disabling this
+    /// does not change search *correctness*, only its speed/ordering
+    /// quality -- useful for measuring the TT's actual strength
+    /// contribution in isolation.
+    pub use_tt: bool,
+    /// Whether `depth == 0` drops into quiescence (captures/promotions/
+    /// evasions until the position is quiet) or evaluates the position
+    /// directly. Disabling this reintroduces the horizon effect
+    /// quiescence exists to fix -- see `search::alpha_beta`'s module
+    /// docs -- so it's an experiment, not something to ship disabled.
+    pub use_quiescence: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            use_tt: true,
+            use_quiescence: true,
+        }
+    }
+}
 
 /// A search score in centipawns, always from the perspective of the
 /// side to move at the point the score was produced (i.e. what

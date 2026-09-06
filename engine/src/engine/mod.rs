@@ -2,7 +2,7 @@
 use crate::chess::{PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{MaterialEvaluator, PositionalEvaluator};
-use crate::search::{self, SearchResult};
+use crate::search::{self, SearchOptions, SearchResult};
 
 /// A move given as `(from, to, promotion)` could not be matched against
 /// any currently legal move. Carries the inputs back so the caller
@@ -18,6 +18,7 @@ pub struct IllegalMoveError {
 pub struct Engine {
     debug: bool,
     evaluator: EvaluatorKind,
+    search_options: SearchOptions,
     position: Position,
     diagnostics: DiagnosticBuffer,
     /// Zobrist hash of every position reached so far in the current
@@ -69,6 +70,7 @@ impl Engine {
         Self {
             debug: false,
             evaluator: EvaluatorKind::default(),
+            search_options: SearchOptions::default(),
             position,
             diagnostics: DiagnosticBuffer::new(),
             position_history,
@@ -141,6 +143,18 @@ impl Engine {
         self.evaluator = evaluator;
     }
 
+    pub const fn search_options(&self) -> SearchOptions {
+        self.search_options
+    }
+
+    pub fn set_use_tt(&mut self, use_tt: bool) {
+        self.search_options.use_tt = use_tt;
+    }
+
+    pub fn set_use_quiescence(&mut self, use_quiescence: bool) {
+        self.search_options.use_quiescence = use_quiescence;
+    }
+
     /// Resets game/search-specific engine state (TT generation and
     /// similar, once that exists) for a new game. This does **not**
     /// reset `position_history` or set the board to the starting
@@ -198,17 +212,19 @@ impl Engine {
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
         match self.evaluator {
-            EvaluatorKind::Material => search::search_with_history(
+            EvaluatorKind::Material => search::search_with_options(
                 &mut self.position,
                 depth,
                 &MaterialEvaluator,
                 &self.position_history,
+                self.search_options,
             ),
-            EvaluatorKind::Positional => search::search_with_history(
+            EvaluatorKind::Positional => search::search_with_options(
                 &mut self.position,
                 depth,
                 &PositionalEvaluator,
                 &self.position_history,
+                self.search_options,
             ),
         }
     }
@@ -226,18 +242,20 @@ impl Engine {
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         match self.evaluator {
-            EvaluatorKind::Material => search::search_iterative_with_history(
+            EvaluatorKind::Material => search::search_iterative_with_options(
                 &mut self.position,
                 budget,
                 &MaterialEvaluator,
                 &self.position_history,
+                self.search_options,
                 on_depth_complete,
             ),
-            EvaluatorKind::Positional => search::search_iterative_with_history(
+            EvaluatorKind::Positional => search::search_iterative_with_options(
                 &mut self.position,
                 budget,
                 &PositionalEvaluator,
                 &self.position_history,
+                self.search_options,
                 on_depth_complete,
             ),
         }
