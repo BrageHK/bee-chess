@@ -2,8 +2,25 @@
 use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
-use crate::eval::{MaterialEvaluator, PositionalEvaluator};
+use crate::eval::{Evaluator, MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, SearchOptions, SearchResult};
+
+/// How much worse (in centipawns) the forced book move is allowed to
+/// score than the best move a shallow search finds from the same
+/// position, before `book_move` rejects it and falls back to a real
+/// search instead. See `Engine::book_move_blunder_deficit`'s docs for
+/// why this is a *relative* comparison (book move vs. best
+/// alternative), not an absolute before/after swing, and for why the
+/// margin can stay fairly tight (~150-200cp) once framed that way.
+const BOOK_BLUNDER_MARGIN_CP: i32 = 150;
+
+/// Depth `book_move_blunder_deficit` searches both the unconstrained
+/// position and the forced book move to before comparing them --
+/// deliberately shallow (one ply plus quiescence, since
+/// `SearchOptions::default()` always runs quiescence at the horizon):
+/// just enough for an immediate hanging capture to show up, not a real
+/// search Bee already skipped the book to avoid running.
+const BOOK_BLUNDER_SEARCH_DEPTH: u32 = 1;
 
 /// A move given as `(from, to, promotion)` could not be matched against
 /// any currently legal move. Carries the inputs back so the caller
@@ -290,7 +307,19 @@ impl Engine {
     /// here rather than trusting every implementation to get it right
     /// forever. An invalid candidate is logged and treated as a book
     /// miss, never played.
-    fn book_move(&mut self) -> Option<SearchResult> {
+    ///
+    /// Also runs a generic tactical sanity check via `evaluator`
+    /// (whichever one `Engine` is currently configured with -- a book
+    /// move is checked the same way a searched one would be, not
+    /// against some separate rule): see `book_move_blunder_deficit`. A
+    /// book is allowed to suggest a move; it isn't allowed to force Bee
+    /// to hang a piece. This is deliberately generic and unrelated to
+    /// any specific book's own internal logic -- `CowOpeningBook`
+    /// tracking its setup correctly (see `crate::book`'s docs on
+    /// historical progress) is a completely different concern from
+    /// "does finishing that setup right now hang something else on the
+    /// board", and this check exists for the latter.
+    fn book_move(&mut self, evaluator: &impl Evaluator) -> Option<SearchResult> {
         let context = OpeningContext {
             position: &self.position,
             moves: &self.move_history,
@@ -311,6 +340,18 @@ impl Engine {
             );
             return None;
         }
+        if let Some(deficit) = self.book_move_blunder_deficit(mv, evaluator) {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                format!(
+                    "opening book ({}) move {}{} scores {deficit}cp worse than the best shallow alternative; ignoring and searching instead",
+                    self.opening_book_kind.uci_name(),
+                    mv.from(),
+                    mv.to(),
+                ),
+            );
+            return None;
+        }
         self.emit_diagnostic(
             DiagnosticLevel::Info,
             format!(
@@ -327,6 +368,56 @@ impl Engine {
         })
     }
 
+    /// Returns `Some(deficit)` (in centipawns, always positive) if the
+    /// book's proposed `mv` -- already known legal -- scores more than
+    /// `BOOK_BLUNDER_MARGIN_CP` worse than the best move a shallow
+    /// search finds from the *same* current position. `None` means the
+    /// book move is fine (or even the best move already).
+    ///
+    /// This is a **relative** comparison, not a before/after swing
+    /// against the pre-move position: it asks "is this book move
+    /// obviously worse than something Bee could just play instead
+    /// right now", not "did the score change by a lot" -- the
+    /// distinction matters whenever the position was already bad before
+    /// the book ever got a say (a piece already hanging from the
+    /// opponent's last move, say). A before/after check would blame the
+    /// book move for a loss it didn't cause; comparing the book move
+    /// against the best available alternative only flags it when
+    /// playing something else would clearly have avoided that loss.
+    ///
+    /// Both scores come from `search::search` at `BOOK_BLUNDER_SEARCH_DEPTH`
+    /// (one ply plus quiescence, so an immediate hanging capture shows
+    /// up) using `evaluator` -- whichever one `Engine` is currently
+    /// configured with. The "best move" score is just that search run
+    /// from the current position unconstrained; the "forced book move"
+    /// score is the same search run one ply further down, from the
+    /// position *after* `mv`, negated back to the mover's own
+    /// perspective (search scores are always side-to-move-relative,
+    /// which flips across `make_move`) -- i.e. "if I'm forced to play
+    /// `mv`, then search normally from there, how does it look for me".
+    ///
+    /// This is deliberately not "is a specific piece attacked" or any
+    /// other move-specific tactical rule -- ad-hoc rules like that tend
+    /// to miss the next shape of the same problem -- and deliberately
+    /// shallow: this exists to catch a book move that's obviously,
+    /// tactically much worse than an alternative Bee could see one ply
+    /// down, not to establish the book move is objectively optimal.
+    fn book_move_blunder_deficit(&mut self, mv: Move, evaluator: &impl Evaluator) -> Option<i32> {
+        let best = search::search(&mut self.position, BOOK_BLUNDER_SEARCH_DEPTH, evaluator).score;
+
+        let undo = self.position.make_move(mv);
+        let reply = search::search(&mut self.position, BOOK_BLUNDER_SEARCH_DEPTH, evaluator);
+        let forced = -reply.score;
+        self.position.unmake_move(mv, undo);
+
+        let deficit = best - forced;
+        if deficit > BOOK_BLUNDER_MARGIN_CP {
+            Some(deficit)
+        } else {
+            None
+        }
+    }
+
     /// Searches the current position to exactly `depth` plies using
     /// fixed-depth negamax alpha-beta (see `crate::search::alpha_beta`)
     /// with a tapered positional evaluator, and returns the result. Does
@@ -340,7 +431,11 @@ impl Engine {
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
-        if let Some(result) = self.book_move() {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
             return result;
         }
         match self.evaluator {
@@ -379,7 +474,11 @@ impl Engine {
         budget: std::time::Duration,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
-        if let Some(result) = self.book_move() {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
             return result;
         }
         match self.evaluator {
@@ -642,6 +741,55 @@ mod tests {
 
         assert_eq!(result.depth, 2, "should be a real search, not a book hit");
         assert!(result.best_move.is_some());
+    }
+
+    #[test]
+    fn opening_book_move_is_rejected_when_it_hangs_a_piece() {
+        // The exact reported bug: the Cow is one step from completion
+        // (only Nd2-b3 left), but Black has just played ...h5-h4,
+        // directly attacking the g3 knight. `CowOpeningBook` itself
+        // doesn't know or care about that -- it still (correctly, by
+        // its own contract) offers Nd2-b3 to finish the setup. It's
+        // `Engine`'s job to notice that finishing the Cow right now
+        // scores far worse than an obvious alternative (saving the g3
+        // knight) and fall back to a real search instead of blindly
+        // playing the book move into a hung piece.
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        for (from, to) in [
+            ("e2", "e3"),
+            ("e7", "e5"),
+            ("d2", "d3"),
+            ("d7", "d5"),
+            ("g1", "e2"),
+            ("g8", "f6"),
+            ("b1", "d2"),
+            ("b8", "c6"),
+            ("e2", "g3"),
+            ("h7", "h5"),
+            ("a2", "a4"),
+            ("h5", "h4"),
+        ] {
+            engine
+                .apply_move(from.parse().unwrap(), to.parse().unwrap(), None)
+                .unwrap_or_else(|_| panic!("{from}{to} should be legal"));
+        }
+
+        let result = engine.search(1);
+
+        assert_ne!(
+            result.depth, 0,
+            "the book move (finishing the Cow) hangs the g3 knight to h4xg3; \
+             Engine must reject it and run a real search instead of playing it blindly"
+        );
+        let best_move = result
+            .best_move
+            .expect("a real search always returns a move");
+        assert_ne!(
+            (best_move.from(), best_move.to()),
+            ("d2".parse().unwrap(), "b3".parse().unwrap()),
+            "must not play the book's Nd2-b3 here"
+        );
     }
 
     #[test]
