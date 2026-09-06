@@ -3,12 +3,17 @@ import { Chessground as cg } from "@lichess-org/chessground";
 import type { Api } from "@lichess-org/chessground/api";
 import type { Config } from "@lichess-org/chessground/config";
 
-/** The board's size at its largest -- matches `EvalBar`'s own fixed
- * `HEIGHT` (see EvalBar.tsx), since the two sit side by side and are
- * meant to line up. Below that, the board's `w-full` + `aspect-square`
- * (see the wrapper below) let it shrink to fit its container instead
- * of forcing a horizontal scroll on narrow viewports. */
-const MAX_SIZE_PX = 480;
+/** Fixed board size -- matches `EvalBar`'s own fixed `HEIGHT` (see
+ * EvalBar.tsx), since the two sit side by side and are meant to line
+ * up.
+ *
+ * A responsive (shrink-on-narrow-viewport) version of this was tried
+ * here and reverted: `aspect-square` sizing on a flex item inside
+ * Game.tsx's row rendered a full-height, near-zero-width board
+ * instead of scaling down cleanly, and it wasn't practical to debug
+ * further without a browser inspector attached to this session. Back
+ * to a fixed size until that's revisited with real visual tooling. */
+const SIZE_PX = 480;
 
 export function Chessground({ config }: { config: Config }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -57,11 +62,5 @@ export function Chessground({ config }: { config: Config }) {
     lastFenRef.current = config.fen;
   }, [config]);
 
-  return (
-    <div
-      ref={ref}
-      className="aspect-square w-full min-w-0"
-      style={{ maxWidth: MAX_SIZE_PX, maxHeight: MAX_SIZE_PX }}
-    />
-  );
+  return <div ref={ref} style={{ width: SIZE_PX, height: SIZE_PX }} />;
 }
