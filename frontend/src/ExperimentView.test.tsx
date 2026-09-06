@@ -64,6 +64,14 @@ describe("ExperimentView", () => {
           avg_plies: 42,
           runtime_ms: 45_000,
           games_per_hour: 120,
+          variant_a_search: {
+            searches: 21, total_nodes: 210_000, avg_nodes: 10_000, avg_time_ms: 50,
+            avg_depth: 8.5, max_depth: 11, effective_nps: 200_000, avg_eval_cp: 32,
+          },
+          variant_b_search: {
+            searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
+            avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
+          },
         },
       }),
     );
@@ -74,6 +82,8 @@ describe("ExperimentView", () => {
     expect(screen.getByText("45.0s")).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
     expect(screen.getByText("120.0")).toBeInTheDocument();
+    expect(screen.getByText("8.5 / 11")).toBeInTheDocument();
+    expect(screen.getByText("+0.32")).toBeInTheDocument();
   });
 
   it("shows a placeholder for stats that have no data yet", async () => {

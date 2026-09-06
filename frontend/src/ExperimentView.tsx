@@ -109,6 +109,30 @@ export function ExperimentView({
         </PanelBody>
       </Panel>
 
+      <Panel className="w-full overflow-hidden">
+        <PanelHeader>Search performance</PanelHeader>
+        <PanelBody className="overflow-x-auto p-0">
+          <table className="w-full text-right font-mono text-xs">
+            <thead className="text-subtle">
+              <tr>
+                <th className="px-3 py-2 text-left font-normal">Variant</th>
+                <th className="px-3 py-2 font-normal">Moves</th>
+                <th className="px-3 py-2 font-normal">Depth avg/max</th>
+                <th className="px-3 py-2 font-normal">Total nodes</th>
+                <th className="px-3 py-2 font-normal">Nodes/move</th>
+                <th className="px-3 py-2 font-normal">Time/move</th>
+                <th className="px-3 py-2 font-normal">Effective NPS</th>
+                <th className="px-3 py-2 font-normal">Avg eval</th>
+              </tr>
+            </thead>
+            <tbody>
+              <SearchRow label={snapshot.label_a} stats={snapshot.stats.variant_a_search} />
+              <SearchRow label={snapshot.label_b} stats={snapshot.stats.variant_b_search} />
+            </tbody>
+          </table>
+        </PanelBody>
+      </Panel>
+
       <Panel className="w-full">
         <PanelHeader>Stats</PanelHeader>
         <PanelBody className="grid grid-cols-4 gap-2 text-center font-mono text-sm">
@@ -144,6 +168,26 @@ export function ExperimentView({
       <Button onClick={onBackToSetup}>New experiment</Button>
     </Stack>
   );
+}
+
+function SearchRow({ label, stats }: { label: string; stats: ExperimentSnapshot["stats"]["variant_a_search"] }) {
+  return (
+    <tr className="border-t border-border">
+      <th className="px-3 py-2 text-left font-sans font-medium">{label}</th>
+      <td className="px-3 py-2">{stats.searches}</td>
+      <td className="px-3 py-2">{stats.avg_depth === null ? "—" : `${stats.avg_depth.toFixed(1)} / ${stats.max_depth}`}</td>
+      <td className="px-3 py-2">{formatCompact(stats.total_nodes)}</td>
+      <td className="px-3 py-2">{formatCompact(stats.avg_nodes)}</td>
+      <td className="px-3 py-2">{stats.avg_time_ms === null ? "—" : `${stats.avg_time_ms.toFixed(1)} ms`}</td>
+      <td className="px-3 py-2">{formatCompact(stats.effective_nps)}</td>
+      <td className="px-3 py-2">{stats.avg_eval_cp === null ? "—" : `${stats.avg_eval_cp >= 0 ? "+" : ""}${(stats.avg_eval_cp / 100).toFixed(2)}`}</td>
+    </tr>
+  );
+}
+
+function formatCompact(value: number | null): string {
+  if (value === null) return "—";
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(value);
 }
 
 /** `null`/`undefined` render as "—" throughout this view -- see

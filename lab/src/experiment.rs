@@ -21,11 +21,10 @@
 //! ordinary `/api/games/:id` and `/ws/games/:id` -- see
 //! `ExperimentSnapshot::games`.
 //!
-//! Games run sequentially, not concurrently: this keeps the
-//! implementation (and its state machine) simple and correct for v1,
-//! at the cost of an experiment taking roughly `requested_games *
-//! move_time_ms * average_game_length` wall-clock time. Worth
-//! revisiting once that's actually felt to be too slow -- not before.
+//! Games run through a bounded, work-conserving scheduler. It fills the
+//! experiment's configured number of concurrent game slots, then starts the
+//! next game whenever any slot becomes free. This bounds engine-process load
+//! without making a fast game wait for every other game in a batch.
 //!
 //! Games are paired by color and opening: game `2k` has variant A playing
 //! White, game `2k+1` has variant A playing Black, and both begin from the
@@ -59,7 +58,10 @@ fn opening_moves_for_game(game_index: u32) -> &'static [&'static str] {
     OPENING_SUITE[pair_index % OPENING_SUITE.len()]
 }
 
-use crate::game::{EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore};
+use crate::game::{
+    EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore, UciLogColor,
+    UciLogDirection, UciLogEntry,
+};
 
 /// The git commit `bee-lab` itself was built from -- embedded at
 /// compile time by `build.rs` (`"unknown"` if that couldn't determine
@@ -110,6 +112,8 @@ pub struct ExperimentSpec {
     pub variant_a: EngineVariant,
     pub variant_b: EngineVariant,
     pub requested_games: u32,
+    /// Maximum games run at once. Each game launches two engine processes.
+    pub concurrency: u32,
     pub move_time_ms: u64,
 }
 
@@ -181,6 +185,35 @@ pub struct ExperimentGame {
     /// existing in memory (there's no persistence yet -- see
     /// `GameStore`'s docs).
     pub plies: Option<usize>,
+    #[serde(skip)]
+    search_a: SearchTotals,
+    #[serde(skip)]
+    search_b: SearchTotals,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SearchTotals {
+    searches: u64,
+    nodes: u64,
+    time_ms: u64,
+    depth_sum: u64,
+    depth_samples: u64,
+    max_depth: u32,
+    eval_cp_sum: i64,
+    eval_samples: u64,
+}
+
+impl SearchTotals {
+    fn add(&mut self, other: Self) {
+        self.searches += other.searches;
+        self.nodes += other.nodes;
+        self.time_ms += other.time_ms;
+        self.depth_sum += other.depth_sum;
+        self.depth_samples += other.depth_samples;
+        self.max_depth = self.max_depth.max(other.max_depth);
+        self.eval_cp_sum += other.eval_cp_sum;
+        self.eval_samples += other.eval_samples;
+    }
 }
 
 /// How one experiment game ended, if it has -- deliberately distinct
@@ -304,6 +337,7 @@ pub struct ExperimentSnapshot {
     pub label_a: String,
     pub label_b: String,
     pub requested_games: u32,
+    pub concurrency: u32,
     pub completed_games: u32,
     pub wins_a: u32,
     pub draws: u32,
@@ -382,6 +416,36 @@ pub struct ExperimentStats {
     /// `runtime_ms` so far -- `None` if no game has settled yet or
     /// `runtime_ms` rounds to zero (can't meaningfully divide by it).
     pub games_per_hour: Option<f64>,
+    pub variant_a_search: ExperimentSearchStats,
+    pub variant_b_search: ExperimentSearchStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExperimentSearchStats {
+    pub searches: u64,
+    pub total_nodes: u64,
+    pub avg_nodes: Option<f64>,
+    pub avg_time_ms: Option<f64>,
+    pub avg_depth: Option<f64>,
+    pub max_depth: Option<u32>,
+    pub effective_nps: Option<f64>,
+    pub avg_eval_cp: Option<f64>,
+}
+
+impl From<SearchTotals> for ExperimentSearchStats {
+    fn from(t: SearchTotals) -> Self {
+        let per_search = |value: u64| (t.searches > 0).then(|| value as f64 / t.searches as f64);
+        ExperimentSearchStats {
+            searches: t.searches,
+            total_nodes: t.nodes,
+            avg_nodes: per_search(t.nodes),
+            avg_time_ms: per_search(t.time_ms),
+            avg_depth: (t.depth_samples > 0).then(|| t.depth_sum as f64 / t.depth_samples as f64),
+            max_depth: (t.depth_samples > 0).then_some(t.max_depth),
+            effective_nps: (t.time_ms > 0).then(|| t.nodes as f64 * 1000.0 / t.time_ms as f64),
+            avg_eval_cp: (t.eval_samples > 0).then(|| t.eval_cp_sum as f64 / t.eval_samples as f64),
+        }
+    }
 }
 
 impl ExperimentStats {
@@ -414,12 +478,20 @@ impl ExperimentStats {
             let hours = runtime_ms as f64 / 3_600_000.0;
             Some(settled.len() as f64 / hours)
         };
+        let mut search_a = SearchTotals::default();
+        let mut search_b = SearchTotals::default();
+        for game in &experiment.games {
+            search_a.add(game.search_a);
+            search_b.add(game.search_b);
+        }
 
         ExperimentStats {
             avg_game_duration_ms,
             avg_plies,
             runtime_ms,
             games_per_hour,
+            variant_a_search: search_a.into(),
+            variant_b_search: search_b.into(),
         }
     }
 }
@@ -450,6 +522,7 @@ impl From<&Experiment> for ExperimentSnapshot {
             label_a: experiment.spec.variant_a.label.clone(),
             label_b: experiment.spec.variant_b.label.clone(),
             requested_games: experiment.spec.requested_games,
+            concurrency: experiment.spec.concurrency,
             completed_games,
             wins_a,
             draws,
@@ -528,7 +601,29 @@ impl ExperimentStore {
                 started_at: Utc::now(),
                 finished_at: None,
                 plies: None,
+                search_a: SearchTotals::default(),
+                search_b: SearchTotals::default(),
             });
+        }
+    }
+
+    fn record_game_search(
+        &self,
+        id: ExperimentId,
+        game_id: GameId,
+        a: SearchTotals,
+        b: SearchTotals,
+    ) {
+        let mut experiments = self
+            .experiments
+            .lock()
+            .expect("experiment store mutex poisoned");
+        if let Some(game) = experiments
+            .get_mut(&id)
+            .and_then(|e| e.games.iter_mut().find(|g| g.game_id == game_id))
+        {
+            game.search_a = a;
+            game.search_b = b;
         }
     }
 
@@ -605,61 +700,155 @@ pub async fn run_experiment(
     id: ExperimentId,
     spec: ExperimentSpec,
 ) {
-    for game_index in 0..spec.requested_games {
-        // Even-indexed games: A plays White. Odd-indexed: A plays Black.
-        // Both games in each pair receive the same opening line.
-        let variant_a_is_white = game_index % 2 == 0;
-        let (white, black) = if variant_a_is_white {
-            (&spec.variant_a, &spec.variant_b)
-        } else {
-            (&spec.variant_b, &spec.variant_a)
-        };
+    debug_assert_eq!(spec.requested_games % 2, 0);
+    debug_assert!(spec.concurrency > 0);
 
-        let white_info = engine_participant_info(white);
-        let black_info = engine_participant_info(black);
-        let snapshot = store.create_for_experiment(white_info, black_info, id);
-        experiments.record_game_started(id, snapshot.id, variant_a_is_white);
+    let mut running = tokio::task::JoinSet::new();
+    let mut next_game_index = 0;
+    let slot_count = spec.concurrency.min(spec.requested_games) as usize;
 
-        for &mv in opening_moves_for_game(game_index) {
-            if let Err(err) = store.apply_move(snapshot.id, mv) {
-                store.abort(
-                    snapshot.id,
-                    format!("built-in opening contains illegal move {mv}: {err:?}"),
-                );
-                break;
-            }
+    loop {
+        while next_game_index < spec.requested_games && running.len() < slot_count {
+            let task_store = store.clone();
+            let task_experiments = experiments.clone();
+            let task_spec = spec.clone();
+            let game_index = next_game_index;
+            running.spawn(async move {
+                run_experiment_game(&task_store, &task_experiments, id, &task_spec, game_index)
+                    .await;
+            });
+            next_game_index += 1;
         }
 
-        let slots = EngineSlots {
-            white: Some(white.config.clone()),
-            black: Some(black.config.clone()),
+        let Some(result) = running.join_next().await else {
+            break;
         };
-        crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.move_time_ms).await;
-
-        // `run_engine_loop` only returns once the game reached a
-        // terminal status (Finished or Aborted) -- see its own docs --
-        // so re-fetching the snapshot here always sees one of those,
-        // never `Running`. If the game vanished entirely (no
-        // persistence yet -- see GameStore's docs), there's nothing to
-        // record and nothing more this loop iteration can do.
-        if let Some(final_snapshot) = store.snapshot(snapshot.id) {
-            let outcome = match final_snapshot.status {
-                GameStatus::Finished { result } => GameOutcome::Finished { result },
-                GameStatus::Aborted { .. } => GameOutcome::Aborted,
-                GameStatus::Running => {
-                    unreachable!("run_engine_loop only returns once the game is no longer Running")
-                }
-            };
-            experiments.record_game_outcome(
-                id,
-                snapshot.id,
-                outcome,
-                Some(final_snapshot.moves.len()),
-            );
+        if let Err(err) = result {
+            // A game task should handle engine and chess failures itself. Keep
+            // draining/refilling slots if an unexpected panic or cancellation
+            // nevertheless occurs, so the experiment runner cannot deadlock.
+            eprintln!("experiment {id} game task failed: {err}");
         }
     }
 
     experiments.finish(id);
+}
+
+async fn run_experiment_game(
+    store: &GameStore,
+    experiments: &ExperimentStore,
+    id: ExperimentId,
+    spec: &ExperimentSpec,
+    game_index: u32,
+) {
+    // Even-indexed games: A plays White. Odd-indexed: A plays Black.
+    // Both games in each pair receive the same opening line.
+    let variant_a_is_white = game_index.is_multiple_of(2);
+    let (white, black) = if variant_a_is_white {
+        (&spec.variant_a, &spec.variant_b)
+    } else {
+        (&spec.variant_b, &spec.variant_a)
+    };
+
+    let white_info = engine_participant_info(white);
+    let black_info = engine_participant_info(black);
+    let snapshot = store.create_for_experiment(white_info, black_info, id);
+    experiments.record_game_started(id, snapshot.id, variant_a_is_white);
+
+    for &mv in opening_moves_for_game(game_index) {
+        if let Err(err) = store.apply_move(snapshot.id, mv) {
+            store.abort(
+                snapshot.id,
+                format!("built-in opening contains illegal move {mv}: {err:?}"),
+            );
+            break;
+        }
+    }
+
+    let slots = EngineSlots {
+        white: Some(white.config.clone()),
+        black: Some(black.config.clone()),
+    };
+    crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.move_time_ms).await;
+
+    // `run_engine_loop` only returns once the game reached a
+    // terminal status (Finished or Aborted) -- see its own docs --
+    // so re-fetching the snapshot here always sees one of those,
+    // never `Running`. If the game vanished entirely (no
+    // persistence yet -- see GameStore's docs), there's nothing to
+    // record and nothing more this loop iteration can do.
+    if let Some(final_snapshot) = store.snapshot(snapshot.id) {
+        let (white_search, black_search) = summarize_searches(&final_snapshot.uci_log);
+        let (search_a, search_b) = if variant_a_is_white {
+            (white_search, black_search)
+        } else {
+            (black_search, white_search)
+        };
+        experiments.record_game_search(id, snapshot.id, search_a, search_b);
+        let outcome = match final_snapshot.status {
+            GameStatus::Finished { result } => GameOutcome::Finished { result },
+            GameStatus::Aborted { .. } => GameOutcome::Aborted,
+            GameStatus::Running => {
+                unreachable!("run_engine_loop only returns once the game is no longer Running")
+            }
+        };
+        experiments.record_game_outcome(id, snapshot.id, outcome, Some(final_snapshot.moves.len()));
+    }
+}
+
+fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
+    let mut totals = [SearchTotals::default(); 2];
+    let mut pending = [SearchTotals::default(); 2];
+    for entry in log {
+        if entry.direction != UciLogDirection::Received {
+            continue;
+        }
+        let side = if entry.color == UciLogColor::White {
+            0
+        } else {
+            1
+        };
+        if entry.line.starts_with("info ") {
+            let tokens: Vec<&str> = entry.line.split_whitespace().collect();
+            let mut i = 1;
+            while i + 1 < tokens.len() {
+                let value = tokens[i + 1].parse::<i64>().ok();
+                match tokens[i] {
+                    "depth" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].depth_sum = v as u64;
+                            pending[side].depth_samples = 1;
+                            pending[side].max_depth = v as u32;
+                        }
+                    }
+                    "nodes" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].nodes = v as u64;
+                        }
+                    }
+                    "time" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].time_ms = v as u64;
+                        }
+                    }
+                    "score" if tokens[i + 1] == "cp" && i + 2 < tokens.len() => {
+                        if let Ok(v) = tokens[i + 2].parse::<i64>() {
+                            pending[side].eval_cp_sum = v;
+                            pending[side].eval_samples = 1;
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else if entry.line.starts_with("bestmove ") {
+            pending[side].searches = 1;
+            totals[side].add(pending[side]);
+            pending[side] = SearchTotals::default();
+        }
+    }
+    (totals[0], totals[1])
 }
 
 fn engine_participant_info(variant: &EngineVariant) -> crate::game::ParticipantInfo {
@@ -713,6 +902,7 @@ mod tests {
                 },
             },
             requested_games,
+            concurrency: 2,
             move_time_ms: 5,
         }
     }
@@ -726,6 +916,40 @@ mod tests {
             opening_moves_for_game((OPENING_SUITE.len() * 2) as u32),
             OPENING_SUITE[0]
         );
+    }
+
+    #[test]
+    fn search_summary_uses_the_last_info_before_each_bestmove() {
+        let received = |color, line: &str| UciLogEntry {
+            color,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received(
+                UciLogColor::White,
+                "info depth 4 nodes 100 time 5 score cp 10",
+            ),
+            received(
+                UciLogColor::White,
+                "info depth 6 nodes 300 time 10 score cp 30",
+            ),
+            received(UciLogColor::White, "bestmove e2e4"),
+            received(
+                UciLogColor::White,
+                "info depth 8 nodes 500 time 20 score cp -10",
+            ),
+            received(UciLogColor::White, "bestmove g1f3"),
+        ];
+
+        let (white, black) = summarize_searches(&log);
+        assert_eq!(white.searches, 2);
+        assert_eq!(white.nodes, 800);
+        assert_eq!(white.time_ms, 30);
+        assert_eq!(white.depth_sum, 14);
+        assert_eq!(white.max_depth, 8);
+        assert_eq!(white.eval_cp_sum, 20);
+        assert_eq!(black.searches, 0);
     }
 
     #[test]
@@ -1121,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_experiment_plays_the_requested_number_of_games_and_alternates_colors() {
+    async fn run_experiment_plays_complete_color_swapped_pairs() {
         // The fake engine always replies "bestmove e2e4" -- legal only
         // on the game's first move, so every one of these games aborts
         // (an illegal move) rather than reaching a real chess result.
@@ -1134,12 +1358,16 @@ mod tests {
         // record_game_outcome-based tests above.
         let game_store = GameStore::new();
         let experiments = ExperimentStore::new();
-        let created = experiments.create(fake_spec(3));
+        let created = experiments.create(fake_spec(4));
 
-        run_experiment(game_store, experiments.clone(), created.id, fake_spec(3)).await;
+        run_experiment(game_store, experiments.clone(), created.id, fake_spec(4)).await;
 
         let snapshot = experiments.snapshot(created.id).unwrap();
-        assert_eq!(snapshot.games.len(), 3, "should have started all 3 games");
+        assert_eq!(
+            snapshot.games.len(),
+            4,
+            "should have started both complete pairs"
+        );
         assert_eq!(
             snapshot
                 .games
@@ -1147,7 +1375,7 @@ mod tests {
                 .filter(|g| g.variant_a_is_white)
                 .count(),
             2,
-            "games 0 and 2 (of 3) should have A playing White"
+            "A should play White exactly once in each pair"
         );
         assert!(
             snapshot
@@ -1196,11 +1424,11 @@ mod tests {
     async fn run_experiment_sets_finished_at_once_every_game_has_settled() {
         let game_store = GameStore::new();
         let experiments = ExperimentStore::new();
-        let created = experiments.create(fake_spec(1));
+        let created = experiments.create(fake_spec(2));
         assert_eq!(created.metadata.finished_at, None);
 
         let before = Utc::now();
-        run_experiment(game_store, experiments.clone(), created.id, fake_spec(1)).await;
+        run_experiment(game_store, experiments.clone(), created.id, fake_spec(2)).await;
         let after = Utc::now();
 
         let snapshot = experiments.snapshot(created.id).unwrap();

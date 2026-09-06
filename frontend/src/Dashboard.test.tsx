@@ -20,6 +20,7 @@ function game(overrides: Partial<GameSnapshot> = {}): GameSnapshot {
     id: "g1",
     fen: "start",
     moves: [],
+    uci_log: [],
     white: { kind: "human" },
     black: { kind: "human" },
     experiment_id: null,

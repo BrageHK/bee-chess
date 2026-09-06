@@ -342,12 +342,16 @@ pub fn run<R: BufRead, W: Write>(
                 writeln!(output, "id author {ENGINE_AUTHOR}")?;
                 writeln!(output, "option name Evaluator type combo default Positional var Positional var Material var Experimental")?;
                 // Experimental search feature switches -- see
-                // `SearchOptions`'s docs. Both default to `true` (the
+                // `SearchOptions`'s docs. These default to `true` (the
                 // normal, strongest configuration); Bee Lab's A/B
                 // experiment runner is the intended way to turn one off,
                 // not a permanent engine configuration.
                 writeln!(output, "option name UseTT type check default true")?;
                 writeln!(output, "option name UseQuiescence type check default true")?;
+                writeln!(
+                    output,
+                    "option name UseEnhancedQuiescence type check default true"
+                )?;
                 // See `crate::book`'s module docs -- `None` is the
                 // default (a book is an opt-in experiment), `Cow` is
                 // the first, deliberately small opening book.
@@ -387,6 +391,14 @@ pub fn run<R: BufRead, W: Write>(
                         None => engine.emit_diagnostic(
                             DiagnosticLevel::Warn,
                             format!("ignored invalid UseQuiescence value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseEnhancedQuiescence") {
+                    match parse_uci_check(&value) {
+                        Some(enabled) => engine.set_use_enhanced_quiescence(enabled),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseEnhancedQuiescence value: {value}"),
                         ),
                     }
                 } else if name.eq_ignore_ascii_case("OpeningBook") {
@@ -753,6 +765,7 @@ mod tests {
         assert!(text.contains("var Experimental"));
         assert!(text.contains("option name UseTT type check default true"));
         assert!(text.contains("option name UseQuiescence type check default true"));
+        assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name OpeningBook type combo default None"));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
@@ -792,6 +805,15 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert!(!engine.search_options().use_quiescence);
+    }
+
+    #[test]
+    fn setoption_disables_enhanced_quiescence() {
+        let input = b"setoption name UseEnhancedQuiescence value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_enhanced_quiescence);
     }
 
     #[test]

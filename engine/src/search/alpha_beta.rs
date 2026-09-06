@@ -425,7 +425,16 @@ fn negamax(
     if depth == 0 {
         let score = if state.options.use_quiescence {
             quiescence(
-                position, alpha, beta, ply, ply, evaluator, nodes, deadline, path,
+                position,
+                alpha,
+                beta,
+                ply,
+                ply,
+                evaluator,
+                nodes,
+                deadline,
+                path,
+                state.options.use_enhanced_quiescence,
             )?
         } else {
             evaluator.evaluate(position)
@@ -592,6 +601,7 @@ fn quiescence(
     nodes: &mut u64,
     deadline: &Deadline,
     path: &mut Vec<u64>,
+    use_enhanced_quiescence: bool,
 ) -> Option<Score> {
     if deadline.is_expired(*nodes) {
         return None;
@@ -614,23 +624,32 @@ fn quiescence(
         return Some(terminal_score(position, ply));
     }
 
+    let must_evade_check = use_enhanced_quiescence && position.in_check();
     let stand_pat = evaluator.evaluate(position);
-    if stand_pat >= beta {
-        return Some(stand_pat); // opponent already wouldn't allow reaching this quiet line
-    }
-    let mut best = stand_pat;
-    alpha = alpha.max(stand_pat);
+    let mut best = if must_evade_check {
+        -SCORE_INF
+    } else {
+        if stand_pat >= beta {
+            return Some(stand_pat); // opponent already wouldn't allow reaching this quiet line
+        }
+        alpha = alpha.max(stand_pat);
+        stand_pat
+    };
 
     if ply - start_ply >= MAX_QUIESCENCE_PLY {
-        return Some(best); // safety valve -- see MAX_QUIESCENCE_PLY's docs
+        return Some(stand_pat); // safety valve -- see MAX_QUIESCENCE_PLY's docs
     }
 
-    let mut captures: Vec<Move> = moves
+    let mut noisy_moves: Vec<Move> = moves
         .into_iter()
-        .filter(|&mv| is_capture(position, mv))
+        .filter(|&mv| {
+            must_evade_check
+                || is_capture(position, mv)
+                || (use_enhanced_quiescence && mv.flag().promotion_kind().is_some())
+        })
         .collect();
-    captures.sort_unstable_by_key(|&mv| std::cmp::Reverse(capture_order_score(position, mv)));
-    for mv in captures {
+    noisy_moves.sort_unstable_by_key(|&mv| std::cmp::Reverse(capture_order_score(position, mv)));
+    for mv in noisy_moves {
         let undo = position.make_move(mv);
         path.push(position.zobrist_hash());
         let outcome = quiescence(
@@ -643,6 +662,7 @@ fn quiescence(
             nodes,
             deadline,
             path,
+            use_enhanced_quiescence,
         );
         path.pop();
         position.unmake_move(mv, undo);
@@ -1132,6 +1152,7 @@ mod tests {
         let mut state = SearchState::new(SearchOptions {
             use_tt: false,
             use_quiescence: true,
+            use_enhanced_quiescence: true,
         });
         let mut path = vec![position.zobrist_hash()];
         let mut nodes = 0;
@@ -1188,6 +1209,7 @@ mod tests {
             SearchOptions {
                 use_tt: true,
                 use_quiescence: false,
+                use_enhanced_quiescence: true,
             },
         );
 
@@ -1196,6 +1218,51 @@ mod tests {
             (best_move.from(), best_move.to()),
             ("d4".parse().unwrap(), "d5".parse().unwrap()),
             "with quiescence off, depth 1 should walk into the losing trade quiescence normally avoids"
+        );
+    }
+
+    #[test]
+    fn enhanced_quiescence_searches_quiet_check_evasions() {
+        let mut position =
+            Position::from_fen("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1").expect("valid FEN");
+        assert!(position.in_check());
+
+        let mut baseline_nodes = 0;
+        let mut baseline_path = vec![position.zobrist_hash()];
+        quiescence(
+            &mut position,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            0,
+            &MaterialEvaluator,
+            &mut baseline_nodes,
+            &Deadline::none(),
+            &mut baseline_path,
+            false,
+        )
+        .unwrap();
+
+        let mut enhanced_nodes = 0;
+        let mut enhanced_path = vec![position.zobrist_hash()];
+        quiescence(
+            &mut position,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            0,
+            &MaterialEvaluator,
+            &mut enhanced_nodes,
+            &Deadline::none(),
+            &mut enhanced_path,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(baseline_nodes, 1, "capture-only quiescence stands pat");
+        assert!(
+            enhanced_nodes > baseline_nodes,
+            "enhanced quiescence must search the legal king evasions"
         );
     }
 }

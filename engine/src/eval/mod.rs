@@ -335,17 +335,17 @@ mod tests {
     }
 
     #[test]
-    fn experimental_evaluator_rewards_rooks_on_open_and_semi_open_files() {
+    fn experimental_and_positional_rook_terms_stay_in_sync() {
         let open = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let semi_open = Position::from_fen("4k3/p7/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let closed = Position::from_fen("4k3/8/8/8/8/8/P7/R3K3 w - - 0 1").unwrap();
 
-        let bonus_over_positional = |position: &Position| {
-            ExperimentalEvaluator.evaluate(position) - PositionalEvaluator.evaluate(position)
-        };
-        assert!((9..=11).contains(&bonus_over_positional(&open)));
-        assert!((4..=6).contains(&bonus_over_positional(&semi_open)));
-        assert_eq!(bonus_over_positional(&closed), 0);
+        for position in [&open, &semi_open, &closed] {
+            assert_eq!(
+                ExperimentalEvaluator.evaluate(position),
+                PositionalEvaluator.evaluate(position)
+            );
+        }
     }
 
     #[test]

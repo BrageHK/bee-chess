@@ -178,6 +178,8 @@ struct CreateExperimentRequest {
     variant_a: ExperimentVariantRequest,
     variant_b: ExperimentVariantRequest,
     games: u32,
+    #[serde(default = "default_experiment_concurrency")]
+    concurrency: u32,
     #[serde(default)]
     move_time_ms: Option<u64>,
     #[serde(default)]
@@ -186,6 +188,10 @@ struct CreateExperimentRequest {
 
 fn default_experiment_engine() -> String {
     "bee".to_string()
+}
+
+fn default_experiment_concurrency() -> u32 {
+    2
 }
 
 /// `POST /api/experiments`: starts a new A/B experiment (see
@@ -198,10 +204,21 @@ async fn create_experiment(
     State(state): State<ApiState>,
     Json(request): Json<CreateExperimentRequest>,
 ) -> impl IntoResponse {
-    if request.games == 0 {
+    if request.games == 0 || request.games % 2 != 0 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorBody::new("games must be at least 1")),
+            Json(ErrorBody::new(
+                "games must be a positive even number so every game has a color-swapped partner",
+            )),
+        )
+            .into_response();
+    }
+    if request.concurrency == 0 || request.concurrency > request.games {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new(
+                "concurrency must be between 1 and the number of games",
+            )),
         )
             .into_response();
     }
@@ -237,6 +254,7 @@ async fn create_experiment(
         variant_a,
         variant_b,
         requested_games: request.games,
+        concurrency: request.concurrency,
         move_time_ms: request.move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS),
     };
 
@@ -674,7 +692,7 @@ mod tests {
                                 "engine": "fake",
                                 "variant_a": {"label": "A1"},
                                 "variant_b": {"label": "B1"},
-                                "games": 1,
+                                "games": 2,
                             })
                             .to_string(),
                         ))
@@ -696,7 +714,7 @@ mod tests {
                                 "engine": "fake",
                                 "variant_a": {"label": "A2"},
                                 "variant_b": {"label": "B2"},
-                                "games": 1,
+                                "games": 2,
                             })
                             .to_string(),
                         ))
@@ -752,7 +770,7 @@ mod tests {
                             "engine": "fake",
                             "variant_a": {"label": "A"},
                             "variant_b": {"label": "B"},
-                            "games": 1,
+                            "games": 2,
                             "move_time_ms": 20,
                         })
                         .to_string(),
@@ -772,8 +790,9 @@ mod tests {
                 .iter()
                 .find(|g| g.experiment_id.map(|id| id.to_string()) == Some(experiment_id.clone()))
             {
-                assert!(!game.moves.is_empty() || game.status != GameStatus::Running);
-                return;
+                if !game.moves.is_empty() || game.status != GameStatus::Running {
+                    return;
+                }
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1110,32 +1129,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_experiments_with_zero_games_is_400() {
+    async fn post_experiments_requires_a_positive_even_game_count() {
         let mut registry = EngineRegistry::new();
         registry.insert("fake", fake_engine_spec());
         let app = router(GameStore::new(), registry);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/experiments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "engine": "fake",
-                            "variant_a": {"label": "A"},
-                            "variant_b": {"label": "B"},
-                            "games": 0,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for games in [0, 3] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/experiments")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "engine": "fake",
+                                "variant_a": {"label": "A"},
+                                "variant_b": {"label": "B"},
+                                "games": games,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_experiments_requires_concurrency_within_the_game_count() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        for concurrency in [0, 5] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/experiments")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "engine": "fake",
+                                "variant_a": {"label": "A"},
+                                "variant_b": {"label": "B"},
+                                "games": 4,
+                                "concurrency": concurrency,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

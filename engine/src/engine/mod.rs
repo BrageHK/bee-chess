@@ -229,6 +229,10 @@ impl Engine {
         self.search_options.use_quiescence = use_quiescence;
     }
 
+    pub fn set_use_enhanced_quiescence(&mut self, use_enhanced_quiescence: bool) {
+        self.search_options.use_enhanced_quiescence = use_enhanced_quiescence;
+    }
+
     /// Resets game/search-specific engine state (TT generation and
     /// similar, once that exists) for a new game. This does **not**
     /// reset `position_history` or set the board to the starting
