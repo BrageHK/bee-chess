@@ -297,9 +297,40 @@ pub struct ExperimentSnapshot {
     /// scoring convention -- `None` until at least one game has
     /// finished, rather than a misleading `0.0`.
     pub score_a: Option<f64>,
+    /// A's estimated Elo advantage over B, derived from `score_a` via
+    /// the standard chess-engine-testing formula (see
+    /// `elo_diff_from_score`) -- `None` whenever `score_a` is (no
+    /// games settled yet), plus at the two scores that formula can't
+    /// produce a finite number for (a perfect 0% or 100% score: see
+    /// that function's docs). This is a point estimate only -- no
+    /// confidence interval yet (a later PR in this same
+    /// strength-measurement sequence), so read a small-sample number
+    /// here with real skepticism, the same way you would a "51% score
+    /// after 3 games."
+    pub elo_diff_a: Option<f64>,
     pub games: Vec<ExperimentGame>,
     pub metadata: ExperimentMetadata,
     pub stats: ExperimentStats,
+}
+
+/// The standard chess-engine-testing Elo-difference-from-score
+/// formula: `-400 * log10(1/score - 1)`. `score` is variant A's score
+/// as a fraction of games played (0.0 = A lost every game, 1.0 = A
+/// won every game, 0.5 = even) -- see `score_a`'s own docs.
+///
+/// Returns `None` at the two scores this formula is undefined for:
+/// `0.0` (would need `-infinity`, i.e. "A is infinitely weaker,"
+/// which isn't a real Elo number) and `1.0` (`+infinity`, same
+/// problem in the other direction). A small number of games producing
+/// a perfect score is exactly the situation where "we can't yet put a
+/// number on how much stronger" is the honest answer, not "here's a
+/// gigantic Elo estimate" -- the same `None`-not-a-misleading-number
+/// stance `score_a`/`ExperimentStats`'s averages already take.
+fn elo_diff_from_score(score: f64) -> Option<f64> {
+    if score <= 0.0 || score >= 1.0 {
+        return None;
+    }
+    Some(-400.0 * ((1.0 / score) - 1.0).log10())
 }
 
 /// Summary numbers a human skimming an experiment actually wants,
@@ -396,6 +427,7 @@ impl From<&Experiment> for ExperimentSnapshot {
         } else {
             Some((f64::from(wins_a) + 0.5 * f64::from(draws)) / f64::from(completed_games))
         };
+        let elo_diff_a = score_a.and_then(elo_diff_from_score);
         ExperimentSnapshot {
             id: experiment.id,
             status: experiment.status(),
@@ -407,6 +439,7 @@ impl From<&Experiment> for ExperimentSnapshot {
             draws,
             wins_b,
             score_a,
+            elo_diff_a,
             games: experiment.games.clone(),
             metadata: experiment.metadata.clone(),
             stats: ExperimentStats::compute(experiment),
@@ -669,7 +702,77 @@ mod tests {
         assert_eq!(snapshot.requested_games, 4);
         assert_eq!(snapshot.completed_games, 0);
         assert_eq!(snapshot.score_a, None);
+        assert_eq!(snapshot.elo_diff_a, None);
         assert!(snapshot.games.is_empty());
+    }
+
+    #[test]
+    fn elo_diff_from_score_is_zero_at_an_even_score() {
+        assert_eq!(elo_diff_from_score(0.5), Some(0.0));
+    }
+
+    #[test]
+    fn elo_diff_from_score_matches_the_standard_reference_values() {
+        // Widely published reference points for this exact formula
+        // (e.g. the CCRL/CEGT Elo-from-score tables) -- cross-checking
+        // against them, not just re-deriving the same formula the
+        // implementation uses, is what actually catches a sign error
+        // or an off-by-something in the log/ratio.
+        let at_60_percent = elo_diff_from_score(0.60).unwrap();
+        assert!((at_60_percent - 70.44).abs() < 0.01, "got {at_60_percent}");
+
+        let at_75_percent = elo_diff_from_score(0.75).unwrap();
+        assert!((at_75_percent - 190.85).abs() < 0.01, "got {at_75_percent}");
+
+        // Symmetric: A scoring 25% (losing 3 of 4, roughly) should be
+        // exactly as far behind as A scoring 75% is ahead.
+        let at_25_percent = elo_diff_from_score(0.25).unwrap();
+        assert!(
+            (at_25_percent + at_75_percent).abs() < 1e-9,
+            "should be exact negatives of each other"
+        );
+    }
+
+    #[test]
+    fn elo_diff_from_score_is_none_at_a_perfect_score_either_direction() {
+        assert_eq!(
+            elo_diff_from_score(0.0),
+            None,
+            "can't estimate finite Elo from an all-loss record"
+        );
+        assert_eq!(
+            elo_diff_from_score(1.0),
+            None,
+            "can't estimate finite Elo from an all-win record"
+        );
+    }
+
+    #[test]
+    fn snapshot_elo_diff_tracks_score_a_including_a_perfect_score() {
+        let store = ExperimentStore::new();
+        let created = store.create(fake_spec(1));
+        let game_id: GameId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        store.record_game_started(created.id, game_id, true);
+        store.record_game_outcome(
+            created.id,
+            game_id,
+            GameOutcome::Finished {
+                result: GameResult::WhiteWins,
+            },
+            Some(30),
+        );
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(
+            snapshot.score_a,
+            Some(1.0),
+            "A played White and White won -- a perfect score so far"
+        );
+        assert_eq!(
+            snapshot.elo_diff_a, None,
+            "a perfect score from one game is exactly the 'can't estimate yet' case, not a real Elo number"
+        );
     }
 
     #[test]
@@ -889,6 +992,11 @@ mod tests {
         assert_eq!(snapshot.wins_b, 1);
         assert_eq!(snapshot.draws, 0);
         assert_eq!(snapshot.score_a, Some(0.5));
+        assert_eq!(
+            snapshot.elo_diff_a,
+            Some(0.0),
+            "an even score through the real snapshot path"
+        );
     }
 
     #[test]
