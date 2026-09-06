@@ -68,7 +68,7 @@ def export(checkpoint_path: Path, out_path: Path, opset: int = 17, static_batch:
     can't compile the `Shape`/`Slice` ops a dynamic batch axis forces inside
     `nn.MultiheadAttention`'s internal reshape -- irrelevant for a one-board-
     at-a-time inference site anyway (see mz-web's ChessMamba integration)."""
-    model, config = load_model(checkpoint_path)
+    model, _config = load_model(checkpoint_path)
     in_dim = 12 + 8  # N_PIECE_TYPES + N_AUX, matches encode.py (n_history=0)
     batch = 1 if static_batch else 2
     dummy = torch.randn(batch, 64, in_dim)

@@ -35,6 +35,7 @@ from torch import nn
 
 from bee_training.chess_mamba.triton_scan import TRITON_AVAILABLE, triton_pscan
 
+
 def _sequential_scan(Abar, BX):
     """h_t = Abar_t * h_{t-1} + BX_t, h_{-1} = 0, as a plain Python loop.
 
