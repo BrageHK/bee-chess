@@ -30,6 +30,7 @@ function humanSnapshot(overrides: Partial<{ id: string; fen: string; moves: stri
     status: "running" as const,
     white: { kind: "human" as const },
     black: { kind: "human" as const },
+    experiment_id: null as string | null,
     ...overrides,
   };
 }
