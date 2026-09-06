@@ -96,7 +96,7 @@ export function ExperimentView({
               style={{ width: `${Math.round(progress * 100)}%` }}
             />
           </div>
-          <div className="grid grid-cols-4 gap-2 text-center font-mono text-sm">
+          <div className="grid grid-cols-5 gap-2 text-center font-mono text-sm">
             <Stat label={`${snapshot.label_a} wins`} value={snapshot.wins_a} />
             <Stat label="Draws" value={snapshot.draws} />
             <Stat label={`${snapshot.label_b} wins`} value={snapshot.wins_b} />
@@ -104,6 +104,7 @@ export function ExperimentView({
               label={`${snapshot.label_a} score`}
               value={snapshot.score_a === null ? "—" : `${Math.round(snapshot.score_a * 100)}%`}
             />
+            <Stat label="Elo diff" value={formatEloDiff(snapshot.elo_diff_a)} />
           </div>
         </PanelBody>
       </Panel>
@@ -159,6 +160,16 @@ function formatRounded(value: number | null): string {
 
 function formatOneDecimal(value: number | null): string {
   return value === null ? "—" : value.toFixed(1);
+}
+
+/** A point Elo estimate, always signed (`+37`/`-12`) so it reads as
+ * "A's advantage" at a glance rather than needing the reader to
+ * compare against the label above it -- "—" for `null` (no data yet,
+ * or an undefined perfect-score estimate; see `elo_diff_a`'s docs). */
+function formatEloDiff(value: number | null): string {
+  if (value === null) return "—";
+  const rounded = Math.round(value);
+  return rounded >= 0 ? `+${rounded}` : String(rounded);
 }
 
 function Stat({ label, value }: { label: string; value: string | number }) {

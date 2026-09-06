@@ -163,6 +163,12 @@ export interface ExperimentSnapshot {
   draws: number;
   wins_b: number;
   score_a: number | null;
+  /** A's estimated Elo advantage over B, derived from `score_a` --
+   * `null` whenever `score_a` is, plus at a perfect 0%/100% score
+   * (see `lab::experiment::elo_diff_from_score`'s docs on why those
+   * two can't produce a finite number). A point estimate only -- no
+   * confidence interval yet. */
+  elo_diff_a: number | null;
   games: ExperimentGame[];
   metadata: ExperimentMetadata;
   stats: ExperimentStats;

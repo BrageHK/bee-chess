@@ -82,9 +82,40 @@ describe("ExperimentView", () => {
     render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
 
     await screen.findByText(/0 \/ 20 games/);
-    // avg duration / avg plies / games-per-hour all render "—" rather
-    // than a misleading 0 while nothing has settled yet.
-    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(3);
+    // avg duration / avg plies / games-per-hour / elo diff all render
+    // "—" rather than a misleading 0 while nothing has settled yet.
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("renders a positive Elo estimate with an explicit + sign", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(
+      experimentSnapshotFixture({ score_a: 0.75, elo_diff_a: 190.85 }),
+    );
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    expect(await screen.findByText("+191")).toBeInTheDocument();
+  });
+
+  it("renders a negative Elo estimate without a double sign", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(
+      experimentSnapshotFixture({ score_a: 0.25, elo_diff_a: -190.85 }),
+    );
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    expect(await screen.findByText("-191")).toBeInTheDocument();
+  });
+
+  it("shows a placeholder Elo estimate at a perfect score rather than a fake number", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(
+      experimentSnapshotFixture({ status: "completed", completed_games: 3, wins_a: 3, score_a: 1.0, elo_diff_a: null }),
+    );
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    expect(await screen.findByText("100%")).toBeInTheDocument();
+    expect(screen.getByText("Elo diff").previousSibling).toHaveTextContent("—");
   });
 
   it("clicking a game row calls onOpenGame with that game's id", async () => {
