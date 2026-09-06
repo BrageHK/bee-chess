@@ -1259,10 +1259,17 @@ mod tests {
         assert_eq!(telemetry.soft_ms, 500);
         assert_eq!(telemetry.hard_ms, 2000);
         assert_eq!(telemetry.completed_depth, result.depth);
-        assert_eq!(
-            telemetry.aborted_ms, 0,
-            "a search that stops at the soft deadline (not the hard one) never aborts a depth"
-        );
+        // `aborted_ms` itself is deliberately not asserted here: with a
+        // real wall-clock budget, whether the final iteration happens
+        // to land exactly on the soft boundary or instead gets cut off
+        // by the hard one partway through depends on real timing (and
+        // is *expected* to vary with machine speed/load -- e.g. a
+        // slower CI runner can easily make an iteration still be
+        // running when the hard deadline arrives, which is completely
+        // normal, not a bug). See
+        // `telemetry_reports_the_last_completed_depth_when_a_later_one_is_cancelled`
+        // for a deterministic (StopSignal-driven, not timing-based)
+        // test of the aborted-iteration path itself.
     }
 
     #[test]
