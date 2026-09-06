@@ -44,6 +44,31 @@ class DirectionalMamba(nn.Module):
         super().__init__()
         self.register_buffer("idx", idx)     # (num_lines, max_len)
         self.register_buffer("mask", mask)   # (num_lines, max_len)
+        # Every square appears in exactly one (line, pos) slot across a whole
+        # family (ranks/files/diagonals all partition the 64 squares), so the
+        # flat valid positions and the squares they map to are both a
+        # permutation of 0..63. Precompute that permutation's inverse once so
+        # `forward` can recombine the per-line outputs with a plain gather
+        # (`out[:, sq] = y_flat[:, inv_idx[sq]]`) instead of a scatter/
+        # index_add_ -- ONNX export refuses to trace index_add_ at all when
+        # its index tensor has any repeats (here, every padding slot repeats
+        # square 0), even when those repeats are harmless in eager PyTorch.
+        # persistent=False: derived from idx/mask, so it must not become a
+        # required key in old checkpoints' state_dicts.
+        flat_idx, flat_mask = idx.reshape(-1), mask.reshape(-1)
+        inv_idx = torch.zeros(64, dtype=torch.long)
+        inv_idx[flat_idx[flat_mask]] = flat_mask.nonzero(as_tuple=True)[0]
+        self.register_buffer("inv_idx", inv_idx, persistent=False)  # (64,)
+        # `.flip()` traces to ONNX as a negative-step `Slice` (start=-1,
+        # end=-(very large sentinel for "negative infinity"), step=-1) --
+        # burn-onnx's ONNX-to-Rust codegen (used by mz-web's ChessMamba
+        # integration) literalizes that sentinel as-is into an untyped
+        # integer, which overflows i32 and fails to compile. `index_select`
+        # over a precomputed reversed-index buffer is the same operation
+        # (this dim's length, `max_len`, is fixed and known here) but traces
+        # to a plain `Gather`, which both onnxruntime and burn-onnx handle.
+        max_len = idx.shape[1]
+        self.register_buffer("rev_idx", torch.arange(max_len - 1, -1, -1), persistent=False)
         self.mamba_fwd = MambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
         self.mamba_bwd = MambaBlock(d_model, d_state=d_state, expand=expand, scan_backend=scan_backend)
         self._scan = get_scan_fn(scan_backend)
@@ -60,9 +85,9 @@ class DirectionalMamba(nn.Module):
         mask_tiled = self.mask.unsqueeze(0).expand(B, num_lines, max_len).reshape(-1, max_len)
 
         flat_fwd = flat
-        flat_bwd = flat.flip(dims=[1])
+        flat_bwd = flat.index_select(1, self.rev_idx)
         mask_fwd = mask_tiled
-        mask_bwd = mask_tiled.flip(dims=[-1])
+        mask_bwd = mask_tiled.index_select(-1, self.rev_idx)
 
         # in_proj + SSM projection stay per-direction (separate weights, cheap)
         xz_fwd = self.mamba_fwd.in_proj(flat_fwd)
@@ -85,16 +110,10 @@ class DirectionalMamba(nn.Module):
 
         y_bwd = self.mamba_bwd.ssm.combine(hs_b, Cmat_b, x_bwd, mask=mask_bwd)
         y_bwd = self.mamba_bwd.out_proj(y_bwd * F.silu(z_bwd))
-        y_bwd = y_bwd.flip(dims=[1])
+        y_bwd = y_bwd.index_select(1, self.rev_idx)
 
-        y = (y_fwd + y_bwd).view(B, num_lines, max_len, D)
-        y = y * self.mask.unsqueeze(0).unsqueeze(-1)
-
-        out = board_feats.new_zeros(B, 64, D)
-        idx_flat = self.idx.reshape(-1)          # (num_lines*max_len,)
-        y_flat = y.reshape(B, num_lines * max_len, D)
-        out.index_add_(1, idx_flat, y_flat)
-        return out
+        y_flat = (y_fwd + y_bwd).reshape(B, num_lines * max_len, D)
+        return y_flat[:, self.inv_idx, :]
 
 
 class KnightGraphMixer(nn.Module):
