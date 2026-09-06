@@ -36,10 +36,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::game::{EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore};
+
+/// The git commit `bee-lab` itself was built from -- embedded at
+/// compile time by `build.rs` (`"unknown"` if that couldn't determine
+/// one, e.g. a packaged binary with no `.git` around). Recorded on
+/// every `ExperimentMetadata` so a result can always be traced back
+/// to exactly which build of Lab (and, since this workspace builds
+/// them together, `bee`) produced it -- see that type's docs.
+pub const LAB_GIT_COMMIT: &str = env!("BEE_LAB_GIT_COMMIT");
 
 /// Opaque experiment identifier, serialized as a plain string over the
 /// API -- same shape as `GameId`.
@@ -83,6 +92,48 @@ pub struct ExperimentSpec {
     pub variant_b: EngineVariant,
     pub requested_games: u32,
     pub move_time_ms: u64,
+}
+
+/// Enough about how/when an experiment ran to make its numbers
+/// interpretable again later -- a score by itself doesn't say which
+/// build of Bee produced it, when, or with what exact `argv`. Recorded
+/// once at creation (`lab_git_commit`, `variant_a_argv`/
+/// `variant_b_argv`, `started_at`) plus once more when the experiment
+/// finishes (`finished_at`) -- see `Experiment::finish`.
+///
+/// Doesn't (yet) record an opening/start-position policy as its own
+/// field: v1 always plays from the standard starting position (see
+/// this module's own docs), so that's implicit rather than a real
+/// per-experiment choice to record -- add a field here once that
+/// stops being true.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperimentMetadata {
+    pub lab_git_commit: String,
+    /// The exact `argv` each variant's engine process was spawned
+    /// with -- e.g. `["/path/to/bee"]` -- not just its label, since
+    /// two variants can (and in the intended usage, do) share the
+    /// same binary and differ only in `setoption`s (see `EngineConfig`).
+    /// The `setoption`s themselves are already visible on the
+    /// snapshot's `label_a`/`label_b` config the frontend rendered
+    /// them from, so aren't duplicated here.
+    pub variant_a_argv: Vec<String>,
+    pub variant_b_argv: Vec<String>,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the experiment is still running -- see
+    /// `Experiment::finish`.
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl ExperimentMetadata {
+    fn new(spec: &ExperimentSpec) -> Self {
+        ExperimentMetadata {
+            lab_git_commit: LAB_GIT_COMMIT.to_string(),
+            variant_a_argv: spec.variant_a.config.spec.argv.clone(),
+            variant_b_argv: spec.variant_b.config.spec.argv.clone(),
+            started_at: Utc::now(),
+            finished_at: None,
+        }
+    }
 }
 
 /// One game this experiment ran or is running, in the order it was
@@ -137,6 +188,7 @@ pub struct Experiment {
     pub id: ExperimentId,
     pub spec: ExperimentSpec,
     pub games: Vec<ExperimentGame>,
+    pub metadata: ExperimentMetadata,
     /// Monotonically increasing creation order, used only by
     /// `ExperimentStore::list` to sort newest-first -- an
     /// `ExperimentId` is a random `Uuid::new_v4`, so it carries no
@@ -152,10 +204,12 @@ static NEXT_EXPERIMENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 impl Experiment {
     fn new(id: ExperimentId, spec: ExperimentSpec) -> Self {
+        let metadata = ExperimentMetadata::new(&spec);
         Experiment {
             id,
             spec,
             games: Vec::new(),
+            metadata,
             created_seq: NEXT_EXPERIMENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -227,6 +281,7 @@ pub struct ExperimentSnapshot {
     /// finished, rather than a misleading `0.0`.
     pub score_a: Option<f64>,
     pub games: Vec<ExperimentGame>,
+    pub metadata: ExperimentMetadata,
 }
 
 impl From<&Experiment> for ExperimentSnapshot {
@@ -250,6 +305,7 @@ impl From<&Experiment> for ExperimentSnapshot {
             wins_b,
             score_a,
             games: experiment.games.clone(),
+            metadata: experiment.metadata.clone(),
         }
     }
 }
@@ -339,6 +395,25 @@ impl ExperimentStore {
             game.outcome = outcome;
         }
     }
+
+    /// Records `id`'s experiment as finished right now -- called once,
+    /// by `run_experiment`, after its last game has settled. A no-op
+    /// if the experiment doesn't exist or `finished_at` is already
+    /// set, so calling it twice (there's no real path to that today,
+    /// but nothing here should assume there never will be) can't
+    /// silently overwrite an earlier, more accurate finish time.
+    fn finish(&self, id: ExperimentId) {
+        let mut experiments = self
+            .experiments
+            .lock()
+            .expect("experiment store mutex poisoned");
+        let Some(experiment) = experiments.get_mut(&id) else {
+            return;
+        };
+        if experiment.metadata.finished_at.is_none() {
+            experiment.metadata.finished_at = Some(Utc::now());
+        }
+    }
 }
 
 /// Runs `id`'s experiment to completion: `spec.requested_games` games,
@@ -404,6 +479,8 @@ pub async fn run_experiment(
             experiments.record_game_outcome(id, snapshot.id, outcome);
         }
     }
+
+    experiments.finish(id);
 }
 
 fn engine_participant_info(variant: &EngineVariant) -> crate::game::ParticipantInfo {
@@ -471,6 +548,20 @@ mod tests {
         assert_eq!(snapshot.completed_games, 0);
         assert_eq!(snapshot.score_a, None);
         assert!(snapshot.games.is_empty());
+    }
+
+    #[test]
+    fn create_records_reproducibility_metadata_with_no_finish_time_yet() {
+        let store = ExperimentStore::new();
+        let before = Utc::now();
+        let snapshot = store.create(fake_spec(1));
+        let after = Utc::now();
+
+        assert_eq!(snapshot.metadata.lab_git_commit, LAB_GIT_COMMIT);
+        assert_eq!(snapshot.metadata.variant_a_argv, fake_bee_spec().argv);
+        assert_eq!(snapshot.metadata.variant_b_argv, fake_bee_spec().argv);
+        assert!(snapshot.metadata.started_at >= before && snapshot.metadata.started_at <= after);
+        assert_eq!(snapshot.metadata.finished_at, None);
     }
 
     #[test]
@@ -702,5 +793,25 @@ mod tests {
                 "a game run_experiment created should link back to its own experiment"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn run_experiment_sets_finished_at_once_every_game_has_settled() {
+        let game_store = GameStore::new();
+        let experiments = ExperimentStore::new();
+        let created = experiments.create(fake_spec(1));
+        assert_eq!(created.metadata.finished_at, None);
+
+        let before = Utc::now();
+        run_experiment(game_store, experiments.clone(), created.id, fake_spec(1)).await;
+        let after = Utc::now();
+
+        let snapshot = experiments.snapshot(created.id).unwrap();
+        let finished_at = snapshot
+            .metadata
+            .finished_at
+            .expect("finished_at should be set once run_experiment returns");
+        assert!(finished_at >= before && finished_at <= after);
+        assert!(finished_at >= snapshot.metadata.started_at);
     }
 }
