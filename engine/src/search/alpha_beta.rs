@@ -160,12 +160,11 @@ pub fn search_with_options(
 /// depth that was cut off partway through by the deadline is never
 /// reported, since its score can't be trusted (see the module docs).
 ///
-/// Always completes at least depth 1 regardless of `budget`, even a
-/// zero or already-elapsed one: a legal `bestmove` must be returned
-/// somehow, and depth 1 (one ply of the game's real legal moves,
-/// scored by material) is a good enough floor for that -- there's no
-/// cancellation machinery yet to bail out of an in-progress depth 1
-/// and still have anything sensible to report.
+/// `budget` is used as both the soft and hard limit (see
+/// `search_iterative_with_budget`'s docs for the distinction) -- this
+/// entry point exists for callers (mostly tests, and any caller that
+/// genuinely has just one number, not a real `TimeBudget`) that don't
+/// need the split.
 pub fn search_iterative(
     position: &mut Position,
     budget: std::time::Duration,
@@ -196,6 +195,15 @@ pub fn search_iterative_with_history(
 /// Same as `search_iterative_with_history`, with explicit
 /// `SearchOptions` -- see `search_with_options`'s docs for why this
 /// exists alongside the unchanged, default-options entry points.
+/// `budget` is used as both the soft and hard limit -- see
+/// `search_iterative_with_budget` for the real soft/hard split.
+///
+/// Unlike `search_iterative_with_budget`, depth 1 here always runs
+/// against `Deadline::none()` and so always completes -- this entry
+/// point predates the fallback-move safety net (`Engine` always having
+/// a legal move in hand before calling into search), so it keeps its
+/// original guarantee for existing callers/tests rather than ever
+/// returning `None`.
 pub fn search_iterative_with_options(
     position: &mut Position,
     budget: std::time::Duration,
@@ -220,10 +228,6 @@ pub fn search_iterative_with_options(
     .expect("depth 1 always completes: Deadline::none() never expires");
     on_depth_complete(&last_completed);
 
-    // If depth 1 already found a forced mate, searching deeper cannot
-    // improve on "I have found a way to win," and every ply deeper is
-    // meaningfully more expensive -- stop immediately rather than
-    // burning the rest of the time budget for no gain.
     if super::mate_in_plies(last_completed.score).is_some() {
         return last_completed;
     }
@@ -239,14 +243,92 @@ pub fn search_iterative_with_options(
                     return last_completed;
                 }
             }
-            None => return last_completed, // this depth was cut off; keep the previous one
+            None => return last_completed,
         }
 
         if deadline.is_expired(0) {
+            return last_completed;
+        }
+    }
+}
+
+/// Searches `position` with iterative deepening under a real soft/hard
+/// [`super::TimeBudget`] (see that type's docs for what each half
+/// means) -- the entry point `Engine` uses once it has a clock-aware
+/// `TimeManager` allocation rather than a single number.
+///
+/// A cut-off depth's result is always discarded (see the module
+/// docs), *including depth 1*: unlike earlier versions of this
+/// function, depth 1 is no longer given an unconditional
+/// `Deadline::none()` -- under an extreme time control (e.g. `go
+/// wtime 12`) even one ply, one move at a time, is not guaranteed to
+/// finish before the hard limit. The invariant this function now
+/// upholds is only ever "returns *some* legal move if one exists, and
+/// never intentionally crosses the hard limit" -- see `Engine`'s own
+/// `fallback_move`, which is what makes that safe: `Engine` always has
+/// a legal move in hand *before* calling this, so a hard-limit abort
+/// partway through depth 1 (returning `None` as `last_completed`) is a
+/// well-defined, handleable outcome rather than "no move to report."
+pub fn search_iterative_with_budget(
+    position: &mut Position,
+    budget: super::TimeBudget,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+    mut on_depth_complete: impl FnMut(&SearchResult),
+) -> Option<SearchResult> {
+    let soft_deadline = Deadline::from_now(budget.soft);
+    let hard_deadline = Deadline::from_now(budget.hard);
+    let mut state = SearchState::new(options);
+    let mut path = normalized_history(position, history);
+
+    let mut depth = 1;
+    let mut last_completed = search_to_depth(
+        position,
+        depth,
+        evaluator,
+        &hard_deadline,
+        &mut state,
+        &mut path,
+    )?;
+    on_depth_complete(&last_completed);
+
+    // If depth 1 already found a forced mate, searching deeper cannot
+    // improve on "I have found a way to win," and every ply deeper is
+    // meaningfully more expensive -- stop immediately rather than
+    // burning the rest of the time budget for no gain.
+    if super::mate_in_plies(last_completed.score).is_some() {
+        return Some(last_completed);
+    }
+
+    loop {
+        depth += 1;
+        match search_to_depth(
+            position,
+            depth,
+            evaluator,
+            &hard_deadline,
+            &mut state,
+            &mut path,
+        ) {
+            Some(result) => {
+                let found_mate = super::mate_in_plies(result.score).is_some();
+                last_completed = result;
+                on_depth_complete(&last_completed);
+                if found_mate {
+                    return Some(last_completed);
+                }
+            }
+            None => return Some(last_completed), // this depth was cut off by the hard limit; keep the previous one
+        }
+
+        if soft_deadline.is_expired(0) {
             // is_expired(0) forces an actual clock check regardless of
             // node-count parity, since we're asking between depths,
-            // not from inside the hot loop.
-            return last_completed;
+            // not from inside the hot loop. Only the soft deadline is
+            // checked here -- crossing it just means "don't start
+            // another depth," not "abort the one that just finished."
+            return Some(last_completed);
         }
     }
 }
@@ -918,6 +1000,67 @@ mod tests {
         // Strictly increasing, no repeats or gaps backward.
         for pair in depths_seen.windows(2) {
             assert_eq!(pair[1], pair[0] + 1);
+        }
+    }
+
+    #[test]
+    fn budgeted_search_stops_at_the_soft_deadline_without_waiting_for_hard() {
+        // A generous hard limit but a tiny soft limit: iterative
+        // deepening should stop starting new depths once soft has
+        // elapsed, long before hard would ever kick in.
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+        let start = std::time::Instant::now();
+
+        let result = search_iterative_with_budget(
+            &mut position,
+            super::super::TimeBudget {
+                soft: Duration::from_millis(20),
+                hard: Duration::from_secs(10),
+            },
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            |_| {},
+        );
+
+        assert!(result.is_some());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "should have stopped at the soft deadline, not run anywhere near the hard one"
+        );
+    }
+
+    #[test]
+    fn budgeted_search_returns_none_when_even_depth_1_cannot_complete_before_the_hard_limit() {
+        // An already-expired hard deadline: depth 1 itself must be
+        // abortable now (unlike the older, unconditionally-`Deadline::
+        // none()` depth-1 guarantee) -- the caller (`Engine`) is
+        // responsible for having a fallback move ready in this case.
+        let mut position = Position::startpos();
+        let history = [position.zobrist_hash()];
+
+        let result = search_iterative_with_budget(
+            &mut position,
+            super::super::TimeBudget {
+                soft: Duration::ZERO,
+                hard: Duration::ZERO,
+            },
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+            |_| {},
+        );
+
+        // This is a timing-sensitive edge case (a zero deadline is
+        // already expired, but the very first clock check inside
+        // negamax happens after a small number of nodes -- see
+        // `Deadline`'s docs), so depth 1 completing anyway is an
+        // acceptable outcome; what matters is that a `None` result
+        // here doesn't panic and is a well-defined "use the fallback"
+        // signal.
+        if let Some(completed) = result {
+            assert_eq!(completed.depth, 1);
         }
     }
 

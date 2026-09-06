@@ -10,10 +10,14 @@ use crate::chess::{Move, Position};
 
 mod alpha_beta;
 mod deadline;
+mod time_manager;
 
 pub use alpha_beta::{
-    search, search_iterative, search_iterative_with_history, search_iterative_with_options,
-    search_with_history, search_with_options,
+    search, search_iterative, search_iterative_with_budget, search_iterative_with_history,
+    search_iterative_with_options, search_with_history, search_with_options,
+};
+pub use time_manager::{
+    allocate_time, ClockTimeControl, TimeBudget, TimeManagerConfig, DEFAULT_MOVE_OVERHEAD_MS,
 };
 
 /// Toggles for experimental search features, exposed to UCI as

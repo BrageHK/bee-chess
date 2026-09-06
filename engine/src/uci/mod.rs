@@ -12,10 +12,10 @@
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
-use crate::chess::{Move, PieceKind, Position, Square};
+use crate::chess::{Color, Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
 use crate::engine::{Engine, EvaluatorKind, OpeningBookKind};
-use crate::search::mate_in_plies;
+use crate::search::{mate_in_plies, DEFAULT_MOVE_OVERHEAD_MS};
 
 pub const ENGINE_NAME: &str = "bee-chess";
 pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
@@ -152,33 +152,65 @@ fn parse_moves_suffix(s: &str) -> Option<Vec<UciMove>> {
 }
 
 /// The parsed body of a `go` command. Recognizes `depth <n>` (fixed-
-/// depth search, see `Engine::search`) and `movetime <ms>`
-/// (time-bounded iterative deepening, see `Engine::search_for_time`).
-/// If both are given, `movetime` takes priority -- iterative deepening
-/// is the more useful default for anything actually playing a timed
-/// game. Clock fields (`wtime`/`btime`/`winc`/`binc`), `infinite`,
-/// `ponder`, `stop`, and real cancellation are follow-up #6/#7 work;
-/// see `SearchLimits` in `crate::search` for the eventual full shape.
+/// depth search, see `Engine::search`), `movetime <ms>` (time-bounded
+/// iterative deepening with a single fixed budget, see
+/// `Engine::search_for_time`), and the real UCI clock fields
+/// (`wtime`/`btime`/`winc`/`binc`/`movestogo`, see
+/// `Engine::search_with_clock`). Priority when more than one applies:
+/// `movetime` first, then clock fields, then `depth`, matching the
+/// dispatch order in `run` below -- movetime and the clock fields are
+/// both "time-bounded search," and movetime is the more explicit
+/// request when both happen to be present. `infinite`, `ponder`,
+/// `stop`, and real cancellation are follow-up work; see
+/// `SearchLimits` in `crate::search` for the eventual full shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GoCommand {
     pub depth: Option<u32>,
     pub movetime_ms: Option<u64>,
+    pub white_time_ms: Option<u64>,
+    pub black_time_ms: Option<u64>,
+    pub white_increment_ms: Option<u64>,
+    pub black_increment_ms: Option<u64>,
+    pub moves_to_go: Option<u32>,
 }
 
 impl GoCommand {
     /// Parses the argument portion of a `go` command, i.e. everything
-    /// after `"go"`. Currently only recognizes `depth <n>` and
-    /// `movetime <ms>`; any other token is ignored rather than
-    /// rejected, since a real `go` line from a GUI will carry fields
-    /// (`wtime`, `btime`, ...) this milestone doesn't act on yet, and
-    /// ignoring them is more useful than refusing the whole command
-    /// over them.
+    /// after `"go"`. Recognizes `depth <n>`, `movetime <ms>`, and
+    /// `wtime`/`btime`/`winc`/`binc`/`movestogo`; any other token
+    /// (`infinite`, `ponder`, ...) is ignored rather than rejected,
+    /// since a real `go` line from a GUI may carry fields this
+    /// milestone doesn't act on yet, and ignoring them is more useful
+    /// than refusing the whole command over them.
     pub fn parse(args: &str) -> Self {
         let tokens: Vec<&str> = args.split_whitespace().collect();
         GoCommand {
             depth: go_field(&tokens, "depth"),
             movetime_ms: go_field(&tokens, "movetime"),
+            white_time_ms: go_field(&tokens, "wtime"),
+            black_time_ms: go_field(&tokens, "btime"),
+            white_increment_ms: go_field(&tokens, "winc"),
+            black_increment_ms: go_field(&tokens, "binc"),
+            moves_to_go: go_field(&tokens, "movestogo"),
         }
+    }
+
+    /// Resolves this command's clock fields to `side`'s own
+    /// side-relative `ClockTimeControl` (see that type's docs), or
+    /// `None` if the command didn't carry a time-left field for
+    /// `side` at all (e.g. `go depth 8`, `go movetime 500`, `go
+    /// infinite`) -- `Engine::search_with_clock` should only be used
+    /// when this returns `Some`.
+    pub fn clock_for(&self, side: Color) -> Option<crate::search::ClockTimeControl> {
+        let (time_left_ms, increment_ms) = match side {
+            Color::White => (self.white_time_ms?, self.white_increment_ms.unwrap_or(0)),
+            Color::Black => (self.black_time_ms?, self.black_increment_ms.unwrap_or(0)),
+        };
+        Some(crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_millis(time_left_ms),
+            increment: std::time::Duration::from_millis(increment_ms),
+            moves_to_go: self.moves_to_go,
+        })
     }
 }
 
@@ -355,6 +387,17 @@ pub fn run<R: BufRead, W: Write>(
                     output,
                     "option name OpeningBook type combo default None var None var Cow"
                 )?;
+                // See `crate::search::TimeManagerConfig::move_overhead`'s
+                // docs -- milliseconds reserved every move for
+                // protocol/process/network delay, never planned as
+                // thinking time. The right value depends on the
+                // deployment (a network round trip to a Lichess bridge
+                // needs more than a local GUI).
+                writeln!(
+                    output,
+                    "option name MoveOverhead type spin default {} min 0 max 1000",
+                    DEFAULT_MOVE_OVERHEAD_MS
+                )?;
                 writeln!(output, "uciok")?;
             }
             UciCommand::IsReady => {
@@ -398,6 +441,14 @@ pub fn run<R: BufRead, W: Write>(
                             format!("ignored invalid OpeningBook value: {value}"),
                         );
                     }
+                } else if name.eq_ignore_ascii_case("MoveOverhead") {
+                    match value.trim().parse::<u64>() {
+                        Ok(ms) => engine.set_move_overhead(std::time::Duration::from_millis(ms)),
+                        Err(_) => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid MoveOverhead value: {value}"),
+                        ),
+                    }
                 } else {
                     engine.emit_diagnostic(
                         DiagnosticLevel::Info,
@@ -417,36 +468,39 @@ pub fn run<R: BufRead, W: Write>(
                 // No real cancellation/threading yet (see GoCommand's
                 // docs and #6/#7) -- `go` runs to completion
                 // synchronously before this loop reads its next line.
-                // movetime takes priority over depth when both are
-                // given, since time-bounded search is the more useful
-                // default for anything actually playing a timed game.
-                let result = match go_command.movetime_ms {
-                    Some(movetime_ms) => {
-                        let budget = std::time::Duration::from_millis(movetime_ms);
-                        let start = Instant::now();
-                        engine.search_for_time(budget, |depth_result| {
-                            let _ = write_search_info(&mut output, depth_result, start.elapsed());
-                        })
+                // Priority when more than one applies: movetime, then
+                // the real UCI clock (wtime/btime/...), then depth --
+                // see `GoCommand`'s docs for why.
+                let side_to_move = engine.position().side_to_move();
+                let result = if let Some(movetime_ms) = go_command.movetime_ms {
+                    let budget = std::time::Duration::from_millis(movetime_ms);
+                    let start = Instant::now();
+                    engine.search_for_time(budget, |depth_result| {
+                        let _ = write_search_info(&mut output, depth_result, start.elapsed());
+                    })
+                } else if let Some(control) = go_command.clock_for(side_to_move) {
+                    let start = Instant::now();
+                    engine.search_with_clock(control, |depth_result| {
+                        let _ = write_search_info(&mut output, depth_result, start.elapsed());
+                    })
+                } else {
+                    // Default to a shallow depth when none of
+                    // movetime/wtime/btime is given, since there's no
+                    // time-based stopping condition to fall back on
+                    // instead.
+                    const DEFAULT_DEPTH: u32 = 4;
+                    let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
+                    let start = Instant::now();
+                    let result = engine.search(depth);
+                    // depth == 0 means this was a book hit (see
+                    // `Engine::book_move`'s docs), not a real
+                    // search -- there's no depth/node count to
+                    // report, so writing an "info depth 0 ..."
+                    // line for it would misrepresent it as one.
+                    if result.depth > 0 {
+                        write_search_info(&mut output, &result, start.elapsed())?;
                     }
-                    None => {
-                        // Default to a shallow depth when neither
-                        // movetime nor depth is given, since there's
-                        // no time-based stopping condition to fall
-                        // back on instead.
-                        const DEFAULT_DEPTH: u32 = 4;
-                        let depth = go_command.depth.unwrap_or(DEFAULT_DEPTH);
-                        let start = Instant::now();
-                        let result = engine.search(depth);
-                        // depth == 0 means this was a book hit (see
-                        // `Engine::book_move`'s docs), not a real
-                        // search -- there's no depth/node count to
-                        // report, so writing an "info depth 0 ..."
-                        // line for it would misrepresent it as one.
-                        if result.depth > 0 {
-                            write_search_info(&mut output, &result, start.elapsed())?;
-                        }
-                        result
-                    }
+                    result
                 };
 
                 match result.best_move {
@@ -500,14 +554,14 @@ mod tests {
             UciCommand::parse("go depth 1"),
             UciCommand::Go(GoCommand {
                 depth: Some(1),
-                movetime_ms: None
+                ..Default::default()
             })
         );
         assert_eq!(
             UciCommand::parse("go depth 12"),
             UciCommand::Go(GoCommand {
                 depth: Some(12),
-                movetime_ms: None
+                ..Default::default()
             })
         );
     }
@@ -516,24 +570,74 @@ mod tests {
     fn go_command_with_no_depth_has_none() {
         assert_eq!(
             UciCommand::parse("go"),
-            UciCommand::Go(GoCommand {
-                depth: None,
-                movetime_ms: None
-            })
+            UciCommand::Go(GoCommand::default())
         );
     }
 
     #[test]
     fn go_command_ignores_unrecognized_fields() {
-        // A real GUI's `go` line carries fields (wtime/btime/...) this
-        // milestone doesn't act on yet; they must not prevent parsing
-        // the fields we do recognize.
+        // A real GUI's `go` line carries fields (`ponder`, `infinite`,
+        // ...) this milestone doesn't act on yet; they must not
+        // prevent parsing the fields we do recognize.
         assert_eq!(
-            UciCommand::parse("go wtime 300000 btime 300000 depth 3"),
+            UciCommand::parse("go ponder depth 3"),
             UciCommand::Go(GoCommand {
                 depth: Some(3),
-                movetime_ms: None
+                ..Default::default()
             })
+        );
+    }
+
+    #[test]
+    fn go_command_parses_clock_fields() {
+        assert_eq!(
+            UciCommand::parse("go wtime 300000 btime 295000 winc 2000 binc 1000 movestogo 20"),
+            UciCommand::Go(GoCommand {
+                white_time_ms: Some(300_000),
+                black_time_ms: Some(295_000),
+                white_increment_ms: Some(2_000),
+                black_increment_ms: Some(1_000),
+                moves_to_go: Some(20),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn go_command_clock_for_resolves_the_requested_sides_own_fields() {
+        let go_command = GoCommand {
+            white_time_ms: Some(60_000),
+            black_time_ms: Some(55_000),
+            white_increment_ms: Some(1_000),
+            black_increment_ms: None,
+            moves_to_go: Some(10),
+            ..Default::default()
+        };
+
+        let white = go_command.clock_for(Color::White).unwrap();
+        assert_eq!(white.time_left, std::time::Duration::from_millis(60_000));
+        assert_eq!(white.increment, std::time::Duration::from_millis(1_000));
+        assert_eq!(white.moves_to_go, Some(10));
+
+        let black = go_command.clock_for(Color::Black).unwrap();
+        assert_eq!(black.time_left, std::time::Duration::from_millis(55_000));
+        assert_eq!(
+            black.increment,
+            std::time::Duration::ZERO,
+            "missing binc defaults to zero, not None/panic"
+        );
+    }
+
+    #[test]
+    fn go_command_clock_for_is_none_without_a_time_left_field() {
+        assert_eq!(GoCommand::default().clock_for(Color::White), None);
+        assert_eq!(
+            GoCommand {
+                depth: Some(4),
+                ..Default::default()
+            }
+            .clock_for(Color::Black),
+            None
         );
     }
 
@@ -541,10 +645,7 @@ mod tests {
     fn go_command_with_malformed_depth_value_has_none() {
         assert_eq!(
             UciCommand::parse("go depth notanumber"),
-            UciCommand::Go(GoCommand {
-                depth: None,
-                movetime_ms: None
-            })
+            UciCommand::Go(GoCommand::default())
         );
     }
 
@@ -553,8 +654,8 @@ mod tests {
         assert_eq!(
             UciCommand::parse("go movetime 100"),
             UciCommand::Go(GoCommand {
-                depth: None,
-                movetime_ms: Some(100)
+                movetime_ms: Some(100),
+                ..Default::default()
             })
         );
     }
@@ -565,7 +666,8 @@ mod tests {
             UciCommand::parse("go depth 6 movetime 5000"),
             UciCommand::Go(GoCommand {
                 depth: Some(6),
-                movetime_ms: Some(5000)
+                movetime_ms: Some(5000),
+                ..Default::default()
             })
         );
     }
@@ -1222,6 +1324,84 @@ mod tests {
             assert_eq!(pair[1], pair[0] + 1);
         }
 
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+    }
+
+    #[test]
+    fn go_wtime_btime_drives_a_real_time_bounded_search() {
+        // White to move, plenty of time -- should behave like any
+        // other iterative-deepening search: multiple increasing
+        // depths, then a bestmove.
+        let input = b"position startpos\ngo wtime 5000 btime 5000\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            text.lines().any(|line| line.starts_with("info depth")),
+            "expected at least one real search depth, got: {text:?}"
+        );
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+    }
+
+    #[test]
+    fn go_wtime_uses_whites_own_clock_not_blacks() {
+        // White has almost no time, Black has plenty -- if `go`
+        // resolved the wrong side's clock, this would search for
+        // seconds instead of returning almost immediately.
+        let input = b"position startpos\ngo wtime 20 btime 300000\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+
+        let start = Instant::now();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "go should have used White's own (tiny) clock, took {elapsed:?}"
+        );
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.lines().any(|line| line.starts_with("bestmove")));
+    }
+
+    #[test]
+    fn go_with_near_zero_time_left_still_returns_a_legal_bestmove() {
+        // An extreme time control (e.g. lagging badly on Lichess):
+        // Engine must fall back to a legal move rather than ever
+        // omitting `bestmove` or crashing.
+        let input = b"position startpos\ngo wtime 1 btime 1\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        let bestmove_line = text
+            .lines()
+            .find(|line| line.starts_with("bestmove"))
+            .expect("bestmove line should always be present");
+        assert_ne!(bestmove_line, "bestmove 0000");
+    }
+
+    #[test]
+    fn setoption_move_overhead_is_reflected_in_a_tighter_time_budget() {
+        // Indirect but real end-to-end check: a huge MoveOverhead
+        // eating the entire clock must make Engine fall back to the
+        // first legal move (depth 0, no search) rather than run any
+        // real search at all.
+        let input =
+            b"setoption name MoveOverhead value 10000\nposition startpos\ngo wtime 100 btime 100\nquit\n"
+                .as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+
+        assert!(
+            !text.lines().any(|line| line.starts_with("info depth")),
+            "a MoveOverhead larger than the whole clock should leave zero usable time, got: {text:?}"
+        );
         assert!(text.lines().any(|line| line.starts_with("bestmove")));
     }
 

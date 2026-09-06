@@ -3,7 +3,7 @@ use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{Evaluator, MaterialEvaluator, PositionalEvaluator};
-use crate::search::{self, SearchOptions, SearchResult};
+use crate::search::{self, ClockTimeControl, SearchOptions, SearchResult, TimeManagerConfig};
 
 /// How much worse (in centipawns) the forced book move is allowed to
 /// score than the best move a shallow search finds from the same
@@ -71,6 +71,12 @@ pub struct Engine {
     /// UCI `position` command always resends the entire move list from
     /// a base position.
     move_history: Vec<Move>,
+    /// Policy for turning a `go` command's clock fields into a
+    /// `TimeBudget` -- see `crate::search::TimeManagerConfig`'s docs.
+    /// Only `move_overhead` is exposed as a UCI option (`MoveOverhead`)
+    /// for now; the rest are constants until real measurement suggests
+    /// they should be tunable too.
+    time_manager_config: TimeManagerConfig,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -152,6 +158,7 @@ impl Engine {
             diagnostics: DiagnosticBuffer::new(),
             position_history,
             move_history: Vec::new(),
+            time_manager_config: TimeManagerConfig::default(),
         }
     }
 
@@ -241,6 +248,19 @@ impl Engine {
 
     pub fn set_use_quiescence(&mut self, use_quiescence: bool) {
         self.search_options.use_quiescence = use_quiescence;
+    }
+
+    pub const fn move_overhead(&self) -> std::time::Duration {
+        self.time_manager_config.move_overhead
+    }
+
+    /// Sets `MoveOverhead` -- the fixed slice of every move's time
+    /// budget reserved for protocol/process/network delay (see
+    /// `crate::search::TimeManagerConfig::move_overhead`'s docs). The
+    /// right value depends on the deployment; a local GUI needs far
+    /// less than a network round trip to a lichess-bot bridge.
+    pub fn set_move_overhead(&mut self, move_overhead: std::time::Duration) {
+        self.time_manager_config.move_overhead = move_overhead;
     }
 
     /// Resets game/search-specific engine state (TT generation and
@@ -499,6 +519,78 @@ impl Engine {
                 on_depth_complete,
             ),
         }
+    }
+
+    /// Searches the current position under a real UCI clock -- `go
+    /// wtime/btime/winc/binc[/movestogo]` -- rather than a fixed
+    /// `movetime`. `control` is already resolved to "my side's" clock
+    /// (see `ClockTimeControl`'s docs); this method turns it into a
+    /// soft/hard `TimeBudget` via `crate::search::allocate_time` and
+    /// `self.time_manager_config`, then searches under that budget.
+    ///
+    /// Always returns a legal move if one exists, even under a
+    /// pathological time control (e.g. `go wtime 1`): a fallback move
+    /// (the first legal move, before move ordering/search has any
+    /// chance to improve on it) is chosen up front, and used if the
+    /// real search can't complete even depth 1 before the hard limit.
+    /// This replaces the old "depth 1 always completes" guarantee --
+    /// see `search::search_iterative_with_budget`'s docs -- with the
+    /// weaker, more honest one this method actually needs: *some*
+    /// legal move is always returned, not that search always finishes
+    /// anything.
+    ///
+    /// Consults the configured opening book first (see `book_move`),
+    /// exactly like `search_for_time` -- a clean book hit returns
+    /// immediately without consuming any of the clock budget computed
+    /// here.
+    pub fn search_with_clock(
+        &mut self,
+        control: ClockTimeControl,
+        on_depth_complete: impl FnMut(&SearchResult),
+    ) -> SearchResult {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
+            return result;
+        }
+
+        let fallback = self.position.generate_legal_moves().into_iter().next();
+        let budget = search::allocate_time(control, &self.time_manager_config);
+
+        let searched = match self.evaluator {
+            EvaluatorKind::Material => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &MaterialEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
+            EvaluatorKind::Positional => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &PositionalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
+        };
+
+        searched.unwrap_or_else(|| {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                "time budget expired before depth 1 completed; playing the first legal move instead of a searched one",
+            );
+            SearchResult {
+                best_move: fallback,
+                score: 0,
+                nodes: 0,
+                depth: 0,
+                pv: fallback.into_iter().collect(),
+            }
+        })
     }
 }
 
@@ -836,6 +928,85 @@ mod tests {
             "should complete more than one depth in 200ms"
         );
         assert_eq!(depths_seen.first(), Some(&1));
+    }
+
+    #[test]
+    fn search_with_clock_returns_a_legal_move_and_does_not_mutate_the_position() {
+        let mut engine = Engine::new();
+        let before = engine.position().clone();
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_secs(5),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some());
+        assert_eq!(engine.position(), &before);
+    }
+
+    #[test]
+    fn search_with_clock_falls_back_to_a_legal_move_when_time_left_is_essentially_zero() {
+        // Below move_overhead + emergency_reserve, usable time is
+        // zero -- search_iterative_with_budget can't even complete
+        // depth 1, so Engine must fall back to the pre-chosen legal
+        // move rather than ever reporting no move at all.
+        let mut engine = Engine::new();
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_millis(1),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some(), "must still return a legal move");
+        assert_eq!(
+            result.depth, 0,
+            "a fallback move (no completed search) should report depth 0, like a book hit"
+        );
+    }
+
+    #[test]
+    fn search_with_clock_respects_move_overhead() {
+        // A MoveOverhead that consumes the entire clock must produce a
+        // zero-usable-time budget just like an inherently tiny clock
+        // does -- proving `time_manager_config` (not just the raw
+        // clock) actually drives the allocation.
+        let mut engine = Engine::new();
+        engine.set_move_overhead(std::time::Duration::from_secs(10));
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_millis(100),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some());
+        assert_eq!(result.depth, 0);
+    }
+
+    #[test]
+    fn search_with_clock_also_consults_the_opening_book() {
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_secs(5),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        let best_move = result.best_move.expect("should hit the book");
+        assert_eq!(best_move.from(), "e2".parse().unwrap());
+        assert_eq!(best_move.to(), "e3".parse().unwrap());
+        assert_eq!(
+            result.depth, 0,
+            "a book hit shouldn't consume any of the clock budget"
+        );
     }
 
     #[test]
