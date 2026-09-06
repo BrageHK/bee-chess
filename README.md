@@ -1,5 +1,7 @@
 # bee-chess
 
+[![Lichess Stats](https://lichess-readme-stats.vercel.app/api?username=beechessmagnus)](https://lichess.org/@/beechessmagnus)
+
 This is a crazy Transformer based chess engine with cool stuff.
 
 Bee Chess is one monorepo with three products plus development tooling.
