@@ -47,6 +47,13 @@ export type GameSnapshot = {
   moves: string[];
   white: ParticipantInfo;
   black: ParticipantInfo;
+  /** The experiment that created this game, if any -- `null` for an
+   * ordinary game started from the setup screen. Mirrors
+   * `lab::game::GameSnapshot::experiment_id` exactly; lets a game
+   * viewer link back to its experiment regardless of how the game was
+   * reached (the dashboard, an experiment's own game list, or a
+   * bookmarked link). */
+  experiment_id: string | null;
 } & GameStatus;
 
 /** One side's requested participant for `createGame` -- mirrors
@@ -166,6 +173,15 @@ export async function getGame(id: string): Promise<GameSnapshot> {
   return parseJsonOrThrow(response, "get game");
 }
 
+/** `GET /api/games` -- every game the server currently knows about,
+ * newest first. Powers the dashboard's running/past game lists (it
+ * filters this one list client-side by `status` rather than Lab
+ * offering separate endpoints per status). */
+export async function listGames(): Promise<GameSnapshot[]> {
+  const response = await fetch(`${LAB_BASE_URL}/api/games`);
+  return parseJsonOrThrow(response, "list games");
+}
+
 /** `GET /api/engines/:name/options` -- the UCI options `name` (e.g.
  * `"bee"`) advertises during its own handshake. See `EngineOption`'s
  * docs for why the frontend renders this generically rather than
@@ -205,6 +221,14 @@ export async function createExperiment(request: CreateExperimentRequest): Promis
 export async function getExperiment(id: string): Promise<ExperimentSnapshot> {
   const response = await fetch(`${LAB_BASE_URL}/api/experiments/${id}`);
   return parseJsonOrThrow(response, "get experiment");
+}
+
+/** `GET /api/experiments` -- every experiment the server currently
+ * knows about, newest first. Same "one list, filter client-side by
+ * status" reasoning as `listGames`. */
+export async function listExperiments(): Promise<ExperimentSnapshot[]> {
+  const response = await fetch(`${LAB_BASE_URL}/api/experiments`);
+  return parseJsonOrThrow(response, "list experiments");
 }
 
 /**
