@@ -2,8 +2,25 @@
 use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
-use crate::eval::{ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
-use crate::search::{self, SearchOptions, SearchResult};
+use crate::eval::{Evaluator, ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
+use crate::search::{self, ClockTimeControl, SearchOptions, SearchResult, TimeManagerConfig};
+
+/// How much worse (in centipawns) the forced book move is allowed to
+/// score than the best move a shallow search finds from the same
+/// position, before `book_move` rejects it and falls back to a real
+/// search instead. See `Engine::book_move_blunder_deficit`'s docs for
+/// why this is a *relative* comparison (book move vs. best
+/// alternative), not an absolute before/after swing, and for why the
+/// margin can stay fairly tight (~150-200cp) once framed that way.
+const BOOK_BLUNDER_MARGIN_CP: i32 = 150;
+
+/// Depth `book_move_blunder_deficit` searches both the unconstrained
+/// position and the forced book move to before comparing them --
+/// deliberately shallow (one ply plus quiescence, since
+/// `SearchOptions::default()` always runs quiescence at the horizon):
+/// just enough for an immediate hanging capture to show up, not a real
+/// search Bee already skipped the book to avoid running.
+const BOOK_BLUNDER_SEARCH_DEPTH: u32 = 1;
 
 /// A move given as `(from, to, promotion)` could not be matched against
 /// any currently legal move. Carries the inputs back so the caller
@@ -54,6 +71,12 @@ pub struct Engine {
     /// UCI `position` command always resends the entire move list from
     /// a base position.
     move_history: Vec<Move>,
+    /// Policy for turning a `go` command's clock fields into a
+    /// `TimeBudget` -- see `crate::search::TimeManagerConfig`'s docs.
+    /// Only `move_overhead` is exposed as a UCI option (`MoveOverhead`)
+    /// for now; the rest are constants until real measurement suggests
+    /// they should be tunable too.
+    time_manager_config: TimeManagerConfig,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -138,6 +161,7 @@ impl Engine {
             diagnostics: DiagnosticBuffer::new(),
             position_history,
             move_history: Vec::new(),
+            time_manager_config: TimeManagerConfig::default(),
         }
     }
 
@@ -233,6 +257,19 @@ impl Engine {
         self.search_options.use_enhanced_quiescence = use_enhanced_quiescence;
     }
 
+    pub const fn move_overhead(&self) -> std::time::Duration {
+        self.time_manager_config.move_overhead
+    }
+
+    /// Sets `MoveOverhead` -- the fixed slice of every move's time
+    /// budget reserved for protocol/process/network delay (see
+    /// `crate::search::TimeManagerConfig::move_overhead`'s docs). The
+    /// right value depends on the deployment; a local GUI needs far
+    /// less than a network round trip to a lichess-bot bridge.
+    pub fn set_move_overhead(&mut self, move_overhead: std::time::Duration) {
+        self.time_manager_config.move_overhead = move_overhead;
+    }
+
     /// Resets game/search-specific engine state (TT generation and
     /// similar, once that exists) for a new game. This does **not**
     /// reset `position_history` or set the board to the starting
@@ -297,7 +334,19 @@ impl Engine {
     /// here rather than trusting every implementation to get it right
     /// forever. An invalid candidate is logged and treated as a book
     /// miss, never played.
-    fn book_move(&mut self) -> Option<SearchResult> {
+    ///
+    /// Also runs a generic tactical sanity check via `evaluator`
+    /// (whichever one `Engine` is currently configured with -- a book
+    /// move is checked the same way a searched one would be, not
+    /// against some separate rule): see `book_move_blunder_deficit`. A
+    /// book is allowed to suggest a move; it isn't allowed to force Bee
+    /// to hang a piece. This is deliberately generic and unrelated to
+    /// any specific book's own internal logic -- `CowOpeningBook`
+    /// tracking its setup correctly (see `crate::book`'s docs on
+    /// historical progress) is a completely different concern from
+    /// "does finishing that setup right now hang something else on the
+    /// board", and this check exists for the latter.
+    fn book_move(&mut self, evaluator: &impl Evaluator) -> Option<SearchResult> {
         let context = OpeningContext {
             position: &self.position,
             moves: &self.move_history,
@@ -318,6 +367,18 @@ impl Engine {
             );
             return None;
         }
+        if let Some(deficit) = self.book_move_blunder_deficit(mv, evaluator) {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                format!(
+                    "opening book ({}) move {}{} scores {deficit}cp worse than the best shallow alternative; ignoring and searching instead",
+                    self.opening_book_kind.uci_name(),
+                    mv.from(),
+                    mv.to(),
+                ),
+            );
+            return None;
+        }
         self.emit_diagnostic(
             DiagnosticLevel::Info,
             format!(
@@ -334,6 +395,56 @@ impl Engine {
         })
     }
 
+    /// Returns `Some(deficit)` (in centipawns, always positive) if the
+    /// book's proposed `mv` -- already known legal -- scores more than
+    /// `BOOK_BLUNDER_MARGIN_CP` worse than the best move a shallow
+    /// search finds from the *same* current position. `None` means the
+    /// book move is fine (or even the best move already).
+    ///
+    /// This is a **relative** comparison, not a before/after swing
+    /// against the pre-move position: it asks "is this book move
+    /// obviously worse than something Bee could just play instead
+    /// right now", not "did the score change by a lot" -- the
+    /// distinction matters whenever the position was already bad before
+    /// the book ever got a say (a piece already hanging from the
+    /// opponent's last move, say). A before/after check would blame the
+    /// book move for a loss it didn't cause; comparing the book move
+    /// against the best available alternative only flags it when
+    /// playing something else would clearly have avoided that loss.
+    ///
+    /// Both scores come from `search::search` at `BOOK_BLUNDER_SEARCH_DEPTH`
+    /// (one ply plus quiescence, so an immediate hanging capture shows
+    /// up) using `evaluator` -- whichever one `Engine` is currently
+    /// configured with. The "best move" score is just that search run
+    /// from the current position unconstrained; the "forced book move"
+    /// score is the same search run one ply further down, from the
+    /// position *after* `mv`, negated back to the mover's own
+    /// perspective (search scores are always side-to-move-relative,
+    /// which flips across `make_move`) -- i.e. "if I'm forced to play
+    /// `mv`, then search normally from there, how does it look for me".
+    ///
+    /// This is deliberately not "is a specific piece attacked" or any
+    /// other move-specific tactical rule -- ad-hoc rules like that tend
+    /// to miss the next shape of the same problem -- and deliberately
+    /// shallow: this exists to catch a book move that's obviously,
+    /// tactically much worse than an alternative Bee could see one ply
+    /// down, not to establish the book move is objectively optimal.
+    fn book_move_blunder_deficit(&mut self, mv: Move, evaluator: &impl Evaluator) -> Option<i32> {
+        let best = search::search(&mut self.position, BOOK_BLUNDER_SEARCH_DEPTH, evaluator).score;
+
+        let undo = self.position.make_move(mv);
+        let reply = search::search(&mut self.position, BOOK_BLUNDER_SEARCH_DEPTH, evaluator);
+        let forced = -reply.score;
+        self.position.unmake_move(mv, undo);
+
+        let deficit = best - forced;
+        if deficit > BOOK_BLUNDER_MARGIN_CP {
+            Some(deficit)
+        } else {
+            None
+        }
+    }
+
     /// Searches the current position to exactly `depth` plies using
     /// fixed-depth negamax alpha-beta (see `crate::search::alpha_beta`)
     /// with a tapered positional evaluator, and returns the result. Does
@@ -347,7 +458,12 @@ impl Engine {
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
-        if let Some(result) = self.book_move() {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
             return result;
         }
         match self.evaluator {
@@ -393,7 +509,12 @@ impl Engine {
         budget: std::time::Duration,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
-        if let Some(result) = self.book_move() {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
             return result;
         }
         match self.evaluator {
@@ -422,6 +543,87 @@ impl Engine {
                 on_depth_complete,
             ),
         }
+    }
+
+    /// Searches the current position under a real UCI clock -- `go
+    /// wtime/btime/winc/binc[/movestogo]` -- rather than a fixed
+    /// `movetime`. `control` is already resolved to "my side's" clock
+    /// (see `ClockTimeControl`'s docs); this method turns it into a
+    /// soft/hard `TimeBudget` via `crate::search::allocate_time` and
+    /// `self.time_manager_config`, then searches under that budget.
+    ///
+    /// Always returns a legal move if one exists, even under a
+    /// pathological time control (e.g. `go wtime 1`): a fallback move
+    /// (the first legal move, before move ordering/search has any
+    /// chance to improve on it) is chosen up front, and used if the
+    /// real search can't complete even depth 1 before the hard limit.
+    /// This replaces the old "depth 1 always completes" guarantee --
+    /// see `search::search_iterative_with_budget`'s docs -- with the
+    /// weaker, more honest one this method actually needs: *some*
+    /// legal move is always returned, not that search always finishes
+    /// anything.
+    ///
+    /// Consults the configured opening book first (see `book_move`),
+    /// exactly like `search_for_time` -- a clean book hit returns
+    /// immediately without consuming any of the clock budget computed
+    /// here.
+    pub fn search_with_clock(
+        &mut self,
+        control: ClockTimeControl,
+        on_depth_complete: impl FnMut(&SearchResult),
+    ) -> SearchResult {
+        let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
+            EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+        };
+        if let Some(result) = book_result {
+            return result;
+        }
+
+        let fallback = self.position.generate_legal_moves().into_iter().next();
+        let budget = search::allocate_time(control, &self.time_manager_config);
+
+        let searched = match self.evaluator {
+            EvaluatorKind::Experimental => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
+            EvaluatorKind::Material => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &MaterialEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
+            EvaluatorKind::Positional => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &PositionalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
+        };
+
+        searched.unwrap_or_else(|| {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                "time budget expired before depth 1 completed; playing the first legal move instead of a searched one",
+            );
+            SearchResult {
+                best_move: fallback,
+                score: 0,
+                nodes: 0,
+                depth: 0,
+                pv: fallback.into_iter().collect(),
+            }
+        })
     }
 }
 
@@ -667,6 +869,55 @@ mod tests {
     }
 
     #[test]
+    fn opening_book_move_is_rejected_when_it_hangs_a_piece() {
+        // The exact reported bug: the Cow is one step from completion
+        // (only Nd2-b3 left), but Black has just played ...h5-h4,
+        // directly attacking the g3 knight. `CowOpeningBook` itself
+        // doesn't know or care about that -- it still (correctly, by
+        // its own contract) offers Nd2-b3 to finish the setup. It's
+        // `Engine`'s job to notice that finishing the Cow right now
+        // scores far worse than an obvious alternative (saving the g3
+        // knight) and fall back to a real search instead of blindly
+        // playing the book move into a hung piece.
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        for (from, to) in [
+            ("e2", "e3"),
+            ("e7", "e5"),
+            ("d2", "d3"),
+            ("d7", "d5"),
+            ("g1", "e2"),
+            ("g8", "f6"),
+            ("b1", "d2"),
+            ("b8", "c6"),
+            ("e2", "g3"),
+            ("h7", "h5"),
+            ("a2", "a4"),
+            ("h5", "h4"),
+        ] {
+            engine
+                .apply_move(from.parse().unwrap(), to.parse().unwrap(), None)
+                .unwrap_or_else(|_| panic!("{from}{to} should be legal"));
+        }
+
+        let result = engine.search(1);
+
+        assert_ne!(
+            result.depth, 0,
+            "the book move (finishing the Cow) hangs the g3 knight to h4xg3; \
+             Engine must reject it and run a real search instead of playing it blindly"
+        );
+        let best_move = result
+            .best_move
+            .expect("a real search always returns a move");
+        assert_ne!(
+            (best_move.from(), best_move.to()),
+            ("d2".parse().unwrap(), "b3".parse().unwrap()),
+            "must not play the book's Nd2-b3 here"
+        );
+    }
+
+    #[test]
     fn search_for_time_also_consults_the_opening_book() {
         let mut engine = Engine::new();
         engine.set_opening_book(OpeningBookKind::Cow);
@@ -710,6 +961,85 @@ mod tests {
             "should complete more than one depth in 200ms"
         );
         assert_eq!(depths_seen.first(), Some(&1));
+    }
+
+    #[test]
+    fn search_with_clock_returns_a_legal_move_and_does_not_mutate_the_position() {
+        let mut engine = Engine::new();
+        let before = engine.position().clone();
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_secs(5),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some());
+        assert_eq!(engine.position(), &before);
+    }
+
+    #[test]
+    fn search_with_clock_falls_back_to_a_legal_move_when_time_left_is_essentially_zero() {
+        // Below move_overhead + emergency_reserve, usable time is
+        // zero -- search_iterative_with_budget can't even complete
+        // depth 1, so Engine must fall back to the pre-chosen legal
+        // move rather than ever reporting no move at all.
+        let mut engine = Engine::new();
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_millis(1),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some(), "must still return a legal move");
+        assert_eq!(
+            result.depth, 0,
+            "a fallback move (no completed search) should report depth 0, like a book hit"
+        );
+    }
+
+    #[test]
+    fn search_with_clock_respects_move_overhead() {
+        // A MoveOverhead that consumes the entire clock must produce a
+        // zero-usable-time budget just like an inherently tiny clock
+        // does -- proving `time_manager_config` (not just the raw
+        // clock) actually drives the allocation.
+        let mut engine = Engine::new();
+        engine.set_move_overhead(std::time::Duration::from_secs(10));
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_millis(100),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        assert!(result.best_move.is_some());
+        assert_eq!(result.depth, 0);
+    }
+
+    #[test]
+    fn search_with_clock_also_consults_the_opening_book() {
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        let control = crate::search::ClockTimeControl {
+            time_left: std::time::Duration::from_secs(5),
+            increment: std::time::Duration::ZERO,
+            moves_to_go: None,
+        };
+
+        let result = engine.search_with_clock(control, |_| {});
+
+        let best_move = result.best_move.expect("should hit the book");
+        assert_eq!(best_move.from(), "e2".parse().unwrap());
+        assert_eq!(best_move.to(), "e3".parse().unwrap());
+        assert_eq!(
+            result.depth, 0,
+            "a book hit shouldn't consume any of the clock budget"
+        );
     }
 
     #[test]
