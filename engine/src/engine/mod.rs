@@ -1,5 +1,6 @@
 /// Engine
-use crate::chess::{PieceKind, Position, Square};
+use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
+use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, SearchOptions, SearchResult};
@@ -18,6 +19,15 @@ pub struct IllegalMoveError {
 pub struct Engine {
     debug: bool,
     evaluator: EvaluatorKind,
+    opening_book_kind: OpeningBookKind,
+    /// The live `OpeningBook` matching `opening_book_kind` -- kept in
+    /// sync by `set_opening_book`, rather than reconstructed on every
+    /// `search`/`search_for_time` call. `Cow`/`None` are both
+    /// zero-sized in practice, so this is about keeping one obvious
+    /// source of truth per option (mirroring `evaluator`/the
+    /// `MaterialEvaluator`/`PositionalEvaluator` split below) more
+    /// than about performance.
+    opening_book: Box<dyn OpeningBook>,
     search_options: SearchOptions,
     position: Position,
     diagnostics: DiagnosticBuffer,
@@ -32,6 +42,18 @@ pub struct Engine {
     /// clones, since a repetition check only needs "was this exact
     /// position reached before," not the position itself.
     position_history: Vec<u64>,
+    /// Every move played since the last `set_position`, in order --
+    /// unlike `position_history`, this records the actual `Move`s, not
+    /// just their resulting hashes. Exists purely so an `OpeningBook`
+    /// (see `OpeningContext`) can tell "what has genuinely happened in
+    /// this game" apart from "what the board looks like right now" --
+    /// `CowOpeningBook` needs exactly that distinction (see its docs)
+    /// to keep a temporary knight retreat from reopening an
+    /// already-completed setup step. Reset (not appended to) by
+    /// `set_position`, for the same reason `position_history` is: a
+    /// UCI `position` command always resends the entire move list from
+    /// a base position.
+    move_history: Vec<Move>,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -66,6 +88,42 @@ impl EvaluatorKind {
     }
 }
 
+/// Which `OpeningBook` (see `crate::book`) `Engine::search`/
+/// `search_for_time` consult before falling back to a real search.
+/// `None` -- not searching at all -- is the default: an opening book
+/// is an opt-in experiment, not something that should silently change
+/// a fresh engine's behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpeningBookKind {
+    #[default]
+    None,
+    Cow,
+}
+
+impl OpeningBookKind {
+    pub const fn uci_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Cow => "Cow",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "cow" => Some(Self::Cow),
+            _ => None,
+        }
+    }
+
+    fn book(self) -> Box<dyn OpeningBook> {
+        match self {
+            Self::None => Box::new(NoBook),
+            Self::Cow => Box::new(CowOpeningBook),
+        }
+    }
+}
+
 impl Engine {
     pub fn new() -> Self {
         let position = Position::startpos();
@@ -73,10 +131,13 @@ impl Engine {
         Self {
             debug: false,
             evaluator: EvaluatorKind::default(),
+            opening_book_kind: OpeningBookKind::default(),
+            opening_book: OpeningBookKind::default().book(),
             search_options: SearchOptions::default(),
             position,
             diagnostics: DiagnosticBuffer::new(),
             position_history,
+            move_history: Vec::new(),
         }
     }
 
@@ -106,6 +167,7 @@ impl Engine {
     /// at a time after this.
     pub fn set_position(&mut self, position: Position) {
         self.position_history = vec![position.zobrist_hash()];
+        self.move_history = Vec::new();
         self.position = position;
     }
 
@@ -144,6 +206,15 @@ impl Engine {
 
     pub fn set_evaluator(&mut self, evaluator: EvaluatorKind) {
         self.evaluator = evaluator;
+    }
+
+    pub const fn opening_book_kind(&self) -> OpeningBookKind {
+        self.opening_book_kind
+    }
+
+    pub fn set_opening_book(&mut self, kind: OpeningBookKind) {
+        self.opening_book_kind = kind;
+        self.opening_book = kind.book();
     }
 
     pub const fn search_options(&self) -> SearchOptions {
@@ -194,6 +265,7 @@ impl Engine {
             Some(mv) => {
                 self.position.make_move(mv);
                 self.position_history.push(self.position.zobrist_hash());
+                self.move_history.push(mv);
                 Ok(())
             }
             None => Err(IllegalMoveError {
@@ -204,16 +276,76 @@ impl Engine {
         }
     }
 
+    /// Consults `self.opening_book` for the current position, if
+    /// configured -- see `OpeningBookKind`. Returns a ready-made
+    /// `SearchResult` on a hit (`depth`/`nodes` both `0`, `score` `0`
+    /// since a book move isn't an evaluation claim, just "this is
+    /// known to be reasonable"), so a caller can treat it exactly like
+    /// a real search's result.
+    ///
+    /// Re-validates the returned move against `generate_legal_moves`
+    /// itself rather than trusting the book's own contract blindly:
+    /// `OpeningBook::probe`'s docs already require implementations to
+    /// only return legal moves, but this is the one place a violation
+    /// of that (a bug in a future book implementation, corrupt on-disk
+    /// data, whatever) would otherwise turn into Bee actually
+    /// attempting an illegal move -- worth a cheap defensive check
+    /// here rather than trusting every implementation to get it right
+    /// forever. An invalid candidate is logged and treated as a book
+    /// miss, never played.
+    fn book_move(&mut self) -> Option<SearchResult> {
+        let context = OpeningContext {
+            position: &self.position,
+            moves: &self.move_history,
+        };
+        let mv = self.opening_book.probe(&context)?;
+        if !self
+            .position
+            .generate_legal_moves()
+            .into_iter()
+            .any(|legal| legal == mv)
+        {
+            self.emit_diagnostic(
+                DiagnosticLevel::Warn,
+                format!(
+                    "opening book ({}) returned an illegal move for the current position; ignoring and searching instead",
+                    self.opening_book_kind.uci_name()
+                ),
+            );
+            return None;
+        }
+        self.emit_diagnostic(
+            DiagnosticLevel::Info,
+            format!(
+                "book hit ({}): playing without search",
+                self.opening_book_kind.uci_name()
+            ),
+        );
+        Some(SearchResult {
+            best_move: Some(mv),
+            score: 0,
+            nodes: 0,
+            depth: 0,
+            pv: vec![mv],
+        })
+    }
+
     /// Searches the current position to exactly `depth` plies using
     /// fixed-depth negamax alpha-beta (see `crate::search::alpha_beta`)
     /// with a tapered positional evaluator, and returns the result. Does
     /// not mutate the current position -- `search::search` restores it
     /// fully via make/unmake on every path, including cut-off branches.
     ///
+    /// Consults the configured opening book first (see `book_move`);
+    /// only falls through to a real search on a miss.
+    ///
     /// `depth` is searched to completion synchronously. See `search_for_time` for time-bounded iterative
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
+        if let Some(result) = self.book_move() {
+            return result;
+        }
         match self.evaluator {
             EvaluatorKind::Experimental => search::search_with_options(
                 &mut self.position,
@@ -246,11 +378,20 @@ impl Engine {
     /// `crate::search::alpha_beta`'s module docs for why a cut-off
     /// depth's score can't be trusted). Always completes at least
     /// depth 1 even for a zero/expired budget.
+    ///
+    /// Consults the configured opening book first (see `book_move`);
+    /// on a hit, `on_depth_complete` is never called at all -- there's
+    /// no real search depth to report, so a `depth 0` `info` line
+    /// would only misrepresent a book move as some kind of search
+    /// result.
     pub fn search_for_time(
         &mut self,
         budget: std::time::Duration,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
+        if let Some(result) = self.book_move() {
+            return result;
+        }
         match self.evaluator {
             EvaluatorKind::Experimental => search::search_iterative_with_options(
                 &mut self.position,
@@ -471,6 +612,73 @@ mod tests {
         let best_move = result.best_move.expect("should find a move");
         assert_eq!(best_move.from(), "d1".parse().unwrap());
         assert_eq!(best_move.to(), "d8".parse().unwrap());
+    }
+
+    #[test]
+    fn opening_book_defaults_to_none_and_preserves_existing_search_behavior() {
+        let mut engine = Engine::new();
+        assert_eq!(engine.opening_book_kind(), OpeningBookKind::None);
+
+        // With no book configured, a fresh engine still searches from
+        // the start position rather than instantly returning a book
+        // move -- depth 1 should report a real, non-zero depth.
+        let result = engine.search(1);
+        assert_eq!(result.depth, 1);
+    }
+
+    #[test]
+    fn cow_opening_book_plays_e3_instantly_without_searching() {
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+
+        let result = engine.search(4);
+
+        assert_eq!(
+            result.nodes, 0,
+            "a book hit shouldn't search any nodes at all"
+        );
+        assert_eq!(result.depth, 0);
+        let best_move = result.best_move.expect("should hit the book");
+        assert_eq!(best_move.from(), "e2".parse().unwrap());
+        assert_eq!(best_move.to(), "e3".parse().unwrap());
+    }
+
+    #[test]
+    fn cow_opening_book_falls_back_to_search_once_the_setup_is_finished() {
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        // A position where the Cow book has nothing left to offer
+        // (see book::tests for the equivalent book-level test) --
+        // engine.search must still return a real, searched move
+        // rather than giving up.
+        engine.set_position(
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/1N1PP1N1/P1P2P1P/R1BQKB1R w KQkq - 0 1")
+                .expect("valid FEN"),
+        );
+
+        let result = engine.search(2);
+
+        assert_eq!(result.depth, 2, "should be a real search, not a book hit");
+        assert!(result.best_move.is_some());
+    }
+
+    #[test]
+    fn search_for_time_also_consults_the_opening_book() {
+        let mut engine = Engine::new();
+        engine.set_opening_book(OpeningBookKind::Cow);
+        let mut depths_reported = Vec::new();
+
+        let result = engine.search_for_time(std::time::Duration::from_millis(50), |r| {
+            depths_reported.push(r.depth);
+        });
+
+        assert!(
+            depths_reported.is_empty(),
+            "a book hit has no real search depth to report"
+        );
+        let best_move = result.best_move.expect("should hit the book");
+        assert_eq!(best_move.from(), "e2".parse().unwrap());
+        assert_eq!(best_move.to(), "e3".parse().unwrap());
     }
 
     #[test]
