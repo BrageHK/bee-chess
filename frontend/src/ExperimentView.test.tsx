@@ -18,7 +18,7 @@ function game(overrides: Partial<ExperimentGame> = {}): ExperimentGame {
   return {
     game_id: "g1",
     variant_a_is_white: true,
-    outcome: { status: "finished", result: "white_wins" },
+    outcome: { status: "finished", result: "white_wins", reason: "checkmate" },
     started_at: "2026-01-01T00:00:00Z",
     finished_at: "2026-01-01T00:00:30Z",
     plies: 42,
@@ -37,8 +37,8 @@ describe("ExperimentView", () => {
         draws: 1,
         score_a: 0.75,
         games: [
-          game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } }),
-          game({ game_id: "g2", variant_a_is_white: false, outcome: { status: "finished", result: "draw" } }),
+          game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins", reason: "checkmate" } }),
+          game({ game_id: "g2", variant_a_is_white: false, outcome: { status: "finished", result: "draw", reason: "stalemate" } }),
         ],
       }),
     );
@@ -72,6 +72,7 @@ describe("ExperimentView", () => {
             searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
             avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
           },
+          timeouts: 0,
         },
       }),
     );
@@ -134,7 +135,7 @@ describe("ExperimentView", () => {
         status: "completed",
         completed_games: 1,
         wins_a: 1,
-        games: [game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins" } })],
+        games: [game({ game_id: "g1", variant_a_is_white: true, outcome: { status: "finished", result: "white_wins", reason: "checkmate" } })],
       }),
     );
     const onOpenGame = vi.fn();

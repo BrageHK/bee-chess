@@ -25,6 +25,7 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
       lab_git_commit: "abc123",
       variant_a_argv: ["/path/to/bee"],
       variant_b_argv: ["/path/to/bee"],
+      time_control: { type: "move_time", move_time_ms: 100 },
       started_at: "2026-01-01T00:00:00Z",
       finished_at: null,
     },
@@ -35,6 +36,7 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
       games_per_hour: null,
       variant_a_search: emptySearchStats(),
       variant_b_search: emptySearchStats(),
+      timeouts: 0,
     },
     ...overrides,
   };

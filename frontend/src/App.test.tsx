@@ -136,6 +136,9 @@ describe("App navigation history", () => {
       white: { kind: "engine", name: "Baseline", debug: false },
       black: { kind: "engine", name: "Candidate", debug: false },
       experiment_id: "exp-42",
+      time_control: { type: "move_time", move_time_ms: 100 },
+      white_clock_ms: null,
+      black_clock_ms: null,
     });
     const user = userEvent.setup();
     window.history.replaceState(null, "", "/?game=game-123");
@@ -160,6 +163,9 @@ describe("App navigation history", () => {
       white: { kind: "human" },
       black: { kind: "human" },
       experiment_id: null,
+      time_control: { type: "move_time", move_time_ms: 100 },
+      white_clock_ms: null,
+      black_clock_ms: null,
     });
     window.history.replaceState(null, "", "/?game=game-456");
 

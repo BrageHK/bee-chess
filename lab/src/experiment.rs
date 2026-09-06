@@ -59,8 +59,8 @@ fn opening_moves_for_game(game_index: u32) -> &'static [&'static str] {
 }
 
 use crate::game::{
-    EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore, UciLogColor,
-    UciLogDirection, UciLogEntry,
+    EngineConfig, EngineSlots, FinishReason, GameId, GameResult, GameStatus, GameStore,
+    TimeControl, UciLogColor, UciLogDirection, UciLogEntry,
 };
 
 /// The git commit `bee-lab` itself was built from -- embedded at
@@ -114,7 +114,11 @@ pub struct ExperimentSpec {
     pub requested_games: u32,
     /// Maximum games run at once. Each game launches two engine processes.
     pub concurrency: u32,
-    pub move_time_ms: u64,
+    /// Both variants play under the same clock -- see `TimeControl`'s
+    /// docs on why time control belongs to the experiment itself
+    /// rather than either variant: it's the environment being
+    /// measured in, not a thing being A/B'd.
+    pub time_control: TimeControl,
 }
 
 /// Enough about how/when an experiment ran to make its numbers
@@ -138,6 +142,13 @@ pub struct ExperimentMetadata {
     /// them from, so aren't duplicated here.
     pub variant_a_argv: Vec<String>,
     pub variant_b_argv: Vec<String>,
+    /// Both variants' shared clock policy -- part of reproducibility
+    /// provenance for the same reason the engine argv is: a score by
+    /// itself doesn't say whether it was measured at `1+0` or `3+2`
+    /// (or a fixed movetime), and those aren't comparable to each
+    /// other. See `TimeControl`'s docs on why time control is the
+    /// experiment's own configuration, not either variant's.
+    pub time_control: TimeControl,
     pub started_at: DateTime<Utc>,
     /// `None` while the experiment is still running -- see
     /// `Experiment::finish`.
@@ -150,6 +161,7 @@ impl ExperimentMetadata {
             lab_git_commit: LAB_GIT_COMMIT.to_string(),
             variant_a_argv: spec.variant_a.config.spec.argv.clone(),
             variant_b_argv: spec.variant_b.config.spec.argv.clone(),
+            time_control: spec.time_control,
             started_at: Utc::now(),
             finished_at: None,
         }
@@ -227,7 +239,10 @@ impl SearchTotals {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GameOutcome {
     Pending,
-    Finished { result: GameResult },
+    Finished {
+        result: GameResult,
+        reason: FinishReason,
+    },
     Aborted,
 }
 
@@ -308,7 +323,7 @@ impl Experiment {
         let mut draws = 0;
         let mut wins_b = 0;
         for game in &self.games {
-            let GameOutcome::Finished { result } = game.outcome else {
+            let GameOutcome::Finished { result, .. } = game.outcome else {
                 continue;
             };
             let a_won = match (result, game.variant_a_is_white) {
@@ -418,6 +433,13 @@ pub struct ExperimentStats {
     pub games_per_hour: Option<f64>,
     pub variant_a_search: ExperimentSearchStats,
     pub variant_b_search: ExperimentSearchStats,
+    /// How many settled games ended by a clock flag (`FinishReason::
+    /// Timeout`) rather than a real chess result or an abort -- the
+    /// first slice of the "aggregate timeouts across an experiment"
+    /// telemetry the module docs describe. Meaningful only for a
+    /// `TimeControl::Fischer` experiment; always `0` for `MoveTime`,
+    /// which has no clock to flag on.
+    pub timeouts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -485,6 +507,19 @@ impl ExperimentStats {
             search_b.add(game.search_b);
         }
 
+        let timeouts = settled
+            .iter()
+            .filter(|g| {
+                matches!(
+                    g.outcome,
+                    GameOutcome::Finished {
+                        reason: FinishReason::Timeout,
+                        ..
+                    }
+                )
+            })
+            .count() as u32;
+
         ExperimentStats {
             avg_game_duration_ms,
             avg_plies,
@@ -492,6 +527,7 @@ impl ExperimentStats {
             games_per_hour,
             variant_a_search: search_a.into(),
             variant_b_search: search_b.into(),
+            timeouts,
         }
     }
 }
@@ -752,7 +788,7 @@ async fn run_experiment_game(
 
     let white_info = engine_participant_info(white);
     let black_info = engine_participant_info(black);
-    let snapshot = store.create_for_experiment(white_info, black_info, id);
+    let snapshot = store.create_for_experiment(white_info, black_info, spec.time_control, id);
     experiments.record_game_started(id, snapshot.id, variant_a_is_white);
 
     for &mv in opening_moves_for_game(game_index) {
@@ -769,7 +805,7 @@ async fn run_experiment_game(
         white: Some(white.config.clone()),
         black: Some(black.config.clone()),
     };
-    crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.move_time_ms).await;
+    crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.time_control).await;
 
     // `run_engine_loop` only returns once the game reached a
     // terminal status (Finished or Aborted) -- see its own docs --
@@ -786,7 +822,7 @@ async fn run_experiment_game(
         };
         experiments.record_game_search(id, snapshot.id, search_a, search_b);
         let outcome = match final_snapshot.status {
-            GameStatus::Finished { result } => GameOutcome::Finished { result },
+            GameStatus::Finished { result, reason } => GameOutcome::Finished { result, reason },
             GameStatus::Aborted { .. } => GameOutcome::Aborted,
             GameStatus::Running => {
                 unreachable!("run_engine_loop only returns once the game is no longer Running")
@@ -903,7 +939,7 @@ mod tests {
             },
             requested_games,
             concurrency: 2,
-            move_time_ms: 5,
+            time_control: TimeControl::fixed_move_time(5),
         }
     }
 
@@ -955,7 +991,11 @@ mod tests {
     #[test]
     fn every_built_in_opening_is_legal_and_non_terminal() {
         for opening in OPENING_SUITE {
-            let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+            let mut game = Game::new(
+                ParticipantInfo::Human,
+                ParticipantInfo::Human,
+                TimeControl::fixed_move_time(200),
+            );
             for &mv in *opening {
                 game.apply_move(mv).unwrap_or_else(|err| {
                     panic!("illegal move {mv} in opening {opening:?}: {err:?}")
@@ -1031,6 +1071,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(30),
         );
@@ -1086,6 +1127,7 @@ mod tests {
             a,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(40),
         );
@@ -1095,6 +1137,7 @@ mod tests {
             b,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(80),
         );
@@ -1120,6 +1163,7 @@ mod tests {
             finished,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(50),
         );
@@ -1147,6 +1191,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(10),
         );
@@ -1214,6 +1259,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(42),
         );
@@ -1221,7 +1267,8 @@ mod tests {
         assert_eq!(
             after.games[0].outcome,
             GameOutcome::Finished {
-                result: GameResult::WhiteWins
+                result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             }
         );
         assert_eq!(after.games[0].plies, Some(42));
@@ -1245,6 +1292,7 @@ mod tests {
             game_a_white,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(30),
         );
@@ -1255,6 +1303,7 @@ mod tests {
             game_a_black,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(50),
         );
@@ -1283,6 +1332,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(80),
         );
@@ -1335,6 +1385,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(60),
         );

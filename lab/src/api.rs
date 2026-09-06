@@ -35,7 +35,7 @@ use crate::experiment::{
 };
 use crate::game::{
     ApplyMoveError, EngineConfig, EngineSlots, EngineSpec, GameEvent, GameSnapshot, GameStore,
-    ParticipantInfo,
+    ParticipantInfo, TimeControl,
 };
 use crate::uci_process::{UciDirection, UciOption, UciProcess, UciProcessError};
 
@@ -180,6 +180,16 @@ struct CreateExperimentRequest {
     games: u32,
     #[serde(default = "default_experiment_concurrency")]
     concurrency: u32,
+    /// Both variants' shared clock policy -- see `TimeControl`'s docs
+    /// on why time control belongs to the experiment, not either
+    /// variant. `None` falls back to `move_time_ms` (old clients/
+    /// requests) or, failing that, `DEFAULT_MOVE_TIME_MS` -- see
+    /// `resolve`.
+    #[serde(default)]
+    time_control: Option<TimeControlRequest>,
+    /// Deprecated alias for `time_control: {"type": "move_time",
+    /// "move_time_ms": ...}` -- kept working so existing callers/tests
+    /// that only ever knew about a flat movetime don't break.
     #[serde(default)]
     move_time_ms: Option<u64>,
     #[serde(default)]
@@ -192,6 +202,46 @@ fn default_experiment_engine() -> String {
 
 fn default_experiment_concurrency() -> u32 {
     2
+}
+
+/// Wire shape of `TimeControl`, deserialized separately from it so a
+/// malformed/missing `time_control` can fall back to `move_time_ms`
+/// (see `CreateExperimentRequest`/`CreateGameRequest`) without
+/// `TimeControl` itself needing a `Default` impl that would silently
+/// paper over a real client bug in other contexts.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TimeControlRequest {
+    MoveTime { move_time_ms: u64 },
+    Fischer { initial_ms: u64, increment_ms: u64 },
+}
+
+impl From<TimeControlRequest> for TimeControl {
+    fn from(request: TimeControlRequest) -> Self {
+        match request {
+            TimeControlRequest::MoveTime { move_time_ms } => TimeControl::MoveTime { move_time_ms },
+            TimeControlRequest::Fischer {
+                initial_ms,
+                increment_ms,
+            } => TimeControl::Fischer {
+                initial_ms,
+                increment_ms,
+            },
+        }
+    }
+}
+
+/// Resolves a request's `time_control`/`move_time_ms` fields to a
+/// concrete `TimeControl`: `time_control` wins if present, else
+/// `move_time_ms` as a fixed movetime, else `DEFAULT_MOVE_TIME_MS`.
+fn resolve_time_control(
+    time_control: Option<TimeControlRequest>,
+    move_time_ms: Option<u64>,
+) -> TimeControl {
+    match time_control {
+        Some(request) => request.into(),
+        None => TimeControl::fixed_move_time(move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS)),
+    }
 }
 
 /// `POST /api/experiments`: starts a new A/B experiment (see
@@ -255,7 +305,7 @@ async fn create_experiment(
         variant_b,
         requested_games: request.games,
         concurrency: request.concurrency,
-        move_time_ms: request.move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS),
+        time_control: resolve_time_control(request.time_control, request.move_time_ms),
     };
 
     let snapshot = state.experiments.create(experiment_spec.clone());
@@ -361,6 +411,11 @@ struct CreateGameRequest {
     white: Option<ParticipantRequest>,
     #[serde(default)]
     black: Option<ParticipantRequest>,
+    /// See `CreateExperimentRequest::time_control`'s docs -- same
+    /// resolution rules (`time_control` wins, else `move_time_ms`,
+    /// else the default).
+    #[serde(default)]
+    time_control: Option<TimeControlRequest>,
     #[serde(default)]
     move_time_ms: Option<u64>,
 }
@@ -408,15 +463,15 @@ async fn create_game(
     let white_info = participant_info(&request.white);
     let black_info = participant_info(&request.black);
 
-    let snapshot = state.store.create(white_info, black_info);
+    let time_control = resolve_time_control(request.time_control, request.move_time_ms);
+    let snapshot = state.store.create(white_info, black_info, time_control);
     let slots = EngineSlots { white, black };
     if slots.any_engine() {
-        let move_time_ms = request.move_time_ms.unwrap_or(DEFAULT_MOVE_TIME_MS);
         tokio::spawn(crate::game::run_engine_loop(
             state.store.clone(),
             snapshot.id,
             slots,
-            move_time_ms,
+            time_control,
         ));
     }
 
@@ -508,7 +563,7 @@ enum GameEventWire {
         line: String,
     },
     Updated {
-        snapshot: GameSnapshot,
+        snapshot: Box<GameSnapshot>,
     },
 }
 
@@ -631,8 +686,16 @@ mod tests {
         let store = GameStore::new();
         let app = router(store.clone(), EngineRegistry::new());
 
-        let first = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
-        let second = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let first = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
+        let second = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         let response = app
             .oneshot(
@@ -1460,7 +1523,11 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         let base_url = spawn_real_server(store.clone(), EngineRegistry::new()).await;
 
         let (mut ws, _) =
