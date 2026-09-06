@@ -35,6 +35,29 @@ from torch import nn
 
 from bee_training.chess_mamba.triton_scan import TRITON_AVAILABLE, triton_pscan
 
+
+def _sequential_scan(Abar, BX):
+    """h_t = Abar_t * h_{t-1} + BX_t, h_{-1} = 0, as a plain Python loop.
+
+    O(L) sequential steps instead of pscan's O(log L), so it's slower for
+    training at any real L -- but it has no custom autograd.Function and no
+    in-place view mutation, both of which `mambapy.pscan` relies on and
+    ONNX tracing does not reliably capture (a traced pscan call can come out
+    of `torch.onnx.export` with its `A` input silently dropped, since the
+    tracer loses the data dependency through pscan's chained in-place
+    slice-mutations). At this project's scale (L<=8 per ray) the extra
+    steps are free, so this is the backend `export_onnx.py` swaps in.
+
+    Abar, BX: (B, L, D, N) -> returns hs: (B, L, D, N)
+    """
+    h = torch.zeros_like(Abar[:, 0])
+    hs = []
+    for t in range(Abar.shape[1]):
+        h = Abar[:, t] * h + BX[:, t]
+        hs.append(h)
+    return torch.stack(hs, dim=1)
+
+
 # Pluggable scan backends, same (Abar, BX) -> hs contract either way (see
 # each implementation's own docstring). "pscan" (mambapy, pure PyTorch) is
 # the default -- it needs no custom kernel, so it's the safe choice on any
@@ -43,8 +66,9 @@ from bee_training.chess_mamba.triton_scan import TRITON_AVAILABLE, triton_pscan
 # (matches the sequential reference and mambapy.pscan, including gradients)
 # and ~1.2-1.4x faster end to end on this project's SpatialMixer on ROCm/
 # gfx1100 -- but it's CUDA/ROCm-only (no CPU path) and a newer, less-used
-# code path than mambapy, so it's opt-in rather than the default.
-SCAN_BACKENDS = {"pscan": _mambapy_pscan}
+# code path than mambapy, so it's opt-in rather than the default. "sequential"
+# is for ONNX export only -- see `_sequential_scan`'s docstring.
+SCAN_BACKENDS = {"pscan": _mambapy_pscan, "sequential": _sequential_scan}
 if TRITON_AVAILABLE:
     SCAN_BACKENDS["triton"] = triton_pscan
 

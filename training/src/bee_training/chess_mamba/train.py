@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import random
 import time
@@ -52,6 +53,7 @@ class TrainConfig:
     lr: float = 3e-4
     total_steps: int = 20_000
     val_fraction: float = 0.05
+    max_records: int = 0  # 0 = no limit; caps in-memory positions loaded (see load_all_records)
     save_every: int = 200
     val_every: int = 500
     log_every: int = 20
@@ -77,7 +79,7 @@ def build_model(config: TrainConfig) -> ChessMamba:
 
 
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-                     global_step: int, config: TrainConfig) -> None:
+                     global_step: int, config: TrainConfig, best_val_loss: float = float("inf")) -> None:
     """Writes to a temp file then atomically renames into place (`os.replace`
     is atomic on the same filesystem), so a crash mid-write can never leave
     `latest.pt` itself truncated/corrupt -- worst case you lose the
@@ -89,8 +91,18 @@ def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
         "optimizer_state": optimizer.state_dict(),
         "global_step": global_step,
         "config": config.to_dict(),
+        "best_val_loss": best_val_loss,
     }, tmp_path)
     os.replace(tmp_path, path)
+
+
+def append_history(path: Path, record: dict) -> None:
+    """Appends one JSON line per call -- history.jsonl is never rewritten in
+    place, so it survives resumes (unlike latest.pt) and can be tailed live
+    while training runs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def load_checkpoint_if_compatible(path: Path, config: TrainConfig) -> dict | None:
@@ -175,12 +187,17 @@ def wait_for_data(config: TrainConfig, poll_s: float = 10.0) -> tuple[list, list
     budget. Running the generator and trainer side by side (this
     project's train-mamba.sh) means the trainer would otherwise start and
     immediately crash before the generator has produced its first game.
+
+    `config.max_records`, if set, caps how many positions get loaded into
+    memory -- see `load_all_records`'s docstring for why an unbounded load
+    against this project's current data scale can exhaust host memory.
     """
     min_records = config.batch_size * 2
     logged_waiting = False
     while True:
         shard_paths = sorted(glob.glob(config.data_glob))
-        records = load_all_records(shard_paths) if shard_paths else []
+        max_records = config.max_records or None
+        records = load_all_records(shard_paths, max_records=max_records) if shard_paths else []
         if len(records) >= min_records:
             if logged_waiting:
                 print(f"found {len(records)} positions, proceeding")
@@ -214,13 +231,17 @@ def run(config: TrainConfig) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
     checkpoint_path = Path(config.checkpoint_dir) / "latest.pt"
+    best_path = Path(config.checkpoint_dir) / "best.pt"
+    history_path = Path(config.checkpoint_dir) / "history.jsonl"
     ckpt = load_checkpoint_if_compatible(checkpoint_path, config)
     global_step = 0
+    best_val_loss = float("inf")
     if ckpt is not None:
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         global_step = ckpt["global_step"]
-        print(f"resumed from {checkpoint_path} at step {global_step}")
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        print(f"resumed from {checkpoint_path} at step {global_step} (best_val_loss={best_val_loss:.4f})")
     else:
         print(f"no checkpoint at {checkpoint_path}, starting fresh")
 
@@ -258,21 +279,27 @@ def run(config: TrainConfig) -> None:
             if global_step % config.log_every == 0:
                 steps_per_sec = (global_step - step_at_start) / (time.time() - t_start)
                 print(f"step {global_step:7d}  loss {loss:.4f}  ({steps_per_sec:.2f} steps/sec)")
+                append_history(history_path, {"step": global_step, "train_loss": loss})
 
             if global_step % config.val_every == 0:
                 val_loss = evaluate(compute_model, val_loader, config.device)
                 print(f"step {global_step:7d}  val_loss {val_loss:.4f}")
+                append_history(history_path, {"step": global_step, "val_loss": val_loss})
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(best_path, model, optimizer, global_step, config, best_val_loss)
+                    print(f"step {global_step:7d}  new best val_loss {best_val_loss:.4f}, saved -> {best_path}")
 
             if global_step % config.save_every == 0:
-                save_checkpoint(checkpoint_path, model, optimizer, global_step, config)
+                save_checkpoint(checkpoint_path, model, optimizer, global_step, config, best_val_loss)
                 print(f"step {global_step:7d}  checkpoint saved -> {checkpoint_path}")
     except KeyboardInterrupt:
         print(f"\ninterrupted at step {global_step}, saving checkpoint before exit...")
-        save_checkpoint(checkpoint_path, model, optimizer, global_step, config)
+        save_checkpoint(checkpoint_path, model, optimizer, global_step, config, best_val_loss)
         print(f"checkpoint saved -> {checkpoint_path}")
         raise
 
-    save_checkpoint(checkpoint_path, model, optimizer, global_step, config)
+    save_checkpoint(checkpoint_path, model, optimizer, global_step, config, best_val_loss)
     print(f"training complete at step {global_step}, final checkpoint -> {checkpoint_path}")
 
 

@@ -24,7 +24,10 @@ Per-square layout, `in_dim = 20`:
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import chess
 import torch
@@ -91,16 +94,40 @@ def encode_position_record(record: PositionRecord, n_value_bins: int = 128,
     return planes, move_target, value_bin_target
 
 
-def load_all_records(shard_paths) -> list[PositionRecord]:
-    """Reads every record from `shard_paths` (list of `*.positions.jsonl`
-    files) into memory. At this project's current data scale (tens of
-    thousands of positions), the records themselves (not yet encoded)
-    are small enough that this is fine; re-visit if `data/` grows much
-    larger than that."""
+def _iter_jsonl_lines(path: Path) -> Iterator[dict[str, Any]]:
+    """Like `read_jsonl`, but yields one line at a time instead of reading
+    the whole file into a list first -- `read_jsonl` itself can't do this
+    (it's relied on elsewhere as an eager, indexable list), and eagerly
+    materializing a hundreds-of-MB shard file just to honor a
+    `max_records` cap a few thousand lines in defeats the point of the
+    cap."""
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def load_all_records(shard_paths, max_records: int | None = None) -> list[PositionRecord]:
+    """Reads records from `shard_paths` (list of `*.positions.jsonl` files)
+    into memory. At this project's original data scale (tens of thousands
+    of positions) loading everything was fine; a shard file is now one
+    self-play worker's whole *still-growing* output (hundreds of MB
+    each), and a `PositionRecord` instance costs several times its raw
+    JSON-line size once parsed (dataclass overhead, a separately-boxed
+    `pv` string per ply, etc.) -- loading every shard in full can run a
+    host out of memory. Pass `max_records` to stop early (mid-file, if
+    need be) once that many are loaded; each shard is one worker's
+    continuous self-play stream, so a prefix of it is still an unbiased
+    sample of the same distribution, just less data."""
     records: list[PositionRecord] = []
     for path in shard_paths:
-        for d in read_jsonl(Path(path)):
+        for d in _iter_jsonl_lines(Path(path)):
             records.append(PositionRecord.from_dict(d))
+            if max_records is not None and len(records) >= max_records:
+                return records
     return records
 
 

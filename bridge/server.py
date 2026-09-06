@@ -19,6 +19,7 @@ if it's missing.
 """
 import asyncio
 import contextlib
+import os
 import sys
 from pathlib import Path
 
@@ -27,7 +28,8 @@ import websockets
 ROOT = Path(__file__).resolve().parent.parent
 TRAINING = ROOT / "training"
 MAMBA_PYTHON = TRAINING / ".venv" / "bin" / "python3"
-MAMBA_CHECKPOINT = TRAINING / "checkpoints" / "main-dawg" / "latest.pt"
+MAMBA_CHECKPOINT = Path(os.environ["MAMBA_CHECKPOINT"]) if "MAMBA_CHECKPOINT" in os.environ \
+    else TRAINING / "checkpoints" / "main-dawg" / "latest.pt"
 
 
 def make_handler(argv, cwd):
