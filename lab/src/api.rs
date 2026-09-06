@@ -34,7 +34,7 @@ use crate::game::{
     ApplyMoveError, EngineConfig, EngineSlots, EngineSpec, GameEvent, GameSnapshot, GameStore,
     ParticipantInfo,
 };
-use crate::uci_process::UciDirection;
+use crate::uci_process::{UciDirection, UciOption, UciProcess, UciProcessError};
 
 /// The engine binaries this server knows how to spawn for a game,
 /// keyed by the name a `CreateGameRequest` names them with (e.g.
@@ -74,7 +74,47 @@ pub fn router(store: GameStore, engines: EngineRegistry) -> Router {
         .route("/api/games/{id}", get(get_game))
         .route("/api/games/{id}/moves", post(apply_move))
         .route("/ws/games/{id}", get(game_events_ws))
+        .route("/api/engines/{name}/options", get(get_engine_options))
         .with_state(ApiState { store, engines })
+}
+
+/// `GET /api/engines/:name/options`: the UCI options `name` (e.g.
+/// `"bee"`) advertises during its own handshake, in the same generic
+/// `check`/`spin`/`combo`/`string` vocabulary UCI itself uses -- see
+/// `UciOption`. This is the discovery contract the frontend's
+/// experiment-configuration UI is meant to render generically: adding
+/// a new `setoption` to an engine (e.g. #104's `UseTT`/
+/// `UseQuiescence`) makes it appear here automatically, with no Lab or
+/// frontend code needing to know its name ahead of time.
+///
+/// Spawns `name` fresh for this request alone (and kills it once the
+/// handshake completes -- `UciProcess::drop` handles that) rather than
+/// keeping a running instance around just to answer this: an engine's
+/// advertised options don't change between runs of the same binary,
+/// so there's nothing to gain from a long-lived process here, and this
+/// keeps the endpoint from needing any of `run_engine_loop`'s
+/// game-lifecycle machinery. A real registry (#70) may want to cache
+/// this instead of spawning per request; not worth it yet at this
+/// endpoint's expected call volume (opening the experiment-setup
+/// screen, not something polled).
+async fn get_engine_options(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<UciOption>>, (StatusCode, String)> {
+    let spec = state
+        .engines
+        .get(&name)
+        .ok_or((StatusCode::NOT_FOUND, format!("unknown engine: {name}")))?;
+
+    let process = UciProcess::spawn(&spec.argv, &spec.cwd, None)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, engine_spawn_error_message(&err)))?;
+
+    Ok(Json(process.options().to_vec()))
+}
+
+fn engine_spawn_error_message(err: &UciProcessError) -> String {
+    format!("failed to query engine options: {err}")
 }
 
 /// Default per-move time budget for an engine-driven side, when
@@ -656,6 +696,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_engine_options_for_an_unknown_engine_is_404() {
+        let app = router(GameStore::new(), EngineRegistry::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/engines/no-such-engine/options")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_engine_options_returns_the_options_the_engine_advertised() {
+        let spec = EngineSpec {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"
+                read _
+                echo "option name UseTT type check default true"
+                echo "option name Evaluator type combo default Positional var Positional var Material"
+                echo "uciok"
+                read _; echo "readyok"
+                "#
+                .to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+        };
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", spec);
+        let app = router(GameStore::new(), registry);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/engines/fake/options")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let options: Vec<UciOption> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            options,
+            vec![
+                UciOption::Check {
+                    name: "UseTT".to_string(),
+                    default: true,
+                },
+                UciOption::Combo {
+                    name: "Evaluator".to_string(),
+                    default: "Positional".to_string(),
+                    values: vec!["Positional".to_string(), "Material".to_string()],
+                },
+            ]
+        );
     }
 
     #[tokio::test]
