@@ -340,7 +340,7 @@ pub fn run<R: BufRead, W: Write>(
             UciCommand::Uci => {
                 writeln!(output, "id name {ENGINE_NAME}")?;
                 writeln!(output, "id author {ENGINE_AUTHOR}")?;
-                writeln!(output, "option name Evaluator type combo default Positional var Positional var Material")?;
+                writeln!(output, "option name Evaluator type combo default Positional var Positional var Material var Experimental")?;
                 // Experimental search feature switches -- see
                 // `SearchOptions`'s docs. Both default to `true` (the
                 // normal, strongest configuration); Bee Lab's A/B
@@ -727,6 +727,7 @@ mod tests {
         assert!(text.contains(&format!("id name {ENGINE_NAME}")));
         assert!(text.contains(&format!("id author {ENGINE_AUTHOR}")));
         assert!(text.contains("option name Evaluator type combo default Positional"));
+        assert!(text.contains("var Experimental"));
         assert!(text.contains("option name UseTT type check default true"));
         assert!(text.contains("option name UseQuiescence type check default true"));
         assert!(text.contains("uciok"));
@@ -740,6 +741,15 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert_eq!(engine.evaluator(), EvaluatorKind::Material);
+    }
+
+    #[test]
+    fn setoption_selects_the_experimental_evaluator() {
+        let input = b"setoption name Evaluator value Experimental\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.evaluator(), EvaluatorKind::Experimental);
     }
 
     #[test]

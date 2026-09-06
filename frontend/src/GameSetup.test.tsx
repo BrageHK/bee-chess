@@ -49,7 +49,7 @@ describe("GameSetup's Bee options discovery", () => {
         type: "combo",
         name: "Evaluator",
         default: "Positional",
-        values: ["Positional", "Material"],
+        values: ["Positional", "Material", "Experimental"],
       },
     ]);
 
@@ -58,6 +58,7 @@ describe("GameSetup's Bee options discovery", () => {
     const select = await screen.findByRole("combobox", { name: "Evaluator" });
     expect(select).toHaveValue("Positional");
     expect(screen.getByRole("option", { name: "Material" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Experimental" })).toBeInTheDocument();
   });
 
   it("toggling a discovered checkbox updates its value", async () => {

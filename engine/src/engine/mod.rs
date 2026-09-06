@@ -1,7 +1,7 @@
 /// Engine
 use crate::chess::{PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
-use crate::eval::{MaterialEvaluator, PositionalEvaluator};
+use crate::eval::{ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, SearchOptions, SearchResult};
 
 /// A move given as `(from, to, promotion)` could not be matched against
@@ -41,6 +41,7 @@ pub struct Engine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EvaluatorKind {
+    Experimental,
     Material,
     #[default]
     Positional,
@@ -49,6 +50,7 @@ pub enum EvaluatorKind {
 impl EvaluatorKind {
     pub const fn uci_name(self) -> &'static str {
         match self {
+            Self::Experimental => "Experimental",
             Self::Material => "Material",
             Self::Positional => "Positional",
         }
@@ -56,6 +58,7 @@ impl EvaluatorKind {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "experimental" => Some(Self::Experimental),
             "material" => Some(Self::Material),
             "positional" => Some(Self::Positional),
             _ => None,
@@ -212,6 +215,13 @@ impl Engine {
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
         match self.evaluator {
+            EvaluatorKind::Experimental => search::search_with_options(
+                &mut self.position,
+                depth,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+            ),
             EvaluatorKind::Material => search::search_with_options(
                 &mut self.position,
                 depth,
@@ -242,6 +252,14 @@ impl Engine {
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         match self.evaluator {
+            EvaluatorKind::Experimental => search::search_iterative_with_options(
+                &mut self.position,
+                budget,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
             EvaluatorKind::Material => search::search_iterative_with_options(
                 &mut self.position,
                 budget,

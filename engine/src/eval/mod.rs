@@ -19,6 +19,89 @@ pub trait Evaluator {
     fn evaluate(&self, position: &Position) -> Score;
 }
 
+/// A deliberately simple evaluator used for evaluation experiments.
+pub struct ExperimentalEvaluator;
+
+impl Evaluator for ExperimentalEvaluator {
+    fn evaluate(&self, position: &Position) -> Score {
+        let mut middle = 0;
+        let mut end = 0;
+        let mut phase = 0;
+        let mut bishops = [0u8; 2];
+        let mut pawns = [[0u8; 8]; 2];
+
+        for index in 0..Square::COUNT as u8 {
+            let square = Square::new(index);
+            let Some(piece) = position.piece_at(square) else {
+                continue;
+            };
+            let color = color_index(piece.color);
+            let sign = if piece.color == Color::White { 1 } else { -1 };
+            let relative_rank = if piece.color == Color::White {
+                square.rank()
+            } else {
+                7 - square.rank()
+            };
+
+            let (mg_material, eg_material, phase_value) = piece_values(piece.kind);
+            let (mg_square, eg_square) = square_bonus(piece.kind, square.file(), relative_rank);
+            middle += sign * (mg_material + mg_square);
+            end += sign * (eg_material + eg_square);
+            phase += phase_value;
+
+            if piece.kind == PieceKind::Bishop {
+                bishops[color] += 1;
+            }
+            if piece.kind == PieceKind::Pawn {
+                pawns[color][square.file() as usize] += 1;
+            }
+        }
+
+        for color in [Color::White, Color::Black] {
+            let i = color_index(color);
+            let sign = if color == Color::White { 1 } else { -1 };
+            if bishops[i] >= 2 {
+                middle += sign * 30;
+                end += sign * 45;
+            }
+            for file in 0..8 {
+                let count = pawns[i][file];
+                if count > 1 {
+                    let extras = Score::from(count - 1);
+                    middle -= sign * 12 * extras;
+                    end -= sign * 18 * extras;
+                }
+                if count > 0
+                    && (file == 0 || pawns[i][file - 1] == 0)
+                    && (file == 7 || pawns[i][file + 1] == 0)
+                {
+                    middle -= sign * 10 * Score::from(count);
+                    end -= sign * 8 * Score::from(count);
+                }
+            }
+        }
+
+        // Both armies together contribute 24 phase units initially: four
+        // queens' worth, four rooks, and eight minor pieces at their weights.
+        let phase = phase.min(24);
+        let white_score = (middle * phase + end * (24 - phase)) / 24;
+        let own_score = if position.side_to_move() == Color::White {
+            white_score
+        } else {
+            -white_score
+        };
+
+        let own_mobility = position.generate_legal_moves().len() as Score;
+        let mut opponent_position = position.clone();
+        opponent_position.set_side_to_move(position.side_to_move().opposite());
+        // An en-passant target is only valid for the actual side to move.
+        opponent_position.set_en_passant_square(None);
+        let opponent_mobility = opponent_position.generate_legal_moves().len() as Score;
+
+        return own_score + 2 * (own_mobility - opponent_mobility);
+    }
+}
+
 /// Standard piece values in centipawns, from the classical scale
 /// (pawn=100, knight=320, bishop=330, rook=500, queen=900). No
 /// positional terms, no king safety, no pawn structure -- purely
@@ -201,6 +284,20 @@ fn square_bonus(kind: PieceKind, file: u8, rank: u8) -> (Score, Score) {
 mod tests {
     use super::*;
     use crate::chess::{Color, Piece};
+
+    #[test]
+    fn experimental_start_position_is_balanced() {
+        assert_eq!(ExperimentalEvaluator.evaluate(&Position::startpos()), 0);
+    }
+
+    #[test]
+    fn experimental_evaluator_penalizes_isolated_pawns() {
+        let connected = Position::from_fen("4k3/8/8/8/8/8/2PP4/4K3 w - - 0 1").unwrap();
+        let isolated = Position::from_fen("4k3/8/8/8/8/8/2P2P2/4K3 w - - 0 1").unwrap();
+        assert!(
+            ExperimentalEvaluator.evaluate(&connected) > ExperimentalEvaluator.evaluate(&isolated)
+        );
+    }
 
     #[test]
     fn startpos_is_exactly_balanced() {
