@@ -13,6 +13,7 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
     label_a: "Baseline",
     label_b: "Candidate",
     requested_games: 20,
+    concurrency: 2,
     completed_games: 0,
     wins_a: 0,
     draws: 0,
@@ -32,7 +33,22 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
       avg_plies: null,
       runtime_ms: 0,
       games_per_hour: null,
+      variant_a_search: emptySearchStats(),
+      variant_b_search: emptySearchStats(),
     },
     ...overrides,
+  };
+}
+
+function emptySearchStats() {
+  return {
+    searches: 0,
+    total_nodes: 0,
+    avg_nodes: null,
+    avg_time_ms: null,
+    avg_depth: null,
+    max_depth: null,
+    effective_nps: null,
+    avg_eval_cp: null,
   };
 }

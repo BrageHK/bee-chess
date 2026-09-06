@@ -27,6 +27,7 @@ function humanSnapshot(overrides: Partial<{ id: string; fen: string; moves: stri
     id: "abc",
     fen: "start",
     moves: [] as string[],
+    uci_log: [],
     status: "running" as const,
     white: { kind: "human" as const },
     black: { kind: "human" as const },

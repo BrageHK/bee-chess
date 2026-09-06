@@ -45,6 +45,7 @@ export type GameSnapshot = {
   id: string;
   fen: string;
   moves: string[];
+  uci_log: Array<{ color: Color; direction: "sent" | "received"; line: string }>;
   white: ParticipantInfo;
   black: ParticipantInfo;
   /** The experiment that created this game, if any -- `null` for an
@@ -100,6 +101,7 @@ export interface CreateExperimentRequest {
   variantA: ExperimentVariantRequest;
   variantB: ExperimentVariantRequest;
   games: number;
+  concurrency?: number;
   moveTimeMs?: number;
   debug?: boolean;
 }
@@ -143,6 +145,19 @@ export interface ExperimentStats {
   avg_plies: number | null;
   runtime_ms: number;
   games_per_hour: number | null;
+  variant_a_search: ExperimentSearchStats;
+  variant_b_search: ExperimentSearchStats;
+}
+
+export interface ExperimentSearchStats {
+  searches: number;
+  total_nodes: number;
+  avg_nodes: number | null;
+  avg_time_ms: number | null;
+  avg_depth: number | null;
+  max_depth: number | null;
+  effective_nps: number | null;
+  avg_eval_cp: number | null;
 }
 
 /** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly
@@ -158,6 +173,7 @@ export interface ExperimentSnapshot {
   label_a: string;
   label_b: string;
   requested_games: number;
+  concurrency: number;
   completed_games: number;
   wins_a: number;
   draws: number;
@@ -237,6 +253,7 @@ export async function createExperiment(request: CreateExperimentRequest): Promis
     games: request.games,
   };
   if (request.engine !== undefined) body.engine = request.engine;
+  if (request.concurrency !== undefined) body.concurrency = request.concurrency;
   if (request.moveTimeMs !== undefined) body.move_time_ms = request.moveTimeMs;
   if (request.debug !== undefined) body.debug = request.debug;
 

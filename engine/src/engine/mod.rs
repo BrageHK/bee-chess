@@ -2,7 +2,7 @@
 use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
-use crate::eval::{Evaluator, MaterialEvaluator, PositionalEvaluator};
+use crate::eval::{Evaluator, ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
 use crate::search::{self, ClockTimeControl, SearchOptions, SearchResult, TimeManagerConfig};
 
 /// How much worse (in centipawns) the forced book move is allowed to
@@ -86,6 +86,7 @@ pub struct Engine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EvaluatorKind {
+    Experimental,
     Material,
     #[default]
     Positional,
@@ -94,6 +95,7 @@ pub enum EvaluatorKind {
 impl EvaluatorKind {
     pub const fn uci_name(self) -> &'static str {
         match self {
+            Self::Experimental => "Experimental",
             Self::Material => "Material",
             Self::Positional => "Positional",
         }
@@ -101,6 +103,7 @@ impl EvaluatorKind {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "experimental" => Some(Self::Experimental),
             "material" => Some(Self::Material),
             "positional" => Some(Self::Positional),
             _ => None,
@@ -248,6 +251,10 @@ impl Engine {
 
     pub fn set_use_quiescence(&mut self, use_quiescence: bool) {
         self.search_options.use_quiescence = use_quiescence;
+    }
+
+    pub fn set_use_enhanced_quiescence(&mut self, use_enhanced_quiescence: bool) {
+        self.search_options.use_enhanced_quiescence = use_enhanced_quiescence;
     }
 
     pub const fn move_overhead(&self) -> std::time::Duration {
@@ -452,6 +459,7 @@ impl Engine {
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
         let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
             EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
         };
@@ -459,6 +467,13 @@ impl Engine {
             return result;
         }
         match self.evaluator {
+            EvaluatorKind::Experimental => search::search_with_options(
+                &mut self.position,
+                depth,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+            ),
             EvaluatorKind::Material => search::search_with_options(
                 &mut self.position,
                 depth,
@@ -495,6 +510,7 @@ impl Engine {
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
             EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
         };
@@ -502,6 +518,14 @@ impl Engine {
             return result;
         }
         match self.evaluator {
+            EvaluatorKind::Experimental => search::search_iterative_with_options(
+                &mut self.position,
+                budget,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
             EvaluatorKind::Material => search::search_iterative_with_options(
                 &mut self.position,
                 budget,
@@ -549,6 +573,7 @@ impl Engine {
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
         let book_result = match self.evaluator {
+            EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
             EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
         };
@@ -560,6 +585,14 @@ impl Engine {
         let budget = search::allocate_time(control, &self.time_manager_config);
 
         let searched = match self.evaluator {
+            EvaluatorKind::Experimental => search::search_iterative_with_budget(
+                &mut self.position,
+                budget,
+                &ExperimentalEvaluator,
+                &self.position_history,
+                self.search_options,
+                on_depth_complete,
+            ),
             EvaluatorKind::Material => search::search_iterative_with_budget(
                 &mut self.position,
                 budget,

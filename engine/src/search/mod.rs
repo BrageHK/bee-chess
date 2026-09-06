@@ -40,6 +40,11 @@ pub struct SearchOptions {
     /// quiescence exists to fix -- see `search::alpha_beta`'s module
     /// docs -- so it's an experiment, not something to ship disabled.
     pub use_quiescence: bool,
+    /// Whether quiescence searches all legal evasions while in check and
+    /// non-capturing promotions in otherwise quiet positions. This fixes the
+    /// ordinary capture-only quiescence approximation, but remains separately
+    /// switchable so its strength/cost can be measured in A/B experiments.
+    pub use_enhanced_quiescence: bool,
 }
 
 impl Default for SearchOptions {
@@ -47,6 +52,7 @@ impl Default for SearchOptions {
         Self {
             use_tt: true,
             use_quiescence: true,
+            use_enhanced_quiescence: true,
         }
     }
 }

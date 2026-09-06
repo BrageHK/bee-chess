@@ -131,6 +131,7 @@ describe("App navigation history", () => {
       id: "game-123",
       fen: "start",
       moves: [],
+      uci_log: [{ color: "white", direction: "received", line: "historical line" }],
       status: "running",
       white: { kind: "engine", name: "Baseline", debug: false },
       black: { kind: "engine", name: "Candidate", debug: false },
@@ -142,6 +143,7 @@ describe("App navigation history", () => {
     render(<App />);
 
     const backLink = await screen.findByRole("button", { name: /back to experiment/i });
+    expect(await screen.findByText(/historical line/)).toHaveTextContent("← historical line");
     await user.click(backLink);
 
     expect(await screen.findByText(/loading experiment/i)).toBeInTheDocument();
@@ -153,6 +155,7 @@ describe("App navigation history", () => {
       id: "game-456",
       fen: "start",
       moves: [],
+      uci_log: [],
       status: "running",
       white: { kind: "human" },
       black: { kind: "human" },

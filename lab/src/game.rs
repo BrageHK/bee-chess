@@ -62,6 +62,33 @@ use crate::uci_process::{UciDirection, UciProcess};
 /// subscriber missing some history is an acceptable, self-healing
 /// (on their next receive) condition, not a correctness bug.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Retained per-game UCI history for clients that open a game after its
+/// engines have exited and for post-game search aggregation. The frontend
+/// still renders only its most recent 500 lines per color.
+const UCI_LOG_CAPACITY: usize = 20_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UciLogColor {
+    White,
+    Black,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UciLogDirection {
+    Sent,
+    Received,
+}
+
+/// A retained raw UCI line. Live clients receive the equivalent
+/// `GameEvent::Uci`; snapshots carry this history for late subscribers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UciLogEntry {
+    pub color: UciLogColor,
+    pub direction: UciLogDirection,
+    pub line: String,
+}
 
 /// A live event about one game, broadcast to every current subscriber
 /// (see `GameStore::subscribe`). Not persisted or replayed -- a client
@@ -166,8 +193,13 @@ pub enum ParticipantInfo {
 pub struct Game {
     pub id: GameId,
     position: Position,
+    /// Zobrist hash of the initial position and every position reached after
+    /// it. Halfmove/fullmove counters are intentionally absent from the hash,
+    /// matching the chess definition of a repeated position.
+    position_history: Vec<u64>,
     moves: Vec<String>,
     status: GameStatus,
+    uci_log: Vec<UciLogEntry>,
     white_participant: ParticipantInfo,
     black_participant: ParticipantInfo,
     /// The experiment that created this game, if any -- set once, at
@@ -209,11 +241,15 @@ impl Game {
     /// `white`/`black` recorded as this game's participants (see
     /// `ParticipantInfo`).
     pub fn new(white: ParticipantInfo, black: ParticipantInfo) -> Self {
+        let position = Position::startpos();
+        let position_history = vec![position.zobrist_hash()];
         Game {
             id: GameId::new(),
-            position: Position::startpos(),
+            position,
+            position_history,
             moves: Vec::new(),
             status: GameStatus::Running,
+            uci_log: Vec::new(),
             white_participant: white,
             black_participant: black,
             experiment_id: None,
@@ -229,11 +265,14 @@ impl Game {
     /// exists to test.
     #[cfg(test)]
     fn from_position(position: Position) -> Self {
+        let position_history = vec![position.zobrist_hash()];
         let mut game = Game {
             id: GameId::new(),
             position,
+            position_history,
             moves: Vec::new(),
             status: GameStatus::Running,
+            uci_log: Vec::new(),
             white_participant: ParticipantInfo::Human,
             black_participant: ParticipantInfo::Human,
             experiment_id: None,
@@ -316,27 +355,40 @@ impl Game {
             .ok_or(ApplyMoveError::IllegalMove)?;
 
         self.position.make_move(matching_move);
+        self.position_history.push(self.position.zobrist_hash());
         self.moves.push(uci.to_string());
         self.update_status_after_move();
         Ok(())
     }
 
     fn update_status_after_move(&mut self) {
-        if !self.position.generate_legal_moves().is_empty() {
+        if self.position.generate_legal_moves().is_empty() {
+            self.status = GameStatus::Finished {
+                result: if self.position.in_check() {
+                    // The side to move is checkmated -- the *other* side won.
+                    if self.position.side_to_move() == bee_chess_core::Color::White {
+                        GameResult::BlackWins
+                    } else {
+                        GameResult::WhiteWins
+                    }
+                } else {
+                    GameResult::Draw // stalemate
+                },
+            };
             return;
         }
-        self.status = GameStatus::Finished {
-            result: if self.position.in_check() {
-                // The side to move is checkmated -- the *other* side won.
-                if self.position.side_to_move() == bee_chess_core::Color::White {
-                    GameResult::BlackWins
-                } else {
-                    GameResult::WhiteWins
-                }
-            } else {
-                GameResult::Draw // stalemate
-            },
-        };
+
+        let current_hash = self.position.zobrist_hash();
+        let repetitions = self
+            .position_history
+            .iter()
+            .filter(|&&hash| hash == current_hash)
+            .count();
+        if self.position.halfmove_clock() >= 100 || repetitions >= 3 {
+            self.status = GameStatus::Finished {
+                result: GameResult::Draw,
+            };
+        }
     }
 }
 
@@ -383,6 +435,9 @@ pub struct GameSnapshot {
     pub id: GameId,
     pub fen: String,
     pub moves: Vec<String>,
+    /// Bounded raw UCI history, retained so a finished game can be inspected
+    /// after its engine processes and live event stream have gone quiet.
+    pub uci_log: Vec<UciLogEntry>,
     pub white: ParticipantInfo,
     pub black: ParticipantInfo,
     /// The experiment that created this game, if any -- lets a client
@@ -402,6 +457,7 @@ impl From<&Game> for GameSnapshot {
             id: game.id,
             fen: game.fen(),
             moves: game.moves().to_vec(),
+            uci_log: game.uci_log.clone(),
             white: game.white_participant().clone(),
             black: game.black_participant().clone(),
             experiment_id: game.experiment_id(),
@@ -537,7 +593,7 @@ impl GameStore {
     /// that a real scenario in practice -- still, the engine loop
     /// shouldn't panic over it). Broadcasts `GameEvent::Updated` if the
     /// game existed.
-    fn abort(&self, id: GameId, reason: impl Into<String>) {
+    pub(crate) fn abort(&self, id: GameId, reason: impl Into<String>) {
         let snapshot = {
             let mut games = self.games.lock().expect("game store mutex poisoned");
             let Some(game) = games.get_mut(&id) else {
@@ -577,6 +633,39 @@ impl GameStore {
         {
             let _ = sender.send(event);
         }
+    }
+
+    fn record_uci_line(&self, id: GameId, color: Color, direction: UciDirection, line: &str) {
+        let entry = UciLogEntry {
+            color: match color {
+                Color::White => UciLogColor::White,
+                Color::Black => UciLogColor::Black,
+            },
+            direction: match direction {
+                UciDirection::Sent => UciLogDirection::Sent,
+                UciDirection::Received => UciLogDirection::Received,
+            },
+            line: line.to_string(),
+        };
+        if let Some(game) = self
+            .games
+            .lock()
+            .expect("game store mutex poisoned")
+            .get_mut(&id)
+        {
+            if game.uci_log.len() == UCI_LOG_CAPACITY {
+                game.uci_log.remove(0);
+            }
+            game.uci_log.push(entry);
+        }
+        self.publish(
+            id,
+            GameEvent::Uci {
+                color,
+                direction,
+                line: line.to_string(),
+            },
+        );
     }
 }
 
@@ -692,14 +781,7 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
                 // Best-effort: `publish` already silently no-ops if
                 // nobody's subscribed or the game's gone, so nothing
                 // here needs its own error handling.
-                store_for_events.publish(
-                    id,
-                    GameEvent::Uci {
-                        color: side_to_move,
-                        direction,
-                        line: line.to_string(),
-                    },
-                );
+                store_for_events.record_uci_line(id, side_to_move, direction, line);
             });
             let mut process =
                 match UciProcess::spawn(&config.spec.argv, &config.spec.cwd, Some(on_line)).await {
@@ -856,6 +938,41 @@ mod tests {
     }
 
     #[test]
+    fn hundred_halfmoves_without_a_pawn_move_or_capture_finishes_as_a_draw() {
+        let position = Position::from_fen("7k/8/8/8/8/8/N7/K7 w - - 99 50").expect("valid FEN");
+        let mut game = Game::from_position(position);
+        assert_eq!(game.status(), &GameStatus::Running);
+
+        game.apply_move("a2b4")
+            .expect("quiet knight move should be legal");
+
+        assert_eq!(
+            game.status(),
+            &GameStatus::Finished {
+                result: GameResult::Draw
+            }
+        );
+    }
+
+    #[test]
+    fn third_occurrence_of_a_position_finishes_as_a_draw() {
+        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+
+        for mv in [
+            "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+        ] {
+            game.apply_move(mv).expect("knight shuffle should be legal");
+        }
+
+        assert_eq!(
+            game.status(),
+            &GameStatus::Finished {
+                result: GameResult::Draw
+            }
+        );
+    }
+
+    #[test]
     fn game_store_create_then_snapshot_round_trips() {
         let store = GameStore::new();
         let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
@@ -980,5 +1097,27 @@ mod tests {
         let text = id.to_string();
         let parsed: GameId = text.parse().expect("should parse back");
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn uci_lines_are_retained_in_the_game_snapshot() {
+        let store = GameStore::new();
+        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+
+        store.record_uci_line(
+            created.id,
+            Color::White,
+            UciDirection::Received,
+            "info depth 4",
+        );
+
+        assert_eq!(
+            store.snapshot(created.id).unwrap().uci_log,
+            vec![UciLogEntry {
+                color: UciLogColor::White,
+                direction: UciLogDirection::Received,
+                line: "info depth 4".to_string(),
+            }]
+        );
     }
 }

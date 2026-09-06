@@ -9,6 +9,7 @@ import { NumberInput } from "./components/ui/NumberInput";
 import { Panel, PanelBody, PanelHeader } from "./components/ui/Panel";
 
 const DEFAULT_GAMES = 20;
+const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_MOVE_TIME_MS = 100;
 
 type VariantForm = {
@@ -28,6 +29,7 @@ export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: strin
   const [variantA, setVariantA] = useState<VariantForm>({ label: "Baseline", options: {} });
   const [variantB, setVariantB] = useState<VariantForm>({ label: "Candidate", options: {} });
   const [games, setGames] = useState(DEFAULT_GAMES);
+  const [concurrency, setConcurrency] = useState(DEFAULT_CONCURRENCY);
   const [moveTimeMs, setMoveTimeMs] = useState(DEFAULT_MOVE_TIME_MS);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -35,9 +37,11 @@ export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: strin
   const validationError =
     variantA.label.trim() === "" || variantB.label.trim() === ""
       ? "Both variants need a label."
-      : !Number.isInteger(games) || games < 1
-        ? "Games must be a whole number, at least 1."
-        : !Number.isInteger(moveTimeMs) || moveTimeMs < 1
+      : !Number.isInteger(games) || games < 2 || games % 2 !== 0
+        ? "Games must be a positive even number so every game has a color-swapped partner."
+        : !Number.isInteger(concurrency) || concurrency < 1 || concurrency > games
+          ? "Concurrency must be a whole number between 1 and the number of games."
+          : !Number.isInteger(moveTimeMs) || moveTimeMs < 1
           ? "Move time must be a whole number of milliseconds, at least 1."
           : null;
 
@@ -54,6 +58,7 @@ export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: strin
           variantA: { label: variantA.label, options: variantA.options },
           variantB: { label: variantB.label, options: variantB.options },
           games,
+          concurrency,
           moveTimeMs,
         };
         createExperiment(request).then(
@@ -71,10 +76,13 @@ export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: strin
       </div>
       <div className="flex flex-wrap justify-center gap-4">
         <Field label="Games">
-          <NumberInput value={games} min={1} step={1} onChange={setGames} />
+          <NumberInput value={games} min={2} step={2} onChange={setGames} />
         </Field>
         <Field label="Move time (ms)">
           <NumberInput value={moveTimeMs} min={1} step={1} onChange={setMoveTimeMs} />
+        </Field>
+        <Field label="Concurrent games">
+          <NumberInput value={concurrency} min={1} max={games} step={1} onChange={setConcurrency} />
         </Field>
       </div>
       {(validationError ?? error) && <p className="m-0 text-sm text-danger">{validationError ?? error}</p>}

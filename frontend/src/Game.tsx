@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Chess } from "chessops/chess";
 import { parseFen } from "chessops/fen";
 import { chessgroundDests } from "chessops/compat";
@@ -97,6 +97,15 @@ export function Game({
   // Declared before the mount effect below since that effect forwards
   // events into this set as they arrive over the WebSocket.
   const logListenersRef = useRef(new Set<(event: GameEvent) => void>());
+  const logHistoryRef = useRef<GameEvent[]>([]);
+  const whiteLogSubscribe = useMemo(
+    () => logSubscribeFor(logListenersRef, logHistoryRef, "white"),
+    [],
+  );
+  const blackLogSubscribe = useMemo(
+    () => logSubscribeFor(logListenersRef, logHistoryRef, "black"),
+    [],
+  );
 
   const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
   const [status, setStatus] = useState("connecting to Bee Lab…");
@@ -168,6 +177,7 @@ export function Game({
       if (cancelled) return;
 
       gameIdRef.current = initial.id;
+      logHistoryRef.current = initial.uci_log.map((entry) => ({ type: "uci", ...entry }));
       onGameCreated(initial.id);
       applySnapshot(initial);
 
@@ -180,6 +190,7 @@ export function Game({
       unsubscribe = subscribeToGameEvents(initial.id, (event: GameEvent) => {
         if (cancelled) return;
         if (event.type === "updated") applySnapshot(event.snapshot);
+        if (event.type === "uci") logHistoryRef.current.push(event);
         for (const listener of logListenersRef.current) listener(event);
       });
 
@@ -267,7 +278,7 @@ export function Game({
       )}
       <Inline gap={2} align="start" className="justify-center">
         {participantInfoFor("white")?.kind === "engine" && (
-          <EvalBar color="white" subscribe={logSubscribeFor(logListenersRef, "white")} />
+          <EvalBar color="white" subscribe={whiteLogSubscribe} />
         )}
         <Chessground
           config={{
@@ -286,13 +297,13 @@ export function Game({
           }}
         />
         {participantInfoFor("black")?.kind === "engine" && (
-          <EvalBar color="black" subscribe={logSubscribeFor(logListenersRef, "black")} />
+          <EvalBar color="black" subscribe={blackLogSubscribe} />
         )}
       </Inline>
       <p className="m-0 text-sm text-muted">{status}</p>
       {finished && <Button onClick={onBackToSetup}>New game</Button>}
-      <BotPanels color="white" info={participantInfoFor("white")} logListenersRef={logListenersRef} />
-      <BotPanels color="black" info={participantInfoFor("black")} logListenersRef={logListenersRef} />
+      <BotPanels color="white" info={participantInfoFor("white")} subscribe={whiteLogSubscribe} />
+      <BotPanels color="black" info={participantInfoFor("black")} subscribe={blackLogSubscribe} />
     </Stack>
   );
 }
@@ -303,15 +314,13 @@ export function Game({
 function BotPanels({
   color,
   info,
-  logListenersRef,
+  subscribe,
 }: {
   color: Color;
   info: ParticipantInfo | null;
-  logListenersRef: RefObject<Set<(event: GameEvent) => void>>;
+  subscribe: (listener: (line: UciLogLine) => void) => () => void;
 }) {
   if (!info || info.kind === "human") return null;
-
-  const subscribe = logSubscribeFor(logListenersRef, color);
 
   return (
     <Stack gap={2} className="w-full max-w-[900px]">
@@ -328,6 +337,7 @@ function BotPanels({
  * instead of a direct browser-to-engine connection. */
 function logSubscribeFor(
   logListenersRef: RefObject<Set<(event: GameEvent) => void>>,
+  logHistoryRef: RefObject<GameEvent[]>,
   color: Color,
 ): (listener: (line: UciLogLine) => void) => () => void {
   return (listener) => {
@@ -335,6 +345,7 @@ function logSubscribeFor(
       if (event.type !== "uci" || event.color !== color) return;
       listener({ direction: event.direction, text: event.line, timestamp: Date.now() });
     };
+    for (const event of logHistoryRef.current) handler(event);
     logListenersRef.current.add(handler);
     return () => logListenersRef.current.delete(handler);
   };
