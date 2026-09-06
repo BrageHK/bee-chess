@@ -354,7 +354,7 @@ function toParticipantRequest(participant: Participant): ParticipantRequest | un
         debug: participant.debug,
       };
     case "bee":
-      return { engine: "bee", options: participant.settings, debug: participant.debug };
+      return { engine: "bee", options: participant.options, debug: participant.debug };
     case "bee-mamba":
       // Unreachable: badParticipant already redirected to the
       // unavailable-message screen before createGame is ever called.
