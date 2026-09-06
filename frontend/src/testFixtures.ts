@@ -52,5 +52,6 @@ function emptySearchStats() {
     max_depth: null,
     effective_nps: null,
     avg_eval_cp: null,
+    time_management: null,
   };
 }

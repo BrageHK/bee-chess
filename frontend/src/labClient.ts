@@ -203,6 +203,28 @@ export interface ExperimentSearchStats {
   max_depth: number | null;
   effective_nps: number | null;
   avg_eval_cp: number | null;
+  /** Aggregated `bee-tm` time-management telemetry (see
+   * `bee_engine::search::TimeManagementTelemetry`), or `null` if no
+   * search produced one (a `move_time` experiment, an older engine
+   * build, or a non-Bee engine). */
+  time_management: TimeManagementStats | null;
+}
+
+/** Mirrors `lab::experiment::TimeManagementStats`'s JSON shape
+ * exactly -- see that Rust type's docs for what each field means and
+ * why `total_aborted_ms`/`max_aborted_ms`/
+ * `searches_with_aborted_iteration` are the most load-bearing ones: an
+ * average alone can hide an occasional expensive discarded iteration. */
+export interface TimeManagementStats {
+  searches_with_telemetry: number;
+  avg_soft_ms: number;
+  avg_hard_ms: number;
+  total_aborted_ms: number;
+  avg_aborted_ms: number;
+  max_aborted_ms: number;
+  searches_with_aborted_iteration: number;
+  avg_best_move_changes: number;
+  avg_score_delta_cp: number | null;
 }
 
 /** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly

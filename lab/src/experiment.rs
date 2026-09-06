@@ -213,6 +213,7 @@ struct SearchTotals {
     max_depth: u32,
     eval_cp_sum: i64,
     eval_samples: u64,
+    time_management: TimeManagementTotals,
 }
 
 impl SearchTotals {
@@ -225,6 +226,94 @@ impl SearchTotals {
         self.max_depth = self.max_depth.max(other.max_depth);
         self.eval_cp_sum += other.eval_cp_sum;
         self.eval_samples += other.eval_samples;
+        self.time_management.add(other.time_management);
+    }
+}
+
+/// Running totals from every `bee-tm` telemetry line seen (see
+/// `bee_engine::search::TimeManagementTelemetry`'s docs on the wire
+/// format) -- kept separate from `SearchTotals`'s other fields since
+/// `bee-tm` is a distinct, optional telemetry capability: only a
+/// `search_with_clock` search (a real `go wtime/btime`) ever emits one
+/// at all, so `samples` can legitimately stay `0` for a whole
+/// experiment (a `TimeControl::MoveTime` one, an older engine build,
+/// or any engine that isn't Bee).
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeManagementTotals {
+    samples: u64,
+    soft_ms_sum: u64,
+    hard_ms_sum: u64,
+    aborted_ms_sum: u64,
+    max_aborted_ms: u64,
+    searches_with_aborted_iteration: u64,
+    best_move_changes_sum: u64,
+    score_delta_cp_sum: i64,
+    score_delta_cp_samples: u64,
+}
+
+impl TimeManagementTotals {
+    fn add(&mut self, other: Self) {
+        self.samples += other.samples;
+        self.soft_ms_sum += other.soft_ms_sum;
+        self.hard_ms_sum += other.hard_ms_sum;
+        self.aborted_ms_sum += other.aborted_ms_sum;
+        self.max_aborted_ms = self.max_aborted_ms.max(other.max_aborted_ms);
+        self.searches_with_aborted_iteration += other.searches_with_aborted_iteration;
+        self.best_move_changes_sum += other.best_move_changes_sum;
+        self.score_delta_cp_sum += other.score_delta_cp_sum;
+        self.score_delta_cp_samples += other.score_delta_cp_samples;
+    }
+
+    /// Parses one `bee-tm` payload (the text after `"info string
+    /// bee-tm "`, e.g. `"v=1 soft_ms=164 hard_ms=492
+    /// completed_depth=6 aborted_ms=354 best_move_changes=0
+    /// score_delta_cp=-12"`) into a single-sample `TimeManagementTotals`,
+    /// or `None` if it's missing/malformed in a way that makes it
+    /// unsafe to trust at all (no recognizable `v=1`, or a required
+    /// field is missing/unparseable) -- per the wire format's own
+    /// forward-compatibility rules (see
+    /// `bee_engine::search::TimeManagementTelemetry`'s docs), an
+    /// *unknown* key is always ignored rather than treated as
+    /// malformed, and a missing *optional* field (`score_delta_cp`) is
+    /// expected, not an error. Malformed telemetry only ever means
+    /// "this one record contributes nothing to the aggregate" -- it
+    /// never affects the game or the rest of that move's ordinary
+    /// search stats (see `summarize_searches`, the only caller).
+    fn parse(payload: &str) -> Option<Self> {
+        let mut fields = std::collections::HashMap::new();
+        for token in payload.split_whitespace() {
+            if let Some((key, value)) = token.split_once('=') {
+                fields.insert(key, value);
+            }
+        }
+
+        if fields.get("v").copied() != Some("1") {
+            return None;
+        }
+        let soft_ms: u64 = fields.get("soft_ms")?.parse().ok()?;
+        let hard_ms: u64 = fields.get("hard_ms")?.parse().ok()?;
+        let aborted_ms: u64 = fields.get("aborted_ms")?.parse().ok()?;
+        let best_move_changes: u64 = fields.get("best_move_changes")?.parse().ok()?;
+        // Optional: absent (or unparseable, which shouldn't happen per
+        // the emitter's own contract, but this parser doesn't trust
+        // that blindly) just means "no delta available for this
+        // sample" rather than invalidating the whole record.
+        let score_delta_cp: Option<i64> = fields
+            .get("score_delta_cp")
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(i64::from);
+
+        Some(TimeManagementTotals {
+            samples: 1,
+            soft_ms_sum: soft_ms,
+            hard_ms_sum: hard_ms,
+            aborted_ms_sum: aborted_ms,
+            max_aborted_ms: aborted_ms,
+            searches_with_aborted_iteration: u64::from(aborted_ms > 0),
+            best_move_changes_sum: best_move_changes,
+            score_delta_cp_sum: score_delta_cp.unwrap_or(0),
+            score_delta_cp_samples: u64::from(score_delta_cp.is_some()),
+        })
     }
 }
 
@@ -452,6 +541,72 @@ pub struct ExperimentSearchStats {
     pub max_depth: Option<u32>,
     pub effective_nps: Option<f64>,
     pub avg_eval_cp: Option<f64>,
+    /// Aggregated `bee-tm` telemetry (see `bee_engine::search::
+    /// TimeManagementTelemetry`'s docs) across every search that
+    /// produced one -- `None` if none did (a `TimeControl::MoveTime`
+    /// experiment, an older engine build, a non-Bee engine, or simply
+    /// no games having settled yet). A distinct, optional capability
+    /// from the generic depth/nodes/NPS stats above, not folded into
+    /// them -- see this field's own type's docs.
+    pub time_management: Option<TimeManagementStats>,
+}
+
+/// Aggregated time-management telemetry for one variant across an
+/// experiment's settled games -- see `TimeManagementTotals`, the raw
+/// accumulator this is derived from, and `bee_engine::search::
+/// TimeManagementTelemetry`'s docs for what each underlying field
+/// means on a single search. `total_aborted_ms`/`max_aborted_ms`/
+/// `searches_with_aborted_iteration` are deliberately the most
+/// prominent fields here: an average alone can hide the exact problem
+/// worth knowing about (a search that *usually* wastes nothing but
+/// *occasionally* burns hundreds of milliseconds on a discarded
+/// iteration) -- this is the evidence a predictive time policy (only
+/// start a depth if it can plausibly finish) would need to justify
+/// itself against `TimePolicy::Baseline`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TimeManagementStats {
+    /// How many `go`s produced a `bee-tm` line at all -- the
+    /// denominator for every average below, and worth reporting on its
+    /// own since it's possible for only some of an experiment's
+    /// searches to have clock-based telemetry (e.g. a book hit or a
+    /// forced-fallback move never allocates a real budget to report on).
+    pub searches_with_telemetry: u64,
+    pub avg_soft_ms: f64,
+    pub avg_hard_ms: f64,
+    pub total_aborted_ms: u64,
+    pub avg_aborted_ms: f64,
+    pub max_aborted_ms: u64,
+    /// How many searches had a nonzero `aborted_ms` at all -- distinct
+    /// from `avg_aborted_ms`, which a handful of expensive outliers
+    /// among many zero-waste searches can make look deceptively small.
+    pub searches_with_aborted_iteration: u64,
+    pub avg_best_move_changes: f64,
+    /// `None` if no search reported a `score_delta_cp` at all (every
+    /// sample only ever completed a single depth) -- see
+    /// `TimeManagementTelemetry::score_delta_cp`'s own docs on why that
+    /// field itself is optional per-search.
+    pub avg_score_delta_cp: Option<f64>,
+}
+
+impl From<TimeManagementTotals> for Option<TimeManagementStats> {
+    fn from(t: TimeManagementTotals) -> Self {
+        if t.samples == 0 {
+            return None;
+        }
+        let per_sample = |value: u64| value as f64 / t.samples as f64;
+        Some(TimeManagementStats {
+            searches_with_telemetry: t.samples,
+            avg_soft_ms: per_sample(t.soft_ms_sum),
+            avg_hard_ms: per_sample(t.hard_ms_sum),
+            total_aborted_ms: t.aborted_ms_sum,
+            avg_aborted_ms: per_sample(t.aborted_ms_sum),
+            max_aborted_ms: t.max_aborted_ms,
+            searches_with_aborted_iteration: t.searches_with_aborted_iteration,
+            avg_best_move_changes: per_sample(t.best_move_changes_sum),
+            avg_score_delta_cp: (t.score_delta_cp_samples > 0)
+                .then(|| t.score_delta_cp_sum as f64 / t.score_delta_cp_samples as f64),
+        })
+    }
 }
 
 impl From<SearchTotals> for ExperimentSearchStats {
@@ -466,6 +621,7 @@ impl From<SearchTotals> for ExperimentSearchStats {
             max_depth: (t.depth_samples > 0).then_some(t.max_depth),
             effective_nps: (t.time_ms > 0).then(|| t.nodes as f64 * 1000.0 / t.time_ms as f64),
             avg_eval_cp: (t.eval_samples > 0).then(|| t.eval_cp_sum as f64 / t.eval_samples as f64),
+            time_management: t.time_management.into(),
         }
     }
 }
@@ -844,7 +1000,19 @@ fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
         } else {
             1
         };
-        if entry.line.starts_with("info ") {
+        if let Some(payload) = entry.line.strip_prefix("info string bee-tm ") {
+            // Attaches to the same pending search as the `info depth`
+            // lines above it and the `bestmove` that follows -- same
+            // "accumulate into `pending[side]`, flush on `bestmove`"
+            // shape, so a `bee-tm` line is naturally paired with the
+            // right move even though it's a separate log entry. A
+            // malformed/unparseable payload contributes nothing (see
+            // `TimeManagementTotals::parse`'s docs) rather than
+            // corrupting this move's other search stats.
+            if let Some(time_management) = TimeManagementTotals::parse(payload) {
+                pending[side].time_management = time_management;
+            }
+        } else if entry.line.starts_with("info ") {
             let tokens: Vec<&str> = entry.line.split_whitespace().collect();
             let mut i = 1;
             while i + 1 < tokens.len() {
@@ -986,6 +1154,149 @@ mod tests {
         assert_eq!(white.max_depth, 8);
         assert_eq!(white.eval_cp_sum, 20);
         assert_eq!(black.searches, 0);
+    }
+
+    #[test]
+    fn time_management_totals_parse_reads_every_field() {
+        let parsed = TimeManagementTotals::parse(
+            "v=1 soft_ms=164 hard_ms=492 completed_depth=6 aborted_ms=354 best_move_changes=2 score_delta_cp=-12",
+        )
+        .expect("well-formed payload should parse");
+
+        assert_eq!(parsed.samples, 1);
+        assert_eq!(parsed.soft_ms_sum, 164);
+        assert_eq!(parsed.hard_ms_sum, 492);
+        assert_eq!(parsed.aborted_ms_sum, 354);
+        assert_eq!(parsed.max_aborted_ms, 354);
+        assert_eq!(parsed.searches_with_aborted_iteration, 1);
+        assert_eq!(parsed.best_move_changes_sum, 2);
+        assert_eq!(parsed.score_delta_cp_sum, -12);
+        assert_eq!(parsed.score_delta_cp_samples, 1);
+    }
+
+    #[test]
+    fn time_management_totals_parse_treats_zero_aborted_ms_as_no_aborted_iteration() {
+        let parsed = TimeManagementTotals::parse(
+            "v=1 soft_ms=100 hard_ms=300 completed_depth=5 aborted_ms=0 best_move_changes=0",
+        )
+        .expect("well-formed payload should parse");
+
+        assert_eq!(parsed.aborted_ms_sum, 0);
+        assert_eq!(parsed.searches_with_aborted_iteration, 0);
+        assert_eq!(
+            parsed.score_delta_cp_samples, 0,
+            "score_delta_cp is optional and was omitted here"
+        );
+    }
+
+    #[test]
+    fn time_management_totals_parse_ignores_unknown_fields() {
+        // Forward compatibility: a future engine version might add a
+        // new key (e.g. `policy=Predictive`) -- this parser must not
+        // choke on it.
+        let parsed = TimeManagementTotals::parse(
+            "v=1 policy=Predictive soft_ms=100 hard_ms=300 completed_depth=5 aborted_ms=0 best_move_changes=0",
+        );
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn time_management_totals_parse_rejects_missing_or_wrong_version() {
+        assert!(TimeManagementTotals::parse(
+            "soft_ms=100 hard_ms=300 aborted_ms=0 best_move_changes=0"
+        )
+        .is_none());
+        assert!(
+            TimeManagementTotals::parse(
+                "v=2 soft_ms=100 hard_ms=300 aborted_ms=0 best_move_changes=0"
+            )
+            .is_none(),
+            "an unrecognized version must not be trusted, even if every known field is present"
+        );
+    }
+
+    #[test]
+    fn time_management_totals_parse_rejects_a_missing_required_field() {
+        assert!(
+            TimeManagementTotals::parse("v=1 soft_ms=100 hard_ms=300 best_move_changes=0").is_none(),
+            "missing aborted_ms (a required field, unlike score_delta_cp) invalidates the whole record"
+        );
+    }
+
+    #[test]
+    fn summarize_searches_attaches_bee_tm_to_the_move_it_preceded() {
+        let received = |color, line: &str| UciLogEntry {
+            color,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received(UciLogColor::White, "info depth 6 nodes 300 time 10 score cp 30"),
+            received(
+                UciLogColor::White,
+                "info string bee-tm v=1 soft_ms=164 hard_ms=492 completed_depth=6 aborted_ms=354 best_move_changes=0",
+            ),
+            received(UciLogColor::White, "bestmove e2e4"),
+            // A second move with no bee-tm line at all (e.g. a
+            // fixed-depth go) -- must not carry over the previous
+            // move's telemetry.
+            received(UciLogColor::White, "info depth 4 nodes 100 time 5 score cp 5"),
+            received(UciLogColor::White, "bestmove g1f3"),
+        ];
+
+        let (white, _black) = summarize_searches(&log);
+
+        assert_eq!(white.searches, 2);
+        let stats: Option<TimeManagementStats> = white.time_management.into();
+        let stats = stats.expect("one of the two searches had bee-tm telemetry");
+        assert_eq!(
+            stats.searches_with_telemetry, 1,
+            "only the first move had a bee-tm line"
+        );
+        assert_eq!(stats.avg_soft_ms, 164.0);
+        assert_eq!(stats.avg_hard_ms, 492.0);
+        assert_eq!(stats.total_aborted_ms, 354);
+        assert_eq!(stats.max_aborted_ms, 354);
+        assert_eq!(stats.searches_with_aborted_iteration, 1);
+    }
+
+    #[test]
+    fn summarize_searches_ignores_a_malformed_bee_tm_line_without_affecting_other_stats() {
+        let received = |color, line: &str| UciLogEntry {
+            color,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received(
+                UciLogColor::White,
+                "info depth 6 nodes 300 time 10 score cp 30",
+            ),
+            received(
+                UciLogColor::White,
+                "info string bee-tm garbage not a real payload",
+            ),
+            received(UciLogColor::White, "bestmove e2e4"),
+        ];
+
+        let (white, _black) = summarize_searches(&log);
+
+        assert_eq!(
+            white.searches, 1,
+            "the move's ordinary stats must still be recorded"
+        );
+        assert_eq!(white.nodes, 300);
+        let stats: Option<TimeManagementStats> = white.time_management.into();
+        assert_eq!(
+            stats, None,
+            "a malformed bee-tm payload must not be trusted at all"
+        );
+    }
+
+    #[test]
+    fn experiment_search_stats_time_management_is_none_without_any_bee_tm_lines() {
+        let stats = ExperimentSearchStats::from(SearchTotals::default());
+        assert_eq!(stats.time_management, None);
     }
 
     #[test]
