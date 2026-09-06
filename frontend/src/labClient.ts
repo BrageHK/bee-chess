@@ -131,6 +131,7 @@ export interface ExperimentGame {
  * interpretable again later. */
 export interface ExperimentMetadata {
   lab_git_commit: string;
+  opening_seed: number;
   variant_a_argv: string[];
   variant_b_argv: string[];
   started_at: string;
@@ -158,6 +159,16 @@ export interface ExperimentSearchStats {
   max_depth: number | null;
   effective_nps: number | null;
   avg_eval_cp: number | null;
+  lmr_attempts: number;
+  lmr_fail_lows: number;
+  lmr_researches: number;
+  lmr_research_rate: number | null;
+  nmp_attempts: number;
+  nmp_cutoffs: number;
+  nmp_cutoff_rate: number | null;
+  delta_attempts: number;
+  delta_pruned: number;
+  delta_prune_rate: number | null;
 }
 
 /** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly

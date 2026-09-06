@@ -42,7 +42,7 @@ mod zobrist;
 
 pub use castling::CastlingRights;
 pub use fen::FenError;
-pub use make_unmake::Undo;
+pub use make_unmake::{NullMoveUndo, Undo};
 pub use moves::{Move, MoveFlag};
 pub use perft::{perft, perft_divide};
 pub use piece::{Color, Piece, PieceKind};

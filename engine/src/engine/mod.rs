@@ -257,6 +257,22 @@ impl Engine {
         self.search_options.use_enhanced_quiescence = use_enhanced_quiescence;
     }
 
+    pub fn set_use_lmr(&mut self, use_lmr: bool) {
+        self.search_options.use_lmr = use_lmr;
+    }
+
+    pub fn set_use_null_move(&mut self, enabled: bool) {
+        self.search_options.use_null_move = enabled;
+    }
+
+    pub fn set_use_adaptive_null_move(&mut self, enabled: bool) {
+        self.search_options.use_adaptive_null_move = enabled;
+    }
+
+    pub fn set_use_delta_pruning(&mut self, enabled: bool) {
+        self.search_options.use_delta_pruning = enabled;
+    }
+
     pub const fn move_overhead(&self) -> std::time::Duration {
         self.time_manager_config.move_overhead
     }
@@ -392,6 +408,9 @@ impl Engine {
             nodes: 0,
             depth: 0,
             pv: vec![mv],
+            lmr: Default::default(),
+            null_move: Default::default(),
+            delta_pruning: Default::default(),
         })
     }
 
@@ -622,6 +641,9 @@ impl Engine {
                 nodes: 0,
                 depth: 0,
                 pv: fallback.into_iter().collect(),
+                lmr: Default::default(),
+                null_move: Default::default(),
+                delta_pruning: Default::default(),
             }
         })
     }

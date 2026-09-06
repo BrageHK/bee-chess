@@ -332,10 +332,17 @@ fn write_search_info<W: Write>(
     };
     write!(
         output,
-        "info depth {} score {score_field} nodes {} time {}",
+        "info depth {} score {score_field} nodes {} time {} lmr_attempts {} lmr_fail_lows {} lmr_researches {} nmp_attempts {} nmp_cutoffs {} delta_attempts {} delta_pruned {}",
         result.depth,
         result.nodes,
         elapsed.as_millis(),
+        result.lmr.attempts,
+        result.lmr.fail_lows(),
+        result.lmr.researches,
+        result.null_move.attempts,
+        result.null_move.cutoffs,
+        result.delta_pruning.attempts,
+        result.delta_pruning.pruned,
     )?;
     if !result.pv.is_empty() {
         write!(output, " pv")?;
@@ -380,6 +387,16 @@ pub fn run<R: BufRead, W: Write>(
                 // not a permanent engine configuration.
                 writeln!(output, "option name UseTT type check default true")?;
                 writeln!(output, "option name UseQuiescence type check default true")?;
+                writeln!(output, "option name UseLMR type check default true")?;
+                writeln!(output, "option name UseNullMove type check default true")?;
+                writeln!(
+                    output,
+                    "option name UseAdaptiveNullMove type check default true"
+                )?;
+                writeln!(
+                    output,
+                    "option name UseDeltaPruning type check default true"
+                )?;
                 writeln!(
                     output,
                     "option name UseEnhancedQuiescence type check default true"
@@ -442,6 +459,38 @@ pub fn run<R: BufRead, W: Write>(
                         None => engine.emit_diagnostic(
                             DiagnosticLevel::Warn,
                             format!("ignored invalid UseEnhancedQuiescence value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseLMR") {
+                    match parse_uci_check(&value) {
+                        Some(enabled) => engine.set_use_lmr(enabled),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseLMR value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseNullMove") {
+                    match parse_uci_check(&value) {
+                        Some(enabled) => engine.set_use_null_move(enabled),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseNullMove value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseAdaptiveNullMove") {
+                    match parse_uci_check(&value) {
+                        Some(enabled) => engine.set_use_adaptive_null_move(enabled),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseAdaptiveNullMove value: {value}"),
+                        ),
+                    }
+                } else if name.eq_ignore_ascii_case("UseDeltaPruning") {
+                    match parse_uci_check(&value) {
+                        Some(enabled) => engine.set_use_delta_pruning(enabled),
+                        None => engine.emit_diagnostic(
+                            DiagnosticLevel::Warn,
+                            format!("ignored invalid UseDeltaPruning value: {value}"),
                         ),
                     }
                 } else if name.eq_ignore_ascii_case("OpeningBook") {
@@ -867,6 +916,10 @@ mod tests {
         assert!(text.contains("var Experimental"));
         assert!(text.contains("option name UseTT type check default true"));
         assert!(text.contains("option name UseQuiescence type check default true"));
+        assert!(text.contains("option name UseLMR type check default true"));
+        assert!(text.contains("option name UseNullMove type check default true"));
+        assert!(text.contains("option name UseAdaptiveNullMove type check default true"));
+        assert!(text.contains("option name UseDeltaPruning type check default true"));
         assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name OpeningBook type combo default None"));
         assert!(text.contains("uciok"));
@@ -916,6 +969,42 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert!(!engine.search_options().use_enhanced_quiescence);
+    }
+
+    #[test]
+    fn setoption_disables_late_move_reductions() {
+        let input = b"setoption name UseLMR value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_lmr);
+    }
+
+    #[test]
+    fn setoption_disables_null_move_pruning() {
+        let input = b"setoption name UseNullMove value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_null_move);
+    }
+
+    #[test]
+    fn setoption_disables_adaptive_null_move_reduction() {
+        let input = b"setoption name UseAdaptiveNullMove value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_adaptive_null_move);
+    }
+
+    #[test]
+    fn setoption_disables_delta_pruning() {
+        let input = b"setoption name UseDeltaPruning value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_delta_pruning);
     }
 
     #[test]
@@ -1275,6 +1364,10 @@ mod tests {
         assert!(info_line.contains("score cp") || info_line.contains("score mate"));
         assert!(info_line.contains("nodes"));
         assert!(info_line.contains("time"));
+        assert!(info_line.contains("nmp_attempts"));
+        assert!(info_line.contains("nmp_cutoffs"));
+        assert!(info_line.contains("delta_attempts"));
+        assert!(info_line.contains("delta_pruned"));
 
         let info_index = text.lines().position(|line| line == info_line).unwrap();
         let bestmove_index = text

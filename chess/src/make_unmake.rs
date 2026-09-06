@@ -36,7 +36,33 @@ pub struct Undo {
     fullmove_number: u32,
 }
 
+/// State changed by a search-only null move. A null move is not legal chess;
+/// it exists solely for pruning and therefore does not advance either clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NullMoveUndo {
+    side_to_move: Color,
+    en_passant_square: Option<Square>,
+}
+
 impl Position {
+    /// Passes the turn for null-move pruning, clearing en passant because its
+    /// capture opportunity lasts for only one reply. Clocks and board state
+    /// remain untouched because this is not a real move.
+    pub fn make_null_move(&mut self) -> NullMoveUndo {
+        let undo = NullMoveUndo {
+            side_to_move: self.side_to_move(),
+            en_passant_square: self.en_passant_square(),
+        };
+        self.set_side_to_move(self.side_to_move().opposite());
+        self.set_en_passant_square(None);
+        undo
+    }
+
+    pub fn unmake_null_move(&mut self, undo: NullMoveUndo) {
+        self.set_side_to_move(undo.side_to_move);
+        self.set_en_passant_square(undo.en_passant_square);
+    }
+
     /// Applies `mv` to this position, mutating it in place, and returns
     /// an `Undo` record that can later restore the pre-move state via
     /// `unmake_move`.
@@ -685,5 +711,21 @@ mod tests {
         }
 
         assert_eq!(position, before);
+    }
+
+    #[test]
+    fn null_move_round_trips_without_advancing_clocks() {
+        let mut position =
+            Position::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - e3 17 9").expect("valid FEN");
+        let original = position.clone();
+
+        let undo = position.make_null_move();
+        assert_eq!(position.side_to_move(), Color::White);
+        assert_eq!(position.en_passant_square(), None);
+        assert_eq!(position.halfmove_clock(), 17);
+        assert_eq!(position.fullmove_number(), 9);
+
+        position.unmake_null_move(undo);
+        assert_eq!(position, original);
     }
 }
