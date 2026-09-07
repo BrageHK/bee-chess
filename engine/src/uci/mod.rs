@@ -736,6 +736,16 @@ fn run_event_loop<W: Write>(
                             "option name MoveOverhead type spin default {} min 0 max 1000",
                             DEFAULT_MOVE_OVERHEAD_MS
                         )?;
+                        // See `crate::search::TimePolicy`'s docs --
+                        // `Baseline` is the default (and today's
+                        // unchanged behavior) so this option is purely
+                        // additive; `Predictive` is the A/B-testable
+                        // alternative Bee Lab's experiment runner can
+                        // switch on.
+                        writeln!(
+                            output,
+                            "option name TimePolicy type combo default Baseline var Baseline var Predictive"
+                        )?;
                         writeln!(output, "uciok")?;
                     }
                     UciCommand::IsReady => {
@@ -827,6 +837,14 @@ fn run_event_loop<W: Write>(
                                 Err(_) => engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid MoveOverhead value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("TimePolicy") {
+                            match crate::search::TimePolicy::parse(&value) {
+                                Some(policy) => engine.set_time_policy(policy),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid TimePolicy value: {value}"),
                                 ),
                             }
                         } else {
@@ -1381,6 +1399,8 @@ mod tests {
         assert!(text.contains("option name UseDeltaPruning type check default true"));
         assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name OpeningBook type combo default None"));
+        assert!(text.contains("option name TimePolicy type combo default Baseline"));
+        assert!(text.contains("var Predictive"));
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
     }
@@ -1441,6 +1461,30 @@ mod tests {
         assert!(!options.use_null_move);
         assert!(!options.use_adaptive_null_move);
         assert!(!options.use_delta_pruning);
+    }
+
+    #[test]
+    fn setoption_selects_the_predictive_time_policy() {
+        let input = b"setoption name TimePolicy value Predictive\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Predictive);
+    }
+
+    #[test]
+    fn engine_defaults_to_the_baseline_time_policy() {
+        let engine = Engine::default();
+        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Baseline);
+    }
+
+    #[test]
+    fn invalid_time_policy_value_keeps_the_current_setting() {
+        let input = b"setoption name TimePolicy value Nonsense\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Baseline);
     }
 
     #[test]
