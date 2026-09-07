@@ -65,13 +65,21 @@ describe("ExperimentView", () => {
           runtime_ms: 45_000,
           games_per_hour: 120,
           variant_a_search: {
+            ...experimentSnapshotFixture().stats.variant_a_search,
             searches: 21, total_nodes: 210_000, avg_nodes: 10_000, avg_time_ms: 50,
             avg_depth: 8.5, max_depth: 11, effective_nps: 200_000, avg_eval_cp: 32,
+            lmr_attempts: 100, lmr_fail_lows: 80, lmr_researches: 20, lmr_research_rate: 0.2,
+            nmp_attempts: 50, nmp_cutoffs: 30, nmp_cutoff_rate: 0.6,
+            delta_attempts: 40, delta_pruned: 10, delta_prune_rate: 0.25,
             time_management: null,
           },
           variant_b_search: {
+            ...experimentSnapshotFixture().stats.variant_b_search,
             searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
             avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
+            lmr_attempts: 0, lmr_fail_lows: 0, lmr_researches: 0, lmr_research_rate: null,
+            nmp_attempts: 0, nmp_cutoffs: 0, nmp_cutoff_rate: null,
+            delta_attempts: 0, delta_pruned: 0, delta_prune_rate: null,
             time_management: null,
           },
           timeouts: 0,
@@ -103,6 +111,7 @@ describe("ExperimentView", () => {
           runtime_ms: 45_000,
           games_per_hour: 120,
           variant_a_search: {
+            ...experimentSnapshotFixture().stats.variant_a_search,
             searches: 21, total_nodes: 210_000, avg_nodes: 10_000, avg_time_ms: 50,
             avg_depth: 8.5, max_depth: 11, effective_nps: 200_000, avg_eval_cp: 32,
             time_management: {
@@ -118,6 +127,7 @@ describe("ExperimentView", () => {
             },
           },
           variant_b_search: {
+            ...experimentSnapshotFixture().stats.variant_b_search,
             searches: 21, total_nodes: 168_000, avg_nodes: 8_000, avg_time_ms: 50,
             avg_depth: 7, max_depth: 9, effective_nps: 160_000, avg_eval_cp: -15,
             time_management: null,
@@ -133,6 +143,24 @@ describe("ExperimentView", () => {
     expect(screen.getByText("164 ms")).toBeInTheDocument();
     expect(screen.getByText("492 ms")).toBeInTheDocument();
     expect(screen.getByText("no bee-tm telemetry")).toBeInTheDocument();
+  });
+
+  it("keeps setting-specific metrics in a collapsed advanced section", async () => {
+    vi.mocked(labClient.getExperiment).mockResolvedValue(experimentSnapshotFixture());
+    const user = userEvent.setup();
+
+    render(<ExperimentView experimentId="exp-1" onOpenGame={() => {}} onBackToSetup={() => {}} />);
+
+    const summary = await screen.findByText("Advanced metrics");
+    const details = summary.closest("details");
+    expect(details).not.toHaveAttribute("open");
+
+    await user.click(summary);
+
+    expect(details).toHaveAttribute("open");
+    expect(screen.getByText("Late move reductions")).toBeInTheDocument();
+    expect(screen.getByText("Null-move pruning")).toBeInTheDocument();
+    expect(screen.getByText("Quiescence delta pruning")).toBeInTheDocument();
   });
 
   it("shows a placeholder for stats that have no data yet", async () => {

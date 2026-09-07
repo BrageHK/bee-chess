@@ -23,6 +23,7 @@ export function experimentSnapshotFixture(overrides: Partial<ExperimentSnapshot>
     games: [],
     metadata: {
       lab_git_commit: "abc123",
+      opening_seed: 12345,
       variant_a_argv: ["/path/to/bee"],
       variant_b_argv: ["/path/to/bee"],
       time_control: { type: "move_time", move_time_ms: 100 },
@@ -52,6 +53,16 @@ function emptySearchStats() {
     max_depth: null,
     effective_nps: null,
     avg_eval_cp: null,
+    lmr_attempts: 0,
+    lmr_fail_lows: 0,
+    lmr_researches: 0,
+    lmr_research_rate: null,
+    nmp_attempts: 0,
+    nmp_cutoffs: 0,
+    nmp_cutoff_rate: null,
+    delta_attempts: 0,
+    delta_pruned: 0,
+    delta_prune_rate: null,
     time_management: null,
   };
 }

@@ -17,13 +17,21 @@
 
 use std::collections::HashMap;
 
-use crate::chess::{Move, MoveFlag, PieceKind, Position};
+use crate::chess::{Color, Move, MoveFlag, PieceKind, Position, Square};
 use crate::eval::Evaluator;
 
 use super::deadline::{Deadline, StopSignal};
-use super::{Score, SearchOptions, SearchResult, SCORE_INF, SCORE_MATE};
+use super::{
+    DeltaPruningStats, LmrStats, NullMoveStats, Score, SearchOptions, SearchResult, SCORE_INF,
+    SCORE_MATE,
+};
 
 const MAX_TT_ENTRIES: usize = 1 << 20;
+/// A practical ceiling for iterative deepening. Positions where every move
+/// immediately reaches a rule draw can otherwise complete arbitrarily large
+/// nominal depths in constant time, producing meaningless values in UCI
+/// telemetry and experiment aggregates.
+const MAX_ITERATIVE_DEPTH: u32 = 128;
 
 #[derive(Clone, Copy)]
 enum Bound {
@@ -46,6 +54,9 @@ struct SearchState {
     killers: Vec<[Option<Move>; 2]>,
     history: [i32; 64 * 64],
     root_best: Option<Move>,
+    lmr: LmrStats,
+    null_move: NullMoveStats,
+    delta_pruning: DeltaPruningStats,
 }
 
 impl SearchState {
@@ -56,6 +67,9 @@ impl SearchState {
             killers: Vec::new(),
             history: [0; 64 * 64],
             root_best: None,
+            lmr: LmrStats::default(),
+            null_move: NullMoveStats::default(),
+            delta_pruning: DeltaPruningStats::default(),
         }
     }
 }
@@ -233,13 +247,19 @@ pub fn search_iterative_with_options(
     }
 
     loop {
+        if depth >= MAX_ITERATIVE_DEPTH {
+            return last_completed;
+        }
         depth += 1;
         match search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
+                let search_saturated = result.nodes == last_completed.nodes
+                    && result.score == last_completed.score
+                    && result.best_move == last_completed.best_move;
                 last_completed = result;
                 on_depth_complete(&last_completed);
-                if found_mate {
+                if found_mate || search_saturated {
                     return last_completed;
                 }
             }
@@ -394,6 +414,12 @@ pub fn search_iterative_with_budget(
     }
 
     loop {
+        if depth >= MAX_ITERATIVE_DEPTH {
+            return Some((
+                last_completed,
+                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+            ));
+        }
         depth += 1;
         let depth_start = std::time::Instant::now();
         match search_to_depth(
@@ -406,6 +432,9 @@ pub fn search_iterative_with_budget(
         ) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
+                let search_saturated = result.nodes == last_completed.nodes
+                    && result.score == last_completed.score
+                    && result.best_move == last_completed.best_move;
                 last_score_delta = previous_score.map(|previous| result.score - previous);
                 if result.best_move != previous_best_move {
                     best_move_changes += 1;
@@ -414,7 +443,7 @@ pub fn search_iterative_with_budget(
                 previous_best_move = result.best_move;
                 last_completed = result;
                 on_depth_complete(&last_completed);
-                if found_mate {
+                if found_mate || search_saturated {
                     return Some((
                         last_completed,
                         telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
@@ -494,6 +523,9 @@ fn search_to_depth(
     state: &mut SearchState,
     path: &mut Vec<u64>,
 ) -> Option<SearchResult> {
+    state.lmr = LmrStats::default();
+    state.null_move = NullMoveStats::default();
+    state.delta_pruning = DeltaPruningStats::default();
     let mut nodes = 0u64;
     let mut moves = position.generate_legal_moves();
 
@@ -507,6 +539,9 @@ fn search_to_depth(
             nodes: 1,
             depth,
             pv: Vec::new(),
+            lmr: state.lmr,
+            null_move: state.null_move,
+            delta_pruning: state.delta_pruning,
         });
     }
 
@@ -521,6 +556,9 @@ fn search_to_depth(
             nodes: 1,
             depth,
             pv: vec![best_move],
+            lmr: state.lmr,
+            null_move: state.null_move,
+            delta_pruning: state.delta_pruning,
         });
     }
 
@@ -545,6 +583,7 @@ fn search_to_depth(
             deadline,
             state,
             path,
+            true,
         );
         path.pop();
         position.unmake_move(mv, undo);
@@ -572,6 +611,9 @@ fn search_to_depth(
         nodes: nodes + 1, // +1 for the root position itself
         depth,
         pv: best_pv,
+        lmr: state.lmr,
+        null_move: state.null_move,
+        delta_pruning: state.delta_pruning,
     })
 }
 
@@ -602,6 +644,7 @@ fn negamax(
     deadline: &Deadline,
     state: &mut SearchState,
     path: &mut Vec<u64>,
+    allow_null: bool,
 ) -> Option<(Score, Vec<Move>)> {
     if deadline.is_expired(*nodes) {
         return None;
@@ -657,16 +700,7 @@ fn negamax(
     if depth == 0 {
         let score = if state.options.use_quiescence {
             quiescence(
-                position,
-                alpha,
-                beta,
-                ply,
-                ply,
-                evaluator,
-                nodes,
-                deadline,
-                path,
-                state.options.use_enhanced_quiescence,
+                position, alpha, beta, ply, ply, evaluator, nodes, deadline, path, state,
             )?
         } else {
             evaluator.evaluate(position)
@@ -674,12 +708,49 @@ fn negamax(
         return Some((score, Vec::new()));
     }
 
+    let null_move_reduction = null_move_reduction(depth, state.options.use_adaptive_null_move);
+    let can_try_null = state.options.use_null_move
+        && allow_null
+        && depth >= null_move_reduction + 2
+        && !position.in_check()
+        && beta.abs() < SCORE_MATE - 1000
+        && has_non_pawn_material(position, position.side_to_move());
+    if can_try_null {
+        state.null_move.attempts += 1;
+        let undo = position.make_null_move();
+        let outcome = negamax(
+            position,
+            depth - 1 - null_move_reduction,
+            -beta,
+            -beta + 1,
+            ply + 1,
+            evaluator,
+            nodes,
+            deadline,
+            state,
+            path,
+            false,
+        );
+        position.unmake_null_move(undo);
+        let (child_score, _) = outcome?;
+        if -child_score >= beta {
+            state.null_move.cutoffs += 1;
+            return Some((-child_score, Vec::new()));
+        }
+    }
+
     order_moves(position, &mut moves, state, ply as usize, tt_move);
     let mut best = -SCORE_INF;
     let mut best_pv: Vec<Move> = Vec::new();
     let mut best_move = None;
+    let in_check = position.in_check();
 
     for (move_index, mv) in moves.into_iter().enumerate() {
+        let quiet = !is_capture(position, mv) && mv.flag().promotion_kind().is_none();
+        let is_killer = state
+            .killers
+            .get(ply as usize)
+            .is_some_and(|killers| killers.contains(&Some(mv)));
         let undo = position.make_move(mv);
         path.push(position.zobrist_hash());
         let mut outcome = if move_index == 0 {
@@ -694,13 +765,26 @@ fn negamax(
                 deadline,
                 state,
                 path,
+                true,
             )
         } else {
             // Principal Variation Search: prove later moves fail low with a
-            // null window, then re-search only an unexpected improvement.
-            let scout = negamax(
+            // null window. Late quiet moves get a conservative one-ply
+            // reduction; any reduced result that challenges alpha is first
+            // verified at full depth before it can affect the result.
+            let use_reduction = state.options.use_lmr
+                && depth >= 3
+                && move_index >= 4
+                && quiet
+                && !is_killer
+                && !in_check
+                && !position.in_check();
+            if use_reduction {
+                state.lmr.attempts += 1;
+            }
+            let mut scout = negamax(
                 position,
-                depth - 1,
+                if use_reduction { depth - 2 } else { depth - 1 },
                 -alpha - 1,
                 -alpha,
                 ply + 1,
@@ -709,7 +793,28 @@ fn negamax(
                 deadline,
                 state,
                 path,
+                true,
             );
+            if use_reduction
+                && scout
+                    .as_ref()
+                    .is_some_and(|(child_score, _)| -*child_score > alpha)
+            {
+                state.lmr.researches += 1;
+                scout = negamax(
+                    position,
+                    depth - 1,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    evaluator,
+                    nodes,
+                    deadline,
+                    state,
+                    path,
+                    true,
+                );
+            }
             match scout {
                 Some((child_score, _)) if -child_score > alpha && -child_score < beta => negamax(
                     position,
@@ -722,6 +827,7 @@ fn negamax(
                     deadline,
                     state,
                     path,
+                    true,
                 ),
                 other => other,
             }
@@ -798,6 +904,7 @@ fn negamax(
 /// way `negamax` returns `evaluator`'s score at `depth == 0` -- a real
 /// (if not fully exchange-resolved) evaluation, never an invented one.
 const MAX_QUIESCENCE_PLY: u32 = 4;
+const DELTA_MARGIN: Score = 200;
 
 /// Quiescence search: from `depth == 0`, keeps searching captures only
 /// (a "noisy" position with hanging material can't be trusted just
@@ -833,7 +940,7 @@ fn quiescence(
     nodes: &mut u64,
     deadline: &Deadline,
     path: &mut Vec<u64>,
-    use_enhanced_quiescence: bool,
+    state: &mut SearchState,
 ) -> Option<Score> {
     if deadline.is_expired(*nodes) {
         return None;
@@ -856,7 +963,7 @@ fn quiescence(
         return Some(terminal_score(position, ply));
     }
 
-    let must_evade_check = use_enhanced_quiescence && position.in_check();
+    let must_evade_check = state.options.use_enhanced_quiescence && position.in_check();
     let stand_pat = evaluator.evaluate(position);
     let mut best = if must_evade_check {
         -SCORE_INF
@@ -877,11 +984,14 @@ fn quiescence(
         .filter(|&mv| {
             must_evade_check
                 || is_capture(position, mv)
-                || (use_enhanced_quiescence && mv.flag().promotion_kind().is_some())
+                || (state.options.use_enhanced_quiescence && mv.flag().promotion_kind().is_some())
         })
         .collect();
     noisy_moves.sort_unstable_by_key(|&mv| std::cmp::Reverse(capture_order_score(position, mv)));
     for mv in noisy_moves {
+        if should_delta_prune(position, mv, stand_pat, alpha, must_evade_check, state) {
+            continue;
+        }
         let undo = position.make_move(mv);
         path.push(position.zobrist_hash());
         let outcome = quiescence(
@@ -894,7 +1004,7 @@ fn quiescence(
             nodes,
             deadline,
             path,
-            use_enhanced_quiescence,
+            state,
         );
         path.pop();
         position.unmake_move(mv, undo);
@@ -912,6 +1022,50 @@ fn quiescence(
     }
 
     Some(best)
+}
+
+fn should_delta_prune(
+    position: &Position,
+    mv: Move,
+    stand_pat: Score,
+    alpha: Score,
+    must_evade_check: bool,
+    state: &mut SearchState,
+) -> bool {
+    if !state.options.use_delta_pruning
+        || must_evade_check
+        || !is_capture(position, mv)
+        || mv.flag().promotion_kind().is_some()
+        || alpha.abs() >= SCORE_MATE - 1_000
+        || !has_major_material(position)
+    {
+        return false;
+    }
+
+    state.delta_pruning.attempts += 1;
+    let captured_value = if mv.flag() == MoveFlag::EnPassant {
+        ordering_piece_value(PieceKind::Pawn)
+    } else {
+        position
+            .piece_at(mv.to())
+            .map_or(0, |piece| ordering_piece_value(piece.kind))
+    };
+    let prune = stand_pat
+        .saturating_add(captured_value)
+        .saturating_add(DELTA_MARGIN)
+        < alpha;
+    if prune {
+        state.delta_pruning.pruned += 1;
+    }
+    prune
+}
+
+fn has_major_material(position: &Position) -> bool {
+    (0..Square::COUNT as u8).any(|index| {
+        position
+            .piece_at(Square::new(index))
+            .is_some_and(|piece| matches!(piece.kind, PieceKind::Rook | PieceKind::Queen))
+    })
 }
 
 fn order_moves(
@@ -943,6 +1097,22 @@ fn order_moves(
         };
         std::cmp::Reverse(score)
     });
+}
+
+fn has_non_pawn_material(position: &Position, color: Color) -> bool {
+    (0..Square::COUNT as u8).any(|index| {
+        position.piece_at(Square::new(index)).is_some_and(|piece| {
+            piece.color == color && !matches!(piece.kind, PieceKind::Pawn | PieceKind::King)
+        })
+    })
+}
+
+const fn null_move_reduction(depth: u32, adaptive: bool) -> u32 {
+    if adaptive && depth >= 7 {
+        3
+    } else {
+        2
+    }
 }
 
 fn record_cutoff(position: &Position, state: &mut SearchState, mv: Move, ply: usize, depth: u32) {
@@ -1171,6 +1341,26 @@ mod tests {
         for pair in depths_seen.windows(2) {
             assert_eq!(pair[1], pair[0] + 1);
         }
+    }
+
+    #[test]
+    fn iterative_deepening_caps_nominal_depth_in_immediate_draw_trees() {
+        // At halfmove 99 every legal non-pawn, non-capture move reaches the
+        // fifty-move draw immediately. Searching depth 2 or 20,000 therefore
+        // costs almost the same unless iterative deepening has a ceiling.
+        let mut position =
+            Position::from_fen("4k3/8/8/8/8/8/8/4K2N w - - 99 1").expect("valid FEN");
+        let mut reported_depths = Vec::new();
+
+        let result = search_iterative(
+            &mut position,
+            std::time::Duration::from_secs(1),
+            &MaterialEvaluator,
+            |result| reported_depths.push(result.depth),
+        );
+
+        assert_eq!(result.depth, 2);
+        assert_eq!(reported_depths, vec![1, 2]);
     }
 
     #[test]
@@ -1562,6 +1752,7 @@ mod tests {
             &Deadline::none(),
             &mut state,
             &mut path,
+            true,
         )
         .unwrap();
         let first_nodes = nodes;
@@ -1576,6 +1767,7 @@ mod tests {
             &Deadline::none(),
             &mut state,
             &mut path,
+            true,
         )
         .unwrap();
         assert_eq!(second.0, first.0);
@@ -1597,6 +1789,10 @@ mod tests {
             use_tt: false,
             use_quiescence: true,
             use_enhanced_quiescence: true,
+            use_lmr: true,
+            use_null_move: true,
+            use_adaptive_null_move: true,
+            use_delta_pruning: true,
         });
         let mut path = vec![position.zobrist_hash()];
         let mut nodes = 0;
@@ -1611,6 +1807,7 @@ mod tests {
             &Deadline::none(),
             &mut state,
             &mut path,
+            true,
         )
         .unwrap();
         let first_nodes = nodes;
@@ -1625,12 +1822,138 @@ mod tests {
             &Deadline::none(),
             &mut state,
             &mut path,
+            true,
         )
         .unwrap();
         assert!(
             nodes - first_nodes > 1,
             "with UseTT off, repeating the search must redo the full node count, not hit a cached root"
         );
+    }
+
+    #[test]
+    fn late_move_reductions_search_fewer_nodes() {
+        let original = Position::startpos();
+        let history = [original.zobrist_hash()];
+        let mut with_lmr = original.clone();
+        let mut without_lmr = original.clone();
+
+        let reduced = search_with_options(
+            &mut with_lmr,
+            4,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+        );
+        let full = search_with_options(
+            &mut without_lmr,
+            4,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions {
+                use_lmr: false,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert!(
+            reduced.nodes < full.nodes,
+            "LMR should reduce work: {} vs {} nodes",
+            reduced.nodes,
+            full.nodes
+        );
+        assert_eq!(with_lmr, original);
+        assert_eq!(without_lmr, original);
+    }
+
+    #[test]
+    fn null_move_pruning_searches_fewer_nodes() {
+        let original = Position::startpos();
+        let history = [original.zobrist_hash()];
+        let mut with_null_move = original.clone();
+        let mut without_null_move = original.clone();
+
+        let pruned = search_with_options(
+            &mut with_null_move,
+            5,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions::default(),
+        );
+        let full = search_with_options(
+            &mut without_null_move,
+            5,
+            &MaterialEvaluator,
+            &history,
+            SearchOptions {
+                use_null_move: false,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert!(
+            pruned.nodes < full.nodes,
+            "null-move pruning should reduce work: {} vs {} nodes",
+            pruned.nodes,
+            full.nodes
+        );
+        assert!(pruned.null_move.attempts > 0);
+        assert!(pruned.null_move.cutoffs > 0);
+        assert!(pruned.null_move.cutoffs <= pruned.null_move.attempts);
+        assert_eq!(full.null_move, NullMoveStats::default());
+        assert_eq!(with_null_move, original);
+        assert_eq!(without_null_move, original);
+    }
+
+    #[test]
+    fn null_move_pruning_zugzwang_guard_requires_non_pawn_material() {
+        let pawn_ending = Position::from_fen("8/8/8/3k4/8/3P4/3K4/8 w - - 0 1").expect("valid FEN");
+        let knight_ending =
+            Position::from_fen("8/8/8/3k4/8/3N4/3K4/8 w - - 0 1").expect("valid FEN");
+
+        assert!(!has_non_pawn_material(&pawn_ending, Color::White));
+        assert!(has_non_pawn_material(&knight_ending, Color::White));
+    }
+
+    #[test]
+    fn adaptive_null_move_uses_a_larger_reduction_only_at_deep_nodes() {
+        assert_eq!(null_move_reduction(6, true), 2);
+        assert_eq!(null_move_reduction(7, true), 3);
+        assert_eq!(null_move_reduction(20, true), 3);
+        assert_eq!(null_move_reduction(20, false), 2);
+    }
+
+    #[test]
+    fn delta_pruning_skips_a_capture_that_cannot_reach_alpha() {
+        let position = Position::from_fen("q3k3/8/8/8/3p4/2P5/8/4K3 w - - 0 1").expect("valid FEN");
+        let capture = position
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| mv.from() == "c3".parse().unwrap() && mv.to() == "d4".parse().unwrap())
+            .expect("c3xd4 should be legal");
+        let mut state = SearchState::default();
+
+        assert!(should_delta_prune(
+            &position, capture, 0, 401, false, &mut state
+        ));
+        assert_eq!(state.delta_pruning.attempts, 1);
+        assert_eq!(state.delta_pruning.pruned, 1);
+    }
+
+    #[test]
+    fn delta_pruning_is_disabled_in_low_material_endings() {
+        let position = Position::from_fen("4k3/8/8/8/3p4/2P5/8/4K3 w - - 0 1").expect("valid FEN");
+        let capture = position
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| mv.from() == "c3".parse().unwrap() && mv.to() == "d4".parse().unwrap())
+            .expect("c3xd4 should be legal");
+        let mut state = SearchState::default();
+
+        assert!(!should_delta_prune(
+            &position, capture, 0, 401, false, &mut state
+        ));
+        assert_eq!(state.delta_pruning, DeltaPruningStats::default());
     }
 
     #[test]
@@ -1654,6 +1977,10 @@ mod tests {
                 use_tt: true,
                 use_quiescence: false,
                 use_enhanced_quiescence: true,
+                use_lmr: true,
+                use_null_move: true,
+                use_adaptive_null_move: true,
+                use_delta_pruning: true,
             },
         );
 
@@ -1673,6 +2000,10 @@ mod tests {
 
         let mut baseline_nodes = 0;
         let mut baseline_path = vec![position.zobrist_hash()];
+        let mut baseline_state = SearchState::new(SearchOptions {
+            use_enhanced_quiescence: false,
+            ..SearchOptions::default()
+        });
         quiescence(
             &mut position,
             -SCORE_INF,
@@ -1683,12 +2014,13 @@ mod tests {
             &mut baseline_nodes,
             &Deadline::none(),
             &mut baseline_path,
-            false,
+            &mut baseline_state,
         )
         .unwrap();
 
         let mut enhanced_nodes = 0;
         let mut enhanced_path = vec![position.zobrist_hash()];
+        let mut enhanced_state = SearchState::default();
         quiescence(
             &mut position,
             -SCORE_INF,
@@ -1699,7 +2031,7 @@ mod tests {
             &mut enhanced_nodes,
             &Deadline::none(),
             &mut enhanced_path,
-            true,
+            &mut enhanced_state,
         )
         .unwrap();
 

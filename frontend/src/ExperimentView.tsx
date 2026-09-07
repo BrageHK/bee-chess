@@ -130,6 +130,39 @@ export function ExperimentView({
               <SearchRow label={snapshot.label_b} stats={snapshot.stats.variant_b_search} />
             </tbody>
           </table>
+          <details className="border-t border-border px-3 py-2 text-left font-sans">
+            <summary className="cursor-pointer text-sm font-medium text-text">Advanced metrics</summary>
+            <div className="mt-3 grid gap-4">
+              <AdvancedMetricTable
+                title="Late move reductions"
+                labels={[snapshot.label_a, snapshot.label_b]}
+                rows={[snapshot.stats.variant_a_search, snapshot.stats.variant_b_search]}
+                columns={[
+                  ["Attempts", (stats) => formatCompact(stats.lmr_attempts)],
+                  ["Fail-low", (stats) => formatCountAndRate(stats.lmr_fail_lows, stats.lmr_attempts)],
+                  ["Verifications", (stats) => formatCountAndRate(stats.lmr_researches, stats.lmr_attempts)],
+                ]}
+              />
+              <AdvancedMetricTable
+                title="Null-move pruning"
+                labels={[snapshot.label_a, snapshot.label_b]}
+                rows={[snapshot.stats.variant_a_search, snapshot.stats.variant_b_search]}
+                columns={[
+                  ["Attempts", (stats) => formatCompact(stats.nmp_attempts)],
+                  ["Cutoffs", (stats) => formatCountAndRate(stats.nmp_cutoffs, stats.nmp_attempts)],
+                ]}
+              />
+              <AdvancedMetricTable
+                title="Quiescence delta pruning"
+                labels={[snapshot.label_a, snapshot.label_b]}
+                rows={[snapshot.stats.variant_a_search, snapshot.stats.variant_b_search]}
+                columns={[
+                  ["Attempts", (stats) => formatCompact(stats.delta_attempts)],
+                  ["Pruned", (stats) => formatCountAndRate(stats.delta_pruned, stats.delta_attempts)],
+                ]}
+              />
+            </div>
+          </details>
         </PanelBody>
       </Panel>
 
@@ -208,6 +241,43 @@ function SearchRow({ label, stats }: { label: string; stats: ExperimentSnapshot[
   );
 }
 
+type SearchStats = ExperimentSnapshot["stats"]["variant_a_search"];
+type AdvancedColumn = [label: string, format: (stats: SearchStats) => string];
+
+function AdvancedMetricTable({
+  title,
+  labels,
+  rows,
+  columns,
+}: {
+  title: string;
+  labels: [string, string];
+  rows: [SearchStats, SearchStats];
+  columns: AdvancedColumn[];
+}) {
+  return (
+    <section>
+      <h3 className="mb-1 text-xs font-medium text-subtle">{title}</h3>
+      <table className="w-full text-right font-mono text-xs">
+        <thead className="text-subtle">
+          <tr>
+            <th className="px-2 py-1 text-left font-normal">Variant</th>
+            {columns.map(([label]) => <th key={label} className="px-2 py-1 font-normal">{label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((stats, index) => (
+            <tr key={labels[index]} className="border-t border-border">
+              <th className="px-2 py-1 text-left font-sans font-medium">{labels[index]}</th>
+              {columns.map(([label, format]) => <td key={label} className="px-2 py-1">{format(stats)}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 /** One row of `TimeManagementStats` -- see that type's docs. `stats`
  * is only ever `null` here for a variant with zero `bee-tm` samples
  * (e.g. a book-only game); the panel itself is hidden entirely (see
@@ -242,6 +312,11 @@ function TimeManagementRow({ label, stats }: { label: string; stats: ExperimentS
 function formatCompact(value: number | null): string {
   if (value === null) return "—";
   return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(value);
+}
+
+function formatCountAndRate(value: number, attempts: number): string {
+  if (attempts === 0) return "—";
+  return `${formatCompact(value)} (${Math.round(value / attempts * 100)}%)`;
 }
 
 /** `null`/`undefined` render as "—" throughout this view -- see

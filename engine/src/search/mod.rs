@@ -48,6 +48,21 @@ pub struct SearchOptions {
     /// ordinary capture-only quiescence approximation, but remains separately
     /// switchable so its strength/cost can be measured in A/B experiments.
     pub use_enhanced_quiescence: bool,
+    /// Whether late, quiet moves receive a conservative one-ply reduction.
+    /// A reduced move that challenges alpha is always re-searched at full
+    /// depth, preserving tactical accuracy while spending less work on moves
+    /// that good ordering has placed near the end of the list.
+    pub use_lmr: bool,
+    /// Whether null-move pruning may prove sufficiently strong positions
+    /// exceed beta without searching every legal move.
+    pub use_null_move: bool,
+    /// Whether null-move pruning increases its reduction from two plies to
+    /// three at depth seven and beyond. Kept separate from `use_null_move` so
+    /// the adaptive policy can be measured against fixed R=2.
+    pub use_adaptive_null_move: bool,
+    /// Whether hopeless captures may be skipped in quiescence when their
+    /// maximum material gain plus a safety margin cannot reach alpha.
+    pub use_delta_pruning: bool,
 }
 
 impl Default for SearchOptions {
@@ -56,6 +71,10 @@ impl Default for SearchOptions {
             use_tt: true,
             use_quiescence: true,
             use_enhanced_quiescence: true,
+            use_lmr: true,
+            use_null_move: true,
+            use_adaptive_null_move: true,
+            use_delta_pruning: true,
         }
     }
 }
@@ -156,6 +175,33 @@ pub struct SearchResult {
     pub nodes: u64,
     pub depth: u32,
     pub pv: Vec<Move>,
+    pub lmr: LmrStats,
+    pub null_move: NullMoveStats,
+    pub delta_pruning: DeltaPruningStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LmrStats {
+    pub attempts: u64,
+    pub researches: u64,
+}
+
+impl LmrStats {
+    pub const fn fail_lows(self) -> u64 {
+        self.attempts.saturating_sub(self.researches)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NullMoveStats {
+    pub attempts: u64,
+    pub cutoffs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeltaPruningStats {
+    pub attempts: u64,
+    pub pruned: u64,
 }
 
 /// A search algorithm. Implementations run to completion (bounded by

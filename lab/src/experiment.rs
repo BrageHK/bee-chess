@@ -28,8 +28,9 @@
 //!
 //! Games are paired by color and opening: game `2k` has variant A playing
 //! White, game `2k+1` has variant A playing Black, and both begin from the
-//! same short opening line. Successive pairs rotate through a small built-in
-//! suite so an experiment does not merely replay two start-position games.
+//! same short opening line. Successive pairs rotate through a shuffled
+//! built-in suite so an experiment does not merely replay start-position
+//! games or use the same opening order on every run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,18 +45,55 @@ use uuid::Uuid;
 const OPENING_SUITE: &[&[&str]] = &[
     &[],
     &["e2e4", "e7e5", "g1f3", "b8c6"],
+    &["e2e4", "e7e5", "f1c4", "g8f6"],
+    &["e2e4", "e7e5", "b1c3", "g8f6"],
     &["d2d4", "d7d5", "c2c4", "e7e6"],
+    &["d2d4", "d7d5", "g1f3", "g8f6"],
+    &["d2d4", "g8f6", "c2c4", "e7e6"],
     &["c2c4", "e7e5", "b1c3", "g8f6"],
+    &["c2c4", "c7c5", "b1c3", "b8c6"],
+    &["c2c4", "e7e6", "g1f3", "d7d5"],
     &["g1f3", "d7d5", "g2g3", "g8f6"],
+    &["g1f3", "g8f6", "g2g3", "g7g6"],
     &["e2e4", "c7c5", "g1f3", "d7d6"],
+    &["e2e4", "c7c5", "g1f3", "b8c6"],
+    &["e2e4", "c7c5", "c2c3", "g8f6"],
+    &["e2e4", "c7c5", "b1c3", "b8c6"],
     &["e2e4", "e7e6", "d2d4", "d7d5"],
     &["d2d4", "g8f6", "c2c4", "g7g6"],
+    &["d2d4", "f7f5", "c2c4", "g8f6"],
     &["e2e4", "c7c6", "d2d4", "d7d5"],
+    &["e2e4", "d7d5", "e4d5", "d8d5"],
+    &["e2e4", "g8f6", "e4e5", "f6d5"],
+    &["d2d4", "g8f6", "c1g5", "d7d5"],
+    &["b2b3", "d7d5", "c1b2", "g8f6"],
+    &["g2g3", "d7d5", "f1g2", "e7e5"],
 ];
 
-fn opening_moves_for_game(game_index: u32) -> &'static [&'static str] {
+/// Selects from a shuffled copy of the suite. Each full pass gets a new
+/// deterministic shuffle derived from the experiment seed, avoiding a fixed
+/// repeated sequence while keeping the run reproducible.
+fn opening_moves_for_game(game_index: u32, seed: u32) -> &'static [&'static str] {
     let pair_index = game_index as usize / 2;
-    OPENING_SUITE[pair_index % OPENING_SUITE.len()]
+    let cycle = pair_index / OPENING_SUITE.len();
+    let slot = pair_index % OPENING_SUITE.len();
+    let mut order: Vec<usize> = (0..OPENING_SUITE.len()).collect();
+    let mut random = seed ^ (cycle as u32).wrapping_mul(0x9E37_79B9);
+    if random == 0 {
+        random = 0xA341_316C;
+    }
+    for i in (1..order.len()).rev() {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        order.swap(i, random as usize % (i + 1));
+    }
+    OPENING_SUITE[order[slot]]
+}
+
+fn opening_seed(id: ExperimentId) -> u32 {
+    let value = id.0.as_u128();
+    (value as u32) ^ ((value >> 32) as u32) ^ ((value >> 64) as u32) ^ ((value >> 96) as u32)
 }
 
 use crate::game::{
@@ -133,6 +171,9 @@ pub struct ExperimentSpec {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExperimentMetadata {
     pub lab_git_commit: String,
+    /// Seed used to shuffle the built-in opening suite. Exposed so an
+    /// experiment's exact opening schedule can be reproduced.
+    pub opening_seed: u32,
     /// The exact `argv` each variant's engine process was spawned
     /// with -- e.g. `["/path/to/bee"]` -- not just its label, since
     /// two variants can (and in the intended usage, do) share the
@@ -156,9 +197,10 @@ pub struct ExperimentMetadata {
 }
 
 impl ExperimentMetadata {
-    fn new(spec: &ExperimentSpec) -> Self {
+    fn new(id: ExperimentId, spec: &ExperimentSpec) -> Self {
         ExperimentMetadata {
             lab_git_commit: LAB_GIT_COMMIT.to_string(),
+            opening_seed: opening_seed(id),
             variant_a_argv: spec.variant_a.config.spec.argv.clone(),
             variant_b_argv: spec.variant_b.config.spec.argv.clone(),
             time_control: spec.time_control,
@@ -213,6 +255,13 @@ struct SearchTotals {
     max_depth: u32,
     eval_cp_sum: i64,
     eval_samples: u64,
+    lmr_attempts: u64,
+    lmr_fail_lows: u64,
+    lmr_researches: u64,
+    nmp_attempts: u64,
+    nmp_cutoffs: u64,
+    delta_attempts: u64,
+    delta_pruned: u64,
     time_management: TimeManagementTotals,
 }
 
@@ -226,6 +275,13 @@ impl SearchTotals {
         self.max_depth = self.max_depth.max(other.max_depth);
         self.eval_cp_sum += other.eval_cp_sum;
         self.eval_samples += other.eval_samples;
+        self.lmr_attempts += other.lmr_attempts;
+        self.lmr_fail_lows += other.lmr_fail_lows;
+        self.lmr_researches += other.lmr_researches;
+        self.nmp_attempts += other.nmp_attempts;
+        self.nmp_cutoffs += other.nmp_cutoffs;
+        self.delta_attempts += other.delta_attempts;
+        self.delta_pruned += other.delta_pruned;
         self.time_management.add(other.time_management);
     }
 }
@@ -374,7 +430,7 @@ static NEXT_EXPERIMENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 impl Experiment {
     fn new(id: ExperimentId, spec: ExperimentSpec) -> Self {
-        let metadata = ExperimentMetadata::new(&spec);
+        let metadata = ExperimentMetadata::new(id, &spec);
         Experiment {
             id,
             spec,
@@ -541,6 +597,16 @@ pub struct ExperimentSearchStats {
     pub max_depth: Option<u32>,
     pub effective_nps: Option<f64>,
     pub avg_eval_cp: Option<f64>,
+    pub lmr_attempts: u64,
+    pub lmr_fail_lows: u64,
+    pub lmr_researches: u64,
+    pub lmr_research_rate: Option<f64>,
+    pub nmp_attempts: u64,
+    pub nmp_cutoffs: u64,
+    pub nmp_cutoff_rate: Option<f64>,
+    pub delta_attempts: u64,
+    pub delta_pruned: u64,
+    pub delta_prune_rate: Option<f64>,
     /// Aggregated `bee-tm` telemetry (see `bee_engine::search::
     /// TimeManagementTelemetry`'s docs) across every search that
     /// produced one -- `None` if none did (a `TimeControl::MoveTime`
@@ -621,6 +687,19 @@ impl From<SearchTotals> for ExperimentSearchStats {
             max_depth: (t.depth_samples > 0).then_some(t.max_depth),
             effective_nps: (t.time_ms > 0).then(|| t.nodes as f64 * 1000.0 / t.time_ms as f64),
             avg_eval_cp: (t.eval_samples > 0).then(|| t.eval_cp_sum as f64 / t.eval_samples as f64),
+            lmr_attempts: t.lmr_attempts,
+            lmr_fail_lows: t.lmr_fail_lows,
+            lmr_researches: t.lmr_researches,
+            lmr_research_rate: (t.lmr_attempts > 0)
+                .then(|| t.lmr_researches as f64 / t.lmr_attempts as f64),
+            nmp_attempts: t.nmp_attempts,
+            nmp_cutoffs: t.nmp_cutoffs,
+            nmp_cutoff_rate: (t.nmp_attempts > 0)
+                .then(|| t.nmp_cutoffs as f64 / t.nmp_attempts as f64),
+            delta_attempts: t.delta_attempts,
+            delta_pruned: t.delta_pruned,
+            delta_prune_rate: (t.delta_attempts > 0)
+                .then(|| t.delta_pruned as f64 / t.delta_attempts as f64),
             time_management: t.time_management.into(),
         }
     }
@@ -947,7 +1026,7 @@ async fn run_experiment_game(
     let snapshot = store.create_for_experiment(white_info, black_info, spec.time_control, id);
     experiments.record_game_started(id, snapshot.id, variant_a_is_white);
 
-    for &mv in opening_moves_for_game(game_index) {
+    for &mv in opening_moves_for_game(game_index, opening_seed(id)) {
         if let Err(err) = store.apply_move(snapshot.id, mv) {
             store.abort(
                 snapshot.id,
@@ -1014,6 +1093,13 @@ fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
             }
         } else if entry.line.starts_with("info ") {
             let tokens: Vec<&str> = entry.line.split_whitespace().collect();
+            // `info string ...` is free-form diagnostic text, not structured
+            // search telemetry. It may legitimately contain words such as
+            // "depth", "nodes", or "time" followed by arbitrary numbers;
+            // interpreting those as UCI fields produces absurd aggregates.
+            if tokens.get(1) == Some(&"string") {
+                continue;
+            }
             let mut i = 1;
             while i + 1 < tokens.len() {
                 let value = tokens[i + 1].parse::<i64>().ok();
@@ -1033,6 +1119,41 @@ fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
                     "time" => {
                         if let Some(v) = value.filter(|v| *v >= 0) {
                             pending[side].time_ms = v as u64;
+                        }
+                    }
+                    "lmr_attempts" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].lmr_attempts = v as u64;
+                        }
+                    }
+                    "lmr_fail_lows" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].lmr_fail_lows = v as u64;
+                        }
+                    }
+                    "lmr_researches" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].lmr_researches = v as u64;
+                        }
+                    }
+                    "nmp_attempts" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].nmp_attempts = v as u64;
+                        }
+                    }
+                    "nmp_cutoffs" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].nmp_cutoffs = v as u64;
+                        }
+                    }
+                    "delta_attempts" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].delta_attempts = v as u64;
+                        }
+                    }
+                    "delta_pruned" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].delta_pruned = v as u64;
                         }
                     }
                     "score" if tokens[i + 1] == "cp" && i + 2 < tokens.len() => {
@@ -1112,14 +1233,32 @@ mod tests {
     }
 
     #[test]
-    fn color_swapped_pairs_use_the_same_opening_and_pairs_rotate() {
-        assert_eq!(opening_moves_for_game(0), opening_moves_for_game(1));
-        assert_eq!(opening_moves_for_game(2), opening_moves_for_game(3));
-        assert_ne!(opening_moves_for_game(0), opening_moves_for_game(2));
+    fn color_swapped_pairs_share_openings_and_each_cycle_is_shuffled() {
+        let seed = 12345;
         assert_eq!(
-            opening_moves_for_game((OPENING_SUITE.len() * 2) as u32),
-            OPENING_SUITE[0]
+            opening_moves_for_game(0, seed),
+            opening_moves_for_game(1, seed)
         );
+        assert_eq!(
+            opening_moves_for_game(2, seed),
+            opening_moves_for_game(3, seed)
+        );
+
+        let first_cycle: Vec<_> = (0..OPENING_SUITE.len())
+            .map(|pair| opening_moves_for_game((pair * 2) as u32, seed))
+            .collect();
+        let unique: std::collections::HashSet<_> = first_cycle.iter().copied().collect();
+        assert_eq!(unique.len(), OPENING_SUITE.len());
+
+        let second_cycle: Vec<_> = (0..OPENING_SUITE.len())
+            .map(|pair| opening_moves_for_game(((pair + OPENING_SUITE.len()) * 2) as u32, seed))
+            .collect();
+        assert_ne!(first_cycle, second_cycle);
+
+        let other_seed: Vec<_> = (0..OPENING_SUITE.len())
+            .map(|pair| opening_moves_for_game((pair * 2) as u32, seed + 1))
+            .collect();
+        assert_ne!(first_cycle, other_seed);
     }
 
     #[test]
@@ -1141,7 +1280,7 @@ mod tests {
             received(UciLogColor::White, "bestmove e2e4"),
             received(
                 UciLogColor::White,
-                "info depth 8 nodes 500 time 20 score cp -10",
+                "info depth 8 nodes 500 time 20 score cp -10 lmr_attempts 50 lmr_fail_lows 42 lmr_researches 8 nmp_attempts 25 nmp_cutoffs 15 delta_attempts 20 delta_pruned 12",
             ),
             received(UciLogColor::White, "bestmove g1f3"),
         ];
@@ -1153,6 +1292,21 @@ mod tests {
         assert_eq!(white.depth_sum, 14);
         assert_eq!(white.max_depth, 8);
         assert_eq!(white.eval_cp_sum, 20);
+        assert_eq!(white.lmr_attempts, 50);
+        assert_eq!(white.lmr_fail_lows, 42);
+        assert_eq!(white.lmr_researches, 8);
+        assert_eq!(white.nmp_attempts, 25);
+        assert_eq!(white.nmp_cutoffs, 15);
+        assert_eq!(
+            ExperimentSearchStats::from(white).nmp_cutoff_rate,
+            Some(0.6)
+        );
+        assert_eq!(white.delta_attempts, 20);
+        assert_eq!(white.delta_pruned, 12);
+        assert_eq!(
+            ExperimentSearchStats::from(white).delta_prune_rate,
+            Some(0.6)
+        );
         assert_eq!(black.searches, 0);
     }
 
@@ -1300,6 +1454,25 @@ mod tests {
     }
 
     #[test]
+    fn search_summary_ignores_free_form_info_string_diagnostics() {
+        let received = |line: &str| UciLogEntry {
+            color: UciLogColor::White,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received("info string debug depth 19000 nodes 999999999 time 8000"),
+            received("info depth 9 nodes 1200 time 20 score cp 15"),
+            received("bestmove e2e4"),
+        ];
+
+        let (white, _) = summarize_searches(&log);
+        assert_eq!(white.max_depth, 9);
+        assert_eq!(white.nodes, 1200);
+        assert_eq!(white.time_ms, 20);
+    }
+
+    #[test]
     fn every_built_in_opening_is_legal_and_non_terminal() {
         for opening in OPENING_SUITE {
             let mut game = Game::new(
@@ -1407,6 +1580,7 @@ mod tests {
         let after = Utc::now();
 
         assert_eq!(snapshot.metadata.lab_git_commit, LAB_GIT_COMMIT);
+        assert_eq!(snapshot.metadata.opening_seed, opening_seed(snapshot.id));
         assert_eq!(snapshot.metadata.variant_a_argv, fake_bee_spec().argv);
         assert_eq!(snapshot.metadata.variant_b_argv, fake_bee_spec().argv);
         assert!(snapshot.metadata.started_at >= before && snapshot.metadata.started_at <= after);
