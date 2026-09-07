@@ -91,6 +91,135 @@ impl Default for TimeManagerConfig {
     }
 }
 
+/// Which allocation policy iterative deepening uses to decide whether
+/// to start another depth, once the soft deadline hasn't been reached
+/// yet -- see `search::search_iterative_with_budget`'s docs for where
+/// this actually plugs in. Exposed as the `TimePolicy` UCI combo
+/// option (see `crate::uci`), so Bee Lab's experiment runner can A/B
+/// one policy against another the same way it already does for
+/// `Evaluator`/`UseTT`/etc.
+///
+/// `Baseline` exists, and stays the default, specifically so this
+/// option is purely additive: a fresh `Engine` (or an older Lab
+/// experiment config that never sets `TimePolicy` at all) behaves
+/// exactly as it did before this type existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimePolicy {
+    /// Today's behavior, unchanged: start the next depth whenever the
+    /// soft deadline hasn't passed, with no attempt to predict whether
+    /// it can actually finish before the hard one. Real telemetry
+    /// (`bee-tm`, see `TimeManagementTelemetry`) from a 20-game 10+0.1
+    /// Fischer experiment showed this costs real, measurable waste:
+    /// ~17% of searches hit the hard deadline mid-iteration and
+    /// discarded the result, for ~60ms average (up to 880ms peak) of
+    /// pure wasted computation per occurrence -- see `Predictive`.
+    #[default]
+    Baseline,
+    /// Adds one check before starting a new depth: estimate that
+    /// depth's likely cost from how the last two completed depths grew
+    /// (see `estimate_next_depth_cost`), and skip starting it at all if
+    /// the estimate suggests it plausibly can't finish before the hard
+    /// deadline -- see `search_iterative_with_budget`'s docs for
+    /// exactly where and how. Does not touch the hard deadline itself,
+    /// which remains the correctness backstop regardless of policy: an
+    /// iteration that *is* started can still be aborted mid-flight if
+    /// the estimate turns out to have been wrong.
+    Predictive,
+}
+
+impl TimePolicy {
+    pub const fn uci_name(self) -> &'static str {
+        match self {
+            Self::Baseline => "Baseline",
+            Self::Predictive => "Predictive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "baseline" => Some(Self::Baseline),
+            "predictive" => Some(Self::Predictive),
+            _ => None,
+        }
+    }
+}
+
+/// How much headroom `estimate_next_depth_cost`-based prediction
+/// requires beyond the estimated cost itself before allowing a new
+/// depth to start -- i.e. a depth is only started if `estimated_cost *
+/// PREDICTION_SAFETY_MARGIN` still fits in the remaining hard budget.
+/// Deliberately conservative (reserving a further ~15% beyond the
+/// estimate itself) since the estimate is a rough one (see
+/// `estimate_next_depth_cost`'s docs on its own clamping) and the
+/// actual cost of getting this wrong -- crossing the hard deadline
+/// anyway -- already has its own backstop (the hard deadline check
+/// mid-iteration), but avoiding that backstop actually having to fire
+/// is the entire point of predicting in the first place.
+const PREDICTION_SAFETY_MARGIN: f64 = 1.15;
+
+/// How much more expensive the *next* depth is assumed to be, relative
+/// to the last completed one, when there's no real growth-factor
+/// history yet (only one depth has completed so far -- see
+/// `estimate_next_depth_cost`'s docs). A conservative middle estimate:
+/// low enough not to refuse a second depth almost every move, high
+/// enough to reflect that iterative deepening's cost realistically
+/// does grow, not shrink or stay flat, per ply.
+const DEFAULT_GROWTH: f64 = 2.0;
+
+/// Clamp bounds for the growth factor `estimate_next_depth_cost`
+/// computes from two real completed depths' timings -- a single
+/// unusually quiet or unusually tactical transition between two
+/// specific depths shouldn't be allowed to dominate the estimate
+/// either direction: `MIN_GROWTH` keeps a rare depth-over-depth
+/// *shrink* (possible with move-ordering/TT effects) from making the
+/// next depth look free, and `MAX_GROWTH` keeps a rare explosive
+/// transition from making every subsequent depth this move look
+/// permanently unaffordable.
+const MIN_GROWTH: f64 = 1.5;
+const MAX_GROWTH: f64 = 4.0;
+
+/// Estimates how long the *next* depth will take, in milliseconds,
+/// from `last_depth_ms` (the most recently completed depth's own
+/// wall-clock time) and `previous_depth_ms` (the depth before that,
+/// `None` if only one depth has completed so far this search). Pure
+/// arithmetic -- no clock reads -- so, like `allocate_time`, this is
+/// directly unit-testable without timing-sensitive tests.
+///
+/// The growth factor between the last two completed depths (clamped to
+/// `[MIN_GROWTH, MAX_GROWTH]`) is projected forward one more ply;
+/// `DEFAULT_GROWTH` stands in for that ratio when there's no second
+/// data point yet. This is deliberately the simplest model that uses
+/// real information already on hand (see the module docs on why a
+/// boring, measurable first version beats a more elaborate unmeasured
+/// one) -- not a branching-factor model of chess search specifically,
+/// just "depths have been getting more expensive at roughly this rate,
+/// assume that continues."
+#[must_use]
+pub fn estimate_next_depth_cost(last_depth_ms: u64, previous_depth_ms: Option<u64>) -> u64 {
+    let growth = match previous_depth_ms {
+        Some(previous) if previous > 0 => {
+            (last_depth_ms as f64 / previous as f64).clamp(MIN_GROWTH, MAX_GROWTH)
+        }
+        _ => DEFAULT_GROWTH,
+    };
+    (last_depth_ms as f64 * growth).round() as u64
+}
+
+/// Whether a depth estimated to cost `estimated_next_depth_ms` should
+/// be started at all, given `elapsed_ms` already spent this search and
+/// `hard_ms` the absolute ceiling -- see `PREDICTION_SAFETY_MARGIN`'s
+/// docs for why the estimate is padded before comparing. Pure
+/// arithmetic, like `estimate_next_depth_cost` itself.
+#[must_use]
+pub fn next_depth_is_affordable(
+    elapsed_ms: u64,
+    estimated_next_depth_ms: u64,
+    hard_ms: u64,
+) -> bool {
+    let padded_estimate = estimated_next_depth_ms as f64 * PREDICTION_SAFETY_MARGIN;
+    elapsed_ms as f64 + padded_estimate <= hard_ms as f64
+}
+
 /// Default `move_overhead`, in milliseconds -- shared with the `uci`
 /// module's advertised `MoveOverhead` UCI option default, so the two
 /// can never drift apart.
@@ -183,6 +312,12 @@ pub struct TimeManagementTelemetry {
     /// suggests the evaluation has settled; a large swing on the final
     /// depth suggests it might not have.
     pub score_delta_cp: Option<i32>,
+    /// Which [`TimePolicy`] this search actually ran under -- included
+    /// so a consumer aggregating `bee-tm` lines across an A/B
+    /// experiment (e.g. `TimePolicy::Baseline` vs `Predictive`) can
+    /// tell which record belongs to which policy without needing to
+    /// separately track "which variant used which `setoption`" itself.
+    pub policy: TimePolicy,
 }
 
 impl TimeManagementTelemetry {
@@ -194,8 +329,13 @@ impl TimeManagementTelemetry {
     #[must_use]
     pub fn to_bee_tm_line(self) -> String {
         let mut line = format!(
-            "v={BEE_TM_VERSION} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
-            self.soft_ms, self.hard_ms, self.completed_depth, self.aborted_ms, self.best_move_changes,
+            "v={BEE_TM_VERSION} policy={} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
+            self.policy.uci_name(),
+            self.soft_ms,
+            self.hard_ms,
+            self.completed_depth,
+            self.aborted_ms,
+            self.best_move_changes,
         );
         if let Some(delta) = self.score_delta_cp {
             line.push_str(&format!(" score_delta_cp={delta}"));
@@ -266,12 +406,22 @@ mod tests {
             aborted_ms: 201,
             best_move_changes: 3,
             score_delta_cp: Some(-42),
+            policy: TimePolicy::Baseline,
         };
 
         assert_eq!(
             telemetry.to_bee_tm_line(),
-            "v=1 soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
+            "v=1 policy=Baseline soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
         );
+    }
+
+    #[test]
+    fn bee_tm_line_includes_the_predictive_policy_name() {
+        let telemetry = TimeManagementTelemetry {
+            policy: TimePolicy::Predictive,
+            ..TimeManagementTelemetry::default()
+        };
+        assert!(telemetry.to_bee_tm_line().contains("policy=Predictive"));
     }
 
     #[test]
@@ -283,6 +433,7 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 0,
             score_delta_cp: None,
+            policy: TimePolicy::Baseline,
         };
 
         let line = telemetry.to_bee_tm_line();
@@ -306,6 +457,7 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 1,
             score_delta_cp: Some(12),
+            policy: TimePolicy::Baseline,
         };
 
         for token in telemetry.to_bee_tm_line().split(' ') {
@@ -403,5 +555,85 @@ mod tests {
         let zero = allocate_time(control(60_000, 0, Some(0)), &config);
 
         assert_eq!(unknown, zero);
+    }
+
+    #[test]
+    fn time_policy_parse_round_trips_through_uci_name() {
+        assert_eq!(TimePolicy::parse("baseline"), Some(TimePolicy::Baseline));
+        assert_eq!(TimePolicy::parse("Baseline"), Some(TimePolicy::Baseline));
+        assert_eq!(
+            TimePolicy::parse("predictive"),
+            Some(TimePolicy::Predictive)
+        );
+        assert_eq!(
+            TimePolicy::parse("PREDICTIVE"),
+            Some(TimePolicy::Predictive)
+        );
+        assert_eq!(TimePolicy::parse("nonsense"), None);
+        assert_eq!(TimePolicy::Baseline.uci_name(), "Baseline");
+        assert_eq!(TimePolicy::Predictive.uci_name(), "Predictive");
+    }
+
+    #[test]
+    fn time_policy_defaults_to_baseline() {
+        assert_eq!(TimePolicy::default(), TimePolicy::Baseline);
+    }
+
+    #[test]
+    fn estimate_next_depth_cost_uses_default_growth_with_only_one_data_point() {
+        // No `previous_depth_ms` yet (only depth 1 has completed) --
+        // falls back to `DEFAULT_GROWTH` (2.0).
+        assert_eq!(estimate_next_depth_cost(100, None), 200);
+    }
+
+    #[test]
+    fn estimate_next_depth_cost_projects_the_observed_growth_ratio() {
+        // Depth grew from 50ms to 100ms (2x) -- project the same 2x
+        // ratio forward.
+        assert_eq!(estimate_next_depth_cost(100, Some(50)), 200);
+    }
+
+    #[test]
+    fn estimate_next_depth_cost_clamps_an_extreme_growth_ratio() {
+        // A 20x jump between two real depths must not be projected
+        // forward as-is -- clamped to MAX_GROWTH (4.0).
+        assert_eq!(estimate_next_depth_cost(2000, Some(100)), 8000);
+    }
+
+    #[test]
+    fn estimate_next_depth_cost_clamps_a_shrinking_ratio_to_the_minimum() {
+        // Depth 5 taking *less* time than depth 4 (plausible with
+        // move-ordering/TT effects) must not make the next depth look
+        // free -- clamped to MIN_GROWTH (1.5), not treated as < 1.
+        assert_eq!(estimate_next_depth_cost(50, Some(100)), 75);
+    }
+
+    #[test]
+    fn estimate_next_depth_cost_treats_a_zero_previous_depth_as_no_history() {
+        // A previous depth reported as 0ms (plausible for a trivial
+        // position/depth) can't produce a meaningful ratio -- falls
+        // back to DEFAULT_GROWTH rather than dividing by zero.
+        assert_eq!(estimate_next_depth_cost(100, Some(0)), 200);
+    }
+
+    #[test]
+    fn next_depth_is_affordable_when_the_padded_estimate_fits() {
+        // 50ms elapsed, estimate 100ms, padded to 115ms (1.15x) --
+        // fits comfortably in a 300ms hard budget.
+        assert!(next_depth_is_affordable(50, 100, 300));
+    }
+
+    #[test]
+    fn next_depth_is_affordable_is_false_when_the_padded_estimate_does_not_fit() {
+        // 200ms elapsed, estimate 100ms (padded to 115ms) -- 200 + 115
+        // = 315ms, past a 300ms hard budget.
+        assert!(!next_depth_is_affordable(200, 100, 300));
+    }
+
+    #[test]
+    fn next_depth_is_affordable_accounts_for_the_safety_margin_at_the_boundary() {
+        // Without the 1.15x safety margin, 200 + 100 = 300 would
+        // exactly fit -- the margin must make this reject it.
+        assert!(!next_depth_is_affordable(200, 100, 300));
     }
 }
