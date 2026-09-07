@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bee_chess_core::{Color, PieceKind, Position, Square};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -67,14 +68,14 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// still renders only its most recent 500 lines per color.
 const UCI_LOG_CAPACITY: usize = 20_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UciLogColor {
     White,
     Black,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UciLogDirection {
     Sent,
@@ -83,7 +84,7 @@ pub enum UciLogDirection {
 
 /// A retained raw UCI line. Live clients receive the equivalent
 /// `GameEvent::Uci`; snapshots carry this history for late subscribers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UciLogEntry {
     pub color: UciLogColor,
     pub direction: UciLogDirection,
@@ -119,7 +120,7 @@ pub enum GameEvent {
 }
 
 /// Opaque game identifier, serialized as a plain string over the API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GameId(Uuid);
 
@@ -156,7 +157,7 @@ impl std::str::FromStr for GameId {
 /// describe: an engine crashing, replying with something illegal, or
 /// some other condition that stopped the game short of a real chess
 /// result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GameStatus {
     Running,
@@ -173,7 +174,7 @@ pub enum GameStatus {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameResult {
     WhiteWins,
@@ -188,7 +189,7 @@ pub enum GameResult {
 /// One canonical reason field rather than a one-off `Timeout` bool
 /// bolted on next to it, so a future reason (resignation, adjudication)
 /// has an obvious place to go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Checkmate,
@@ -311,7 +312,7 @@ impl GameClock {
 /// `sessionStorage`): "who is playing this side" is part of what the
 /// game *is*, exactly like its position or move list, not incidental
 /// client-side routing state.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParticipantInfo {
     Human,
@@ -351,6 +352,11 @@ pub struct Game {
     /// random `Uuid::new_v4`, so it carries no creation-order
     /// information of its own to sort by instead.
     created_seq: u64,
+    /// Wall-clock creation time. Unlike `created_seq` (process-lifetime
+    /// only), this survives a restart, so `GameStore::list` sorts by
+    /// this once persisted games (see `persistence`) can be mixed in
+    /// alongside freshly created ones with their own low `created_seq`.
+    created_at: DateTime<Utc>,
     /// This game's time control, and (for `Fischer`) its live clocks.
     /// `None` `clock` means either `TimeControl::MoveTime` (nothing to
     /// track) or a game with no time control recorded at all (e.g. a
@@ -370,6 +376,17 @@ static NEXT_GAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 fn next_game_seq() -> u64 {
     NEXT_GAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Parses a persisted game's FEN, falling back to the start position
+/// if it's somehow malformed (a hand-edited or corrupted data file --
+/// see `Game::from_snapshot`) rather than refusing to load the rest of
+/// that game's history over it. The position itself no longer matters
+/// for a restored (always-terminal) game beyond satisfying
+/// `GameSnapshot::from(&Game)`'s `fen()` call, so a wrong fallback FEN
+/// is a cosmetic, not correctness, concern.
+fn fen_position_or_startpos(fen: &str) -> Position {
+    Position::from_fen(fen).unwrap_or_else(|_| Position::startpos())
 }
 
 /// Why `Game::apply_move` refused a move -- carries enough detail for
@@ -412,6 +429,7 @@ impl Game {
             black_participant: black,
             experiment_id: None,
             created_seq: next_game_seq(),
+            created_at: Utc::now(),
             time_control,
             clock,
         }
@@ -437,11 +455,53 @@ impl Game {
             black_participant: ParticipantInfo::Human,
             experiment_id: None,
             created_seq: next_game_seq(),
+            created_at: Utc::now(),
             time_control: TimeControl::fixed_move_time(200),
             clock: None,
         };
         game.update_status_after_move();
         game
+    }
+
+    /// Reconstructs a `Game` from a previously-persisted, always-
+    /// terminal `GameSnapshot` (see `GameStore::with_data_dir`/#123).
+    /// Never called for a `Running` snapshot in practice -- only a
+    /// terminal snapshot is ever persisted (`GameStore::maybe_persist`)
+    /// -- and the result is never mutated again either:
+    /// `apply_move`/`abort`/`record_move_time` all refuse to touch a
+    /// non-`Running` game, so approximating `position_history` as just
+    /// the final position (rather than replaying every move to
+    /// reconstruct the exact repetition history) is safe -- nothing
+    /// will ever consult it again.
+    fn from_snapshot(snapshot: GameSnapshot) -> Self {
+        let position = fen_position_or_startpos(&snapshot.fen);
+        let position_history = vec![position.zobrist_hash()];
+        let clock = match (snapshot.white_clock_ms, snapshot.black_clock_ms) {
+            (Some(white_ms), Some(black_ms)) => Some(GameClock {
+                white_remaining: Duration::from_millis(white_ms),
+                black_remaining: Duration::from_millis(black_ms),
+                // The increment no longer matters: `record_move` (the
+                // only thing that reads it) is never called again on a
+                // terminal game.
+                increment: Duration::ZERO,
+            }),
+            _ => None,
+        };
+        Game {
+            id: snapshot.id,
+            position,
+            position_history,
+            moves: snapshot.moves,
+            status: snapshot.status,
+            uci_log: snapshot.uci_log,
+            white_participant: snapshot.white,
+            black_participant: snapshot.black,
+            experiment_id: snapshot.experiment_id,
+            created_seq: next_game_seq(),
+            created_at: snapshot.created_at,
+            time_control: snapshot.time_control,
+            clock,
+        }
     }
 
     pub fn status(&self) -> &GameStatus {
@@ -653,7 +713,7 @@ fn parse_uci_move(s: &str) -> Option<(Square, Square, Option<PieceKind>)> {
 /// this to reconstruct its own UI (is this side a human who can drag
 /// pieces? which engine's eval bar is this?) without the frontend
 /// having separately remembered `Participant` configuration on its own.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GameSnapshot {
     pub id: GameId,
     pub fen: String,
@@ -663,6 +723,9 @@ pub struct GameSnapshot {
     pub uci_log: Vec<UciLogEntry>,
     pub white: ParticipantInfo,
     pub black: ParticipantInfo,
+    /// Wall-clock creation time -- see `Game::created_at`. Used to sort
+    /// `GameStore::list`'s merged live+persisted view newest-first.
+    pub created_at: DateTime<Utc>,
     /// The experiment that created this game, if any -- lets a client
     /// viewing this game (however it got there: an experiment's own
     /// game list, the dashboard, or a bookmarked/shared link) link
@@ -698,6 +761,7 @@ impl From<&Game> for GameSnapshot {
             uci_log: game.uci_log.clone(),
             white: game.white_participant().clone(),
             black: game.black_participant().clone(),
+            created_at: game.created_at,
             experiment_id: game.experiment_id(),
             time_control: game.time_control(),
             white_clock_ms: clock.map(|c| c.remaining(Color::White).as_millis() as u64),
@@ -722,11 +786,76 @@ impl From<&Game> for GameSnapshot {
 pub struct GameStore {
     games: Arc<Mutex<HashMap<GameId, Game>>>,
     events: Arc<Mutex<HashMap<GameId, broadcast::Sender<GameEvent>>>>,
+    /// Where finished/aborted games are persisted (see `persistence`
+    /// and #123) -- `None` means "don't persist," which every existing
+    /// test (and `GameStore::new`, for backward compatibility) gets by
+    /// default, matching the pre-#123 in-memory-only behavior exactly.
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GameStore {
+    /// A purely in-memory store -- no persistence, matching this
+    /// crate's pre-#123 behavior exactly. `main.rs` no longer calls
+    /// this directly (it needs `with_data_dir`'s persistence), but
+    /// every test still does, deliberately: exercising `GameStore`'s
+    /// core game-state logic shouldn't have to touch disk. That split
+    /// (used everywhere in tests, unused in the real binary) is enough
+    /// for clippy's dead-code lint to flag it as unreachable from
+    /// `main` alone; kept `pub` and unsuppressed everywhere except
+    /// that one binary-only view.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Same as `new`, but persists every game to `data_dir` once it
+    /// reaches a terminal status (`Finished`/`Aborted`), and loads
+    /// back whatever was already there -- see `persistence`'s module
+    /// docs and #123. `main.rs` is the only real caller; tests use
+    /// `new` to stay purely in-memory (and avoid touching disk at
+    /// all).
+    pub fn with_data_dir(data_dir: impl Into<std::path::PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        let store = GameStore {
+            data_dir: Some(data_dir.clone()),
+            ..Self::default()
+        };
+        for snapshot in crate::persistence::load_all(&data_dir) {
+            let id = snapshot.id;
+            store
+                .games
+                .lock()
+                .expect("game store mutex poisoned")
+                .insert(id, Game::from_snapshot(snapshot));
+            // A restored game gets its own (initially subscriber-less)
+            // event channel too, so `subscribe`/`publish` behave the
+            // same as for any other known game -- nothing will ever
+            // arrive on it (its engines are long gone), but a late
+            // subscribe to a persisted game should return `Some` and
+            // just never yield anything, not `None` as if the game
+            // never existed.
+            let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+            store
+                .events
+                .lock()
+                .expect("event channel map mutex poisoned")
+                .insert(id, sender);
+        }
+        store
+    }
+
+    /// Persists `snapshot` if it has reached a terminal status and
+    /// this store was constructed with a data directory -- a no-op
+    /// (including for every existing test, which uses `new`) unless
+    /// both are true. See `persistence::save`'s docs on why this is
+    /// safe to call unconditionally after every mutation rather than
+    /// only right at the moment of the status transition.
+    fn maybe_persist(&self, snapshot: &GameSnapshot) {
+        if let Some(data_dir) = &self.data_dir {
+            if snapshot.status != GameStatus::Running {
+                crate::persistence::save(data_dir, snapshot);
+            }
+        }
     }
 
     /// Creates a new game with `white`/`black` as its participants
@@ -774,17 +903,41 @@ impl GameStore {
 
     /// Every game the server currently knows about, newest first --
     /// the shape `GET /api/games` returns for the dashboard's running/
-    /// past game lists. Like `snapshot`, this is a point-in-time view
-    /// with no persistence backing it (see #67's slice 5): a process
-    /// restart means an empty list, not stale history.
+    /// past game lists. A **running** game is still purely a
+    /// point-in-time, in-memory view (see #67's slice 5): a process
+    /// restart loses it entirely, same as before. A **finished/
+    /// aborted** game, if this store has a data directory (see
+    /// `with_data_dir`), survives a restart via `persistence` (#123) --
+    /// it's loaded back into this same map at construction time, so
+    /// there's nothing further this method needs to do to include it.
     ///
-    /// Ordered by each game's `created_seq` (see `Game`'s docs), not
+    /// Ordered by each game's `created_at` (see `Game`'s docs), not
     /// `GameId` -- a `GameId` is a random `Uuid::new_v4`, which carries
-    /// no creation-order information to sort by.
+    /// no creation-order information to sort by. `created_at` (rather
+    /// than the process-lifetime-only `created_seq`) is what keeps
+    /// this ordering correct once a persisted game (an old, real
+    /// timestamp) and a freshly created one (`Utc::now()`) can both be
+    /// in this same map after a restart.
     pub fn list(&self) -> Vec<GameSnapshot> {
         let games = self.games.lock().expect("game store mutex poisoned");
         let mut ordered: Vec<&Game> = games.values().collect();
-        ordered.sort_by_key(|game| std::cmp::Reverse(game.created_seq));
+        // `created_at` alone is not a safe sole sort key: two games
+        // created back-to-back (see `list_returns_every_game_newest_
+        // first`) can land on the same wall-clock tick on a fast
+        // machine or a coarse clock, at which point `created_at` alone
+        // could not tell them apart and their relative order would
+        // fall back to `HashMap` iteration order (arbitrary). Break
+        // ties with `created_seq`, which is exactly monotonic within
+        // one process -- correct for every game created since this
+        // process started, and irrelevant among restored games since
+        // #123 never needs to interleave two *persisted* games'
+        // relative order this precisely.
+        ordered.sort_by_key(|game| {
+            (
+                std::cmp::Reverse(game.created_at),
+                std::cmp::Reverse(game.created_seq),
+            )
+        });
         ordered
             .iter()
             .map(|game| GameSnapshot::from(*game))
@@ -792,8 +945,11 @@ impl GameStore {
     }
 
     /// Returns `id`'s current snapshot, or `None` if no such game
-    /// exists (never created, or this process restarted since -- there
-    /// is no persistence yet, see #67's slice 5).
+    /// exists. For a running game, `None` still means what it always
+    /// did (never created, or this process restarted since -- see
+    /// #67's slice 5); a finished/aborted game persisted via
+    /// `with_data_dir` is loaded back at construction time, so it
+    /// keeps resolving here across a restart too (#123).
     pub fn snapshot(&self, id: GameId) -> Option<GameSnapshot> {
         self.games
             .lock()
@@ -830,6 +986,7 @@ impl GameStore {
             game.apply_move(uci).map_err(Some)?;
             GameSnapshot::from(&*game)
         };
+        self.maybe_persist(&snapshot);
         self.publish(id, GameEvent::Updated(Box::new(snapshot.clone())));
         Ok(snapshot)
     }
@@ -856,6 +1013,7 @@ impl GameStore {
             let _ = game.record_move_time(color, elapsed);
             GameSnapshot::from(&*game)
         };
+        self.maybe_persist(&snapshot);
         self.publish(id, GameEvent::Updated(Box::new(snapshot)));
     }
 
@@ -875,6 +1033,7 @@ impl GameStore {
             game.abort(reason);
             GameSnapshot::from(&*game)
         };
+        self.maybe_persist(&snapshot);
         self.publish(id, GameEvent::Updated(Box::new(snapshot)));
     }
 
@@ -1697,6 +1856,122 @@ mod tests {
     fn list_is_empty_for_a_fresh_store() {
         let store = GameStore::new();
         assert!(store.list().is_empty());
+    }
+
+    /// #123: a finished game's `uci_log` must survive a Lab restart,
+    /// not just live on while the process keeps running (which was
+    /// already true before this fix -- see `uci_lines_are_retained_in_
+    /// the_game_snapshot`). Simulates a restart by dropping the first
+    /// `GameStore` and constructing a fresh one from the same data
+    /// directory, exactly like `main.rs` does across a real process
+    /// restart.
+    #[test]
+    fn a_finished_games_uci_log_survives_a_simulated_restart() {
+        let dir = test_data_dir();
+
+        let finished_id = {
+            let store = GameStore::with_data_dir(dir.path());
+            let created = store.create(
+                ParticipantInfo::Human,
+                ParticipantInfo::Human,
+                TimeControl::fixed_move_time(200),
+            );
+            store.record_uci_line(
+                created.id,
+                Color::White,
+                UciDirection::Sent,
+                "go movetime 200",
+            );
+            store.record_uci_line(
+                created.id,
+                Color::White,
+                UciDirection::Received,
+                "bestmove e2e4",
+            );
+            store.apply_move(created.id, "e2e4").unwrap();
+            store.abort(created.id, "test: simulating a finished game");
+            created.id
+            // `store` dropped here -- nothing left in memory, exactly
+            // like a real process exiting.
+        };
+
+        let restarted = GameStore::with_data_dir(dir.path());
+        let snapshot = restarted
+            .snapshot(finished_id)
+            .expect("a finished game must still resolve after a restart");
+
+        assert_eq!(snapshot.moves, vec!["e2e4".to_string()]);
+        assert_eq!(snapshot.uci_log.len(), 2);
+        assert_eq!(snapshot.uci_log[0].line, "go movetime 200");
+        assert_eq!(snapshot.uci_log[1].line, "bestmove e2e4");
+        assert!(matches!(snapshot.status, GameStatus::Aborted { .. }));
+    }
+
+    #[test]
+    fn a_running_game_does_not_survive_a_simulated_restart() {
+        // The narrow #123 fix: only a *finished/aborted* game is
+        // persisted. A still-running game has no engine process left
+        // to resume after a real restart anyway, so pretending it
+        // still exists would be worse than the honest 404 it already
+        // gets today.
+        let dir = test_data_dir();
+
+        let running_id = {
+            let store = GameStore::with_data_dir(dir.path());
+            let created = store.create(
+                ParticipantInfo::Human,
+                ParticipantInfo::Human,
+                TimeControl::fixed_move_time(200),
+            );
+            created.id
+        };
+
+        let restarted = GameStore::with_data_dir(dir.path());
+        assert!(restarted.snapshot(running_id).is_none());
+    }
+
+    #[test]
+    fn a_store_with_no_data_dir_never_persists_anything() {
+        // GameStore::new() (used by every other test, and matching
+        // pre-#123 behavior exactly) must not write to disk at all.
+        let dir = test_data_dir();
+        let games_subdir = dir.path().join("games");
+
+        let store = GameStore::new();
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
+        store.abort(created.id, "test: no data_dir configured");
+
+        assert!(
+            !games_subdir.exists(),
+            "GameStore::new() must never touch disk, even for a finished game"
+        );
+    }
+
+    /// A unique-per-call temp directory, cleaned up on drop -- see
+    /// `persistence`'s own tests for why this avoids a `tempfile` dev-
+    /// dependency.
+    fn test_data_dir() -> TestDataDir {
+        let path = std::env::temp_dir().join(format!("bee-lab-game-store-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TestDataDir(path)
+    }
+
+    struct TestDataDir(std::path::PathBuf);
+
+    impl TestDataDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]

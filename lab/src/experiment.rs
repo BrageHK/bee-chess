@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Short, deliberately unsurprising opening lines in UCI notation. Every
@@ -111,7 +111,7 @@ pub const LAB_GIT_COMMIT: &str = env!("BEE_LAB_GIT_COMMIT");
 
 /// Opaque experiment identifier, serialized as a plain string over the
 /// API -- same shape as `GameId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ExperimentId(Uuid);
 
