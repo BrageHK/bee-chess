@@ -9,13 +9,16 @@
 //! full asynchronous state machine (`stop`, `ponderhit`, and concurrent
 //! input handling while searching) land in a follow-up milestone.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
-use crate::chess::{Color, Move, PieceKind, Position, Square};
+use crate::chess::{Color, FenError, Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
-use crate::engine::{Engine, EvaluatorKind, OpeningBookKind};
-use crate::search::{mate_in_plies, DEFAULT_MOVE_OVERHEAD_MS};
+use crate::engine::{Engine, EvaluatorKind, IllegalMoveError, OpeningBookKind};
+use crate::search::{
+    mate_in_plies, ClockTimeControl, SearchResult, StopSignal, DEFAULT_MOVE_OVERHEAD_MS,
+};
 
 pub const ENGINE_NAME: &str = "bee-chess";
 pub const ENGINE_AUTHOR: &str = "bragehk, johsol and sebasabe";
@@ -133,8 +136,8 @@ impl PositionCommand {
 /// Why a `position` command could not be fully applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PositionCommandError {
-    InvalidFen(crate::chess::FenError),
-    IllegalMove(crate::engine::IllegalMoveError),
+    InvalidFen(FenError),
+    IllegalMove(IllegalMoveError),
 }
 
 /// Parses the `[moves e2e4 e7e5 ...]` suffix of a `position` command
@@ -201,12 +204,12 @@ impl GoCommand {
     /// `side` at all (e.g. `go depth 8`, `go movetime 500`, `go
     /// infinite`) -- `Engine::search_with_clock` should only be used
     /// when this returns `Some`.
-    pub fn clock_for(&self, side: Color) -> Option<crate::search::ClockTimeControl> {
+    pub fn clock_for(&self, side: Color) -> Option<ClockTimeControl> {
         let (time_left_ms, increment_ms) = match side {
             Color::White => (self.white_time_ms?, self.white_increment_ms.unwrap_or(0)),
             Color::Black => (self.black_time_ms?, self.black_increment_ms.unwrap_or(0)),
         };
-        Some(crate::search::ClockTimeControl {
+        Some(ClockTimeControl {
             time_left: Duration::from_millis(time_left_ms),
             increment: Duration::from_millis(increment_ms),
             moves_to_go: self.moves_to_go,
@@ -332,7 +335,7 @@ fn format_uci_move(mv: Move) -> String {
 /// structured search telemetry those fields exist for.
 fn write_search_info<W: Write>(
     output: &mut W,
-    result: &crate::search::SearchResult,
+    result: &SearchResult,
     elapsed: Duration,
 ) -> std::io::Result<()> {
     let score_field = match mate_in_plies(result.score) {
@@ -384,7 +387,7 @@ enum SearchEvent {
     Telemetry(String),
     /// The search has produced its final answer -- exactly one of
     /// these is sent per `go`, always as the worker's last message.
-    Done(crate::search::SearchResult),
+    Done(SearchResult),
 }
 
 /// Everything that can wake `run`'s event loop up: a new line of input
@@ -417,7 +420,7 @@ enum Event {
 /// `Event`'s docs), not through a channel owned by this type.
 struct SearchWorker {
     handle: std::thread::JoinHandle<Engine>,
-    stop: crate::search::StopSignal,
+    stop: StopSignal,
 }
 
 impl SearchWorker {
@@ -436,7 +439,7 @@ impl SearchWorker {
         go_command: GoCommand,
         events: std::sync::mpsc::Sender<Event>,
     ) -> Self {
-        let stop = crate::search::StopSignal::new();
+        let stop = StopSignal::new();
         let worker_stop = stop.clone();
 
         let handle = std::thread::spawn(move || {
@@ -444,7 +447,7 @@ impl SearchWorker {
             let start = Instant::now();
             let on_depth_complete = {
                 let events = events.clone();
-                move |result: &crate::search::SearchResult| {
+                move |result: &SearchResult| {
                     let mut line = Vec::new();
                     // A rendering failure into an in-memory `Vec` is not a
                     // realistic failure mode; silently skipping the info
@@ -667,7 +670,7 @@ fn run_event_loop<W: Write>(
     let mut active_search: Option<SearchWorker> = None;
     // Events that arrived out of order relative to a search drain --
     // see `drain_and_write_search_events`/`next_event`'s docs.
-    let mut pending: std::collections::VecDeque<Event> = std::collections::VecDeque::new();
+    let mut pending: VecDeque<Event> = VecDeque::new();
 
     loop {
         match next_event(events, &mut pending) {
@@ -831,9 +834,7 @@ fn run_event_loop<W: Write>(
                             }
                         } else if name.eq_ignore_ascii_case("MoveOverhead") {
                             match value.trim().parse::<u64>() {
-                                Ok(ms) => {
-                                    engine.set_move_overhead(Duration::from_millis(ms))
-                                }
+                                Ok(ms) => engine.set_move_overhead(Duration::from_millis(ms)),
                                 Err(_) => engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid MoveOverhead value: {value}"),
@@ -1022,7 +1023,7 @@ fn drain_and_write_search_events<W: Write>(
 /// out of the order it was actually sent in.
 fn next_event(
     events: &std::sync::mpsc::Receiver<Event>,
-    pending: &mut std::collections::VecDeque<Event>,
+    pending: &mut VecDeque<Event>,
 ) -> Result<Event, std::sync::mpsc::RecvError> {
     if let Some(event) = pending.pop_front() {
         return Ok(event);
@@ -1033,6 +1034,9 @@ fn next_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::TimePolicy;
+    use bee_chess_core::MoveFlag;
+    use std::io::BufReader;
 
     /// A `Read` that reads `text` in order, then blocks briefly before
     /// reporting EOF -- wrap in `BufReader::new(..)` for `run`'s `R:
@@ -1047,7 +1051,7 @@ mod tests {
     /// `movetime` search use this instead of a bare byte slice, with
     /// `eof_delay` comfortably longer than the budget under test.
     struct SlowEofInput {
-        remaining: std::collections::VecDeque<u8>,
+        remaining: VecDeque<u8>,
         eof_delay: Duration,
     }
 
@@ -1213,7 +1217,7 @@ mod tests {
     #[test]
     fn format_uci_move_formats_quiet_move() {
         let mv = UciMove::parse("e2e4").unwrap();
-        let position_move = crate::chess::Move::new(mv.from, mv.to, crate::chess::MoveFlag::Quiet);
+        let position_move = Move::new(mv.from, mv.to, MoveFlag::Quiet);
         assert_eq!(format_uci_move(position_move), "e2e4");
     }
 
@@ -1223,19 +1227,19 @@ mod tests {
         let from = "a7".parse().unwrap();
         let to = "a8".parse().unwrap();
         assert_eq!(
-            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteQueen)),
+            format_uci_move(Move::new(from, to, MoveFlag::PromoteQueen)),
             "a7a8q"
         );
         assert_eq!(
-            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteRook)),
+            format_uci_move(Move::new(from, to, MoveFlag::PromoteRook)),
             "a7a8r"
         );
         assert_eq!(
-            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteBishop)),
+            format_uci_move(Move::new(from, to, MoveFlag::PromoteBishop)),
             "a7a8b"
         );
         assert_eq!(
-            format_uci_move(crate::chess::Move::new(from, to, MoveFlag::PromoteKnight)),
+            format_uci_move(Move::new(from, to, MoveFlag::PromoteKnight)),
             "a7a8n"
         );
     }
@@ -1469,13 +1473,13 @@ mod tests {
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
-        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Predictive);
+        assert_eq!(engine.time_policy(), TimePolicy::Predictive);
     }
 
     #[test]
     fn engine_defaults_to_the_baseline_time_policy() {
         let engine = Engine::default();
-        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Baseline);
+        assert_eq!(engine.time_policy(), TimePolicy::Baseline);
     }
 
     #[test]
@@ -1484,7 +1488,7 @@ mod tests {
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
-        assert_eq!(engine.time_policy(), crate::search::TimePolicy::Baseline);
+        assert_eq!(engine.time_policy(), TimePolicy::Baseline);
     }
 
     #[test]
@@ -1945,7 +1949,7 @@ mod tests {
         // depths, then a bestmove. No `quit`: see `SlowEofInput`'s
         // docs on why EOF must be delayed for this to observe a
         // naturally-completed search rather than one cancelled early.
-        let input = std::io::BufReader::new(SlowEofInput::new(
+        let input = BufReader::new(SlowEofInput::new(
             "position startpos\ngo wtime 5000 btime 5000\n",
             Duration::from_millis(300),
         ));
@@ -1968,7 +1972,7 @@ mod tests {
         // `SearchWorker::spawn`'s docs -- so this is the one `go` mode
         // that should always carry a `bee-tm` line, unconditionally
         // (not gated behind `debug on`, unlike ordinary diagnostics).
-        let input = std::io::BufReader::new(SlowEofInput::new(
+        let input = BufReader::new(SlowEofInput::new(
             "position startpos\ngo wtime 5000 btime 5000\n",
             Duration::from_millis(300),
         ));
@@ -2085,7 +2089,7 @@ mod tests {
     fn go_movetime_finds_mate_in_one_via_iterative_deepening() {
         let fen = "6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1";
         // No `quit`: see `SlowEofInput`'s docs.
-        let input = std::io::BufReader::new(SlowEofInput::new(
+        let input = BufReader::new(SlowEofInput::new(
             &format!("position fen {fen}\ngo movetime 500\n"),
             Duration::from_millis(300),
         ));
@@ -2106,7 +2110,7 @@ mod tests {
     #[test]
     fn go_movetime_info_line_includes_pv() {
         // No `quit`: see `SlowEofInput`'s docs.
-        let input = std::io::BufReader::new(SlowEofInput::new(
+        let input = BufReader::new(SlowEofInput::new(
             "position startpos\ngo movetime 100\n",
             Duration::from_millis(300),
         ));
@@ -2128,7 +2132,7 @@ mod tests {
         // should win and drive iterative deepening across several
         // depths within its budget instead.
         // No `quit`: see `SlowEofInput`'s docs.
-        let input = std::io::BufReader::new(SlowEofInput::new(
+        let input = BufReader::new(SlowEofInput::new(
             "position startpos\ngo depth 1 movetime 200\n",
             Duration::from_millis(300),
         ));
@@ -2371,7 +2375,7 @@ mod tests {
         assert_eq!(
             engine.position().to_fen(),
             {
-                let mut position = crate::chess::Position::startpos();
+                let mut position = Position::startpos();
                 let mv = position
                     .generate_legal_moves()
                     .into_iter()
