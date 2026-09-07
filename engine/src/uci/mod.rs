@@ -10,7 +10,7 @@
 //! input handling while searching) land in a follow-up milestone.
 
 use std::io::{BufRead, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::chess::{Color, Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
@@ -207,8 +207,8 @@ impl GoCommand {
             Color::Black => (self.black_time_ms?, self.black_increment_ms.unwrap_or(0)),
         };
         Some(crate::search::ClockTimeControl {
-            time_left: std::time::Duration::from_millis(time_left_ms),
-            increment: std::time::Duration::from_millis(increment_ms),
+            time_left: Duration::from_millis(time_left_ms),
+            increment: Duration::from_millis(increment_ms),
             moves_to_go: self.moves_to_go,
         })
     }
@@ -333,7 +333,7 @@ fn format_uci_move(mv: Move) -> String {
 fn write_search_info<W: Write>(
     output: &mut W,
     result: &crate::search::SearchResult,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
 ) -> std::io::Result<()> {
     let score_field = match mate_in_plies(result.score) {
         Some(plies_to_mate) => format!("mate {plies_to_mate}"),
@@ -461,7 +461,7 @@ impl SearchWorker {
             };
 
             let (result, telemetry) = if let Some(movetime_ms) = go_command.movetime_ms {
-                let budget = std::time::Duration::from_millis(movetime_ms);
+                let budget = Duration::from_millis(movetime_ms);
                 (
                     engine.search_for_time(budget, worker_stop, on_depth_complete),
                     None,
@@ -832,7 +832,7 @@ fn run_event_loop<W: Write>(
                         } else if name.eq_ignore_ascii_case("MoveOverhead") {
                             match value.trim().parse::<u64>() {
                                 Ok(ms) => {
-                                    engine.set_move_overhead(std::time::Duration::from_millis(ms))
+                                    engine.set_move_overhead(Duration::from_millis(ms))
                                 }
                                 Err(_) => engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
@@ -1048,11 +1048,11 @@ mod tests {
     /// `eof_delay` comfortably longer than the budget under test.
     struct SlowEofInput {
         remaining: std::collections::VecDeque<u8>,
-        eof_delay: std::time::Duration,
+        eof_delay: Duration,
     }
 
     impl SlowEofInput {
-        fn new(text: &str, eof_delay: std::time::Duration) -> Self {
+        fn new(text: &str, eof_delay: Duration) -> Self {
             SlowEofInput {
                 remaining: text.bytes().collect(),
                 eof_delay,
@@ -1153,15 +1153,15 @@ mod tests {
         };
 
         let white = go_command.clock_for(Color::White).unwrap();
-        assert_eq!(white.time_left, std::time::Duration::from_millis(60_000));
-        assert_eq!(white.increment, std::time::Duration::from_millis(1_000));
+        assert_eq!(white.time_left, Duration::from_millis(60_000));
+        assert_eq!(white.increment, Duration::from_millis(1_000));
         assert_eq!(white.moves_to_go, Some(10));
 
         let black = go_command.clock_for(Color::Black).unwrap();
-        assert_eq!(black.time_left, std::time::Duration::from_millis(55_000));
+        assert_eq!(black.time_left, Duration::from_millis(55_000));
         assert_eq!(
             black.increment,
-            std::time::Duration::ZERO,
+            Duration::ZERO,
             "missing binc defaults to zero, not None/panic"
         );
     }
@@ -1903,7 +1903,7 @@ mod tests {
         // -- see `SlowEofInput`'s docs.
         let input = std::io::BufReader::new(SlowEofInput::new(
             "position startpos\ngo movetime 200\n",
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -1947,7 +1947,7 @@ mod tests {
         // naturally-completed search rather than one cancelled early.
         let input = std::io::BufReader::new(SlowEofInput::new(
             "position startpos\ngo wtime 5000 btime 5000\n",
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -1970,7 +1970,7 @@ mod tests {
         // (not gated behind `debug on`, unlike ordinary diagnostics).
         let input = std::io::BufReader::new(SlowEofInput::new(
             "position startpos\ngo wtime 5000 btime 5000\n",
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -2035,7 +2035,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < Duration::from_millis(500),
             "go should have used White's own (tiny) clock, took {elapsed:?}"
         );
         let text = String::from_utf8(output).expect("output should be valid utf8");
@@ -2087,7 +2087,7 @@ mod tests {
         // No `quit`: see `SlowEofInput`'s docs.
         let input = std::io::BufReader::new(SlowEofInput::new(
             &format!("position fen {fen}\ngo movetime 500\n"),
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -2108,7 +2108,7 @@ mod tests {
         // No `quit`: see `SlowEofInput`'s docs.
         let input = std::io::BufReader::new(SlowEofInput::new(
             "position startpos\ngo movetime 100\n",
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -2130,7 +2130,7 @@ mod tests {
         // No `quit`: see `SlowEofInput`'s docs.
         let input = std::io::BufReader::new(SlowEofInput::new(
             "position startpos\ngo depth 1 movetime 200\n",
-            std::time::Duration::from_millis(300),
+            Duration::from_millis(300),
         ));
         let mut output = Vec::new();
         let mut engine = Engine::default();
@@ -2244,7 +2244,7 @@ mod tests {
         // before `stop` is even read, so this exercises "stop with
         // nothing running" rather than "stop mid-search" (already
         // covered above).
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         sender.send(Event::Line("stop".to_string())).unwrap();
         sender.send(Event::Line("quit".to_string())).unwrap();
 
