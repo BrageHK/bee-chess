@@ -3,6 +3,10 @@
 # engine/ and lab/ are both members of the root Cargo workspace.
 /target/
 
+# Bee Lab
+# Persisted finished-game history (#123) -- runtime data, not source.
+/data/lab/
+
 # Python
 /training/.venv/
 /training/.pytest_cache/

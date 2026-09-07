@@ -43,6 +43,7 @@ use tower_http::services::ServeDir;
 mod api;
 mod experiment;
 mod game;
+mod persistence;
 mod uci_process;
 
 use game::{EngineSpec, GameStore};
@@ -83,7 +84,13 @@ async fn main() {
         .insert("stockfish", stockfish_spec)
         .insert("bee", bee_spec);
 
-    let app = api::router(GameStore::new(), registry)
+    // Finished/aborted games survive a restart (#123) -- see
+    // `persistence`'s module docs. Kept alongside the engine binaries
+    // and frontend build rather than under `lab/`'s own source tree, so
+    // it isn't mistaken for something `cargo clean`/version control
+    // should touch.
+    let games_data_dir = root.join("data/lab");
+    let app = api::router(GameStore::with_data_dir(games_data_dir), registry)
         .fallback_service(ServeDir::new(&frontend_dist))
         // See the module docs above for why -- permissive (`Any`)
         // since this is a development/orchestration server (#67), not
