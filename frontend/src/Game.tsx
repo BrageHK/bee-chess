@@ -8,6 +8,7 @@ import { UciLogPanel } from "./UciLogPanel";
 import { SearchStatsPanel } from "./SearchStatsPanel";
 import { EvalBar } from "./EvalBar";
 import { Button } from "./components/ui/Button";
+import { IconButton } from "./components/ui/IconButton";
 import { Inline, Stack } from "./components/ui/Stack";
 import type { UciLogLine } from "./engine";
 import type { Participant } from "./participant";
@@ -110,6 +111,12 @@ export function Game({
   const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
   const [status, setStatus] = useState("connecting to Bee Lab…");
   const [unavailable, setUnavailable] = useState<string | null>(null);
+  // #119: the board defaults to "rotated" (human's pieces nearest them)
+  // whenever the human is playing Black, but the "Rotate board" button
+  // below can flip either default. `null` means "no manual override
+  // yet -- use the default"; a game with two engines (no human side)
+  // never rotates by default, but the button still works.
+  const [manualRotation, setManualRotation] = useState<boolean | null>(null);
 
   const participantInfoFor = (color: Color): ParticipantInfo | null =>
     snapshot ? (color === "white" ? snapshot.white : snapshot.black) : null;
@@ -259,9 +266,12 @@ export function Game({
   const canMoveColor = humanTurnColor();
   const fen = snapshot?.fen ?? START_FEN;
   const lastMove = lastMoveKeys(snapshot);
-  // Put the human player's pieces nearest them. White remains the default
-  // while the snapshot is loading and for games without a human Black side.
-  const orientation = snapshot?.black.kind === "human" ? "black" : "white";
+  // Put the human player's pieces nearest them by default. White remains
+  // the default while the snapshot is loading and for games without a
+  // human Black side. The "Rotate board" button (#119) can flip this.
+  const rotatedByDefault = snapshot?.black.kind === "human";
+  const rotated = manualRotation ?? rotatedByDefault;
+  const orientation = rotated ? "black" : "white";
   const dests = canMoveColor ? chessgroundDestsFromFen(fen) : new Map<Key, Key[]>();
   const finished = snapshot ? snapshot.status !== "running" : false;
   const experimentId = snapshot?.experiment_id ?? null;
@@ -307,6 +317,11 @@ export function Game({
         {participantInfoFor("black")?.kind === "engine" && (
           <EvalBar color="black" subscribe={blackLogSubscribe} />
         )}
+        <Stack gap={2} className="self-start">
+          <IconButton aria-label="Rotate board" onClick={() => setManualRotation(!rotated)}>
+            <RotateIcon />
+          </IconButton>
+        </Stack>
       </Inline>
       <p className="m-0 text-sm text-muted">{status}</p>
       {finished && <Button onClick={onBackToSetup}>New game</Button>}
@@ -470,4 +485,16 @@ function chessgroundDestsFromFen(fen: string): Dests {
   const position = Chess.fromSetup(setup.value);
   if (position.isErr) return new Map();
   return chessgroundDests(position.value);
+}
+
+/** Two-arrow "rotate" glyph for the board-orientation toggle (#119). */
+function RotateIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M17 2.1l4 4-4 4" />
+      <path d="M3 12.5v-1a8 8 0 0 1 8-8h9" />
+      <path d="M7 21.9l-4-4 4-4" />
+      <path d="M21 11.5v1a8 8 0 0 1-8 8H4" />
+    </svg>
+  );
 }
