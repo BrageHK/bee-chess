@@ -444,7 +444,14 @@ pub fn search_iterative_with_budget(
         if depth >= MAX_ITERATIVE_DEPTH {
             return Some((
                 last_completed,
-                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                telemetry(
+                    budget,
+                    policy,
+                    depth,
+                    aborted,
+                    best_move_changes,
+                    last_score_delta,
+                ),
             ));
         }
         depth += 1;
