@@ -91,59 +91,6 @@ impl Default for TimeManagerConfig {
     }
 }
 
-/// Which allocation policy iterative deepening uses to decide whether
-/// to start another depth, once the soft deadline hasn't been reached
-/// yet -- see `search::search_iterative_with_budget`'s docs for where
-/// this actually plugs in. Exposed as the `TimePolicy` UCI combo
-/// option (see `crate::uci`), so Bee Lab's experiment runner can A/B
-/// one policy against another the same way it already does for
-/// `Evaluator`/`UseTT`/etc.
-///
-/// `Baseline` exists, and stays the default, specifically so this
-/// option is purely additive: a fresh `Engine` (or an older Lab
-/// experiment config that never sets `TimePolicy` at all) behaves
-/// exactly as it did before this type existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimePolicy {
-    /// Today's behavior, unchanged: start the next depth whenever the
-    /// soft deadline hasn't passed, with no attempt to predict whether
-    /// it can actually finish before the hard one. Real telemetry
-    /// (`bee-tm`, see `TimeManagementTelemetry`) from a 20-game 10+0.1
-    /// Fischer experiment showed this costs real, measurable waste:
-    /// ~17% of searches hit the hard deadline mid-iteration and
-    /// discarded the result, for ~60ms average (up to 880ms peak) of
-    /// pure wasted computation per occurrence -- see `Predictive`.
-    #[default]
-    Baseline,
-    /// Adds one check before starting a new depth: estimate that
-    /// depth's likely cost from how the last two completed depths grew
-    /// (see `estimate_next_depth_cost`), and skip starting it at all if
-    /// the estimate suggests it plausibly can't finish before the hard
-    /// deadline -- see `search_iterative_with_budget`'s docs for
-    /// exactly where and how. Does not touch the hard deadline itself,
-    /// which remains the correctness backstop regardless of policy: an
-    /// iteration that *is* started can still be aborted mid-flight if
-    /// the estimate turns out to have been wrong.
-    Predictive,
-}
-
-impl TimePolicy {
-    pub const fn uci_name(self) -> &'static str {
-        match self {
-            Self::Baseline => "Baseline",
-            Self::Predictive => "Predictive",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "baseline" => Some(Self::Baseline),
-            "predictive" => Some(Self::Predictive),
-            _ => None,
-        }
-    }
-}
-
 /// How much headroom `estimate_next_depth_cost`-based prediction
 /// requires beyond the estimated cost itself before allowing a new
 /// depth to start -- i.e. a depth is only started if `estimated_cost *
@@ -312,12 +259,6 @@ pub struct TimeManagementTelemetry {
     /// suggests the evaluation has settled; a large swing on the final
     /// depth suggests it might not have.
     pub score_delta_cp: Option<i32>,
-    /// Which [`TimePolicy`] this search actually ran under -- included
-    /// so a consumer aggregating `bee-tm` lines across an A/B
-    /// experiment (e.g. `TimePolicy::Baseline` vs `Predictive`) can
-    /// tell which record belongs to which policy without needing to
-    /// separately track "which variant used which `setoption`" itself.
-    pub policy: TimePolicy,
 }
 
 impl TimeManagementTelemetry {
@@ -329,8 +270,7 @@ impl TimeManagementTelemetry {
     #[must_use]
     pub fn to_bee_tm_line(self) -> String {
         let mut line = format!(
-            "v={BEE_TM_VERSION} policy={} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
-            self.policy.uci_name(),
+            "v={BEE_TM_VERSION} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
             self.soft_ms,
             self.hard_ms,
             self.completed_depth,
@@ -406,22 +346,12 @@ mod tests {
             aborted_ms: 201,
             best_move_changes: 3,
             score_delta_cp: Some(-42),
-            policy: TimePolicy::Baseline,
         };
 
         assert_eq!(
             telemetry.to_bee_tm_line(),
-            "v=1 policy=Baseline soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
+            "v=1 soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
         );
-    }
-
-    #[test]
-    fn bee_tm_line_includes_the_predictive_policy_name() {
-        let telemetry = TimeManagementTelemetry {
-            policy: TimePolicy::Predictive,
-            ..TimeManagementTelemetry::default()
-        };
-        assert!(telemetry.to_bee_tm_line().contains("policy=Predictive"));
     }
 
     #[test]
@@ -433,7 +363,6 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 0,
             score_delta_cp: None,
-            policy: TimePolicy::Baseline,
         };
 
         let line = telemetry.to_bee_tm_line();
@@ -457,7 +386,6 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 1,
             score_delta_cp: Some(12),
-            policy: TimePolicy::Baseline,
         };
 
         for token in telemetry.to_bee_tm_line().split(' ') {
@@ -555,28 +483,6 @@ mod tests {
         let zero = allocate_time(control(60_000, 0, Some(0)), &config);
 
         assert_eq!(unknown, zero);
-    }
-
-    #[test]
-    fn time_policy_parse_round_trips_through_uci_name() {
-        assert_eq!(TimePolicy::parse("baseline"), Some(TimePolicy::Baseline));
-        assert_eq!(TimePolicy::parse("Baseline"), Some(TimePolicy::Baseline));
-        assert_eq!(
-            TimePolicy::parse("predictive"),
-            Some(TimePolicy::Predictive)
-        );
-        assert_eq!(
-            TimePolicy::parse("PREDICTIVE"),
-            Some(TimePolicy::Predictive)
-        );
-        assert_eq!(TimePolicy::parse("nonsense"), None);
-        assert_eq!(TimePolicy::Baseline.uci_name(), "Baseline");
-        assert_eq!(TimePolicy::Predictive.uci_name(), "Predictive");
-    }
-
-    #[test]
-    fn time_policy_defaults_to_baseline() {
-        assert_eq!(TimePolicy::default(), TimePolicy::Baseline);
     }
 
     #[test]

@@ -77,10 +77,6 @@ pub struct Engine {
     /// for now; the rest are constants until real measurement suggests
     /// they should be tunable too.
     time_manager_config: TimeManagerConfig,
-    /// Which depth-starting policy `search_with_clock` uses -- see
-    /// `crate::search::TimePolicy`'s docs. Exposed as the `TimePolicy`
-    /// UCI combo option so Bee Lab's experiment runner can A/B it.
-    time_policy: search::TimePolicy,
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
@@ -166,7 +162,6 @@ impl Engine {
             position_history,
             move_history: Vec::new(),
             time_manager_config: TimeManagerConfig::default(),
-            time_policy: search::TimePolicy::default(),
         }
     }
 
@@ -289,14 +284,6 @@ impl Engine {
     /// less than a network round trip to a lichess-bot bridge.
     pub fn set_move_overhead(&mut self, move_overhead: std::time::Duration) {
         self.time_manager_config.move_overhead = move_overhead;
-    }
-
-    pub const fn time_policy(&self) -> search::TimePolicy {
-        self.time_policy
-    }
-
-    pub fn set_time_policy(&mut self, time_policy: search::TimePolicy) {
-        self.time_policy = time_policy;
     }
 
     /// Resets game/search-specific engine state (TT generation and
@@ -676,7 +663,6 @@ impl Engine {
                 &self.position_history,
                 self.search_options,
                 stop,
-                self.time_policy,
                 on_depth_complete,
             ),
             EvaluatorKind::Material => search::search_iterative_with_budget(
@@ -686,7 +672,6 @@ impl Engine {
                 &self.position_history,
                 self.search_options,
                 stop,
-                self.time_policy,
                 on_depth_complete,
             ),
             EvaluatorKind::Positional => search::search_iterative_with_budget(
@@ -696,7 +681,6 @@ impl Engine {
                 &self.position_history,
                 self.search_options,
                 stop,
-                self.time_policy,
                 on_depth_complete,
             ),
         };

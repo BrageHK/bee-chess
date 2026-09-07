@@ -626,9 +626,10 @@ pub struct ExperimentSearchStats {
 /// prominent fields here: an average alone can hide the exact problem
 /// worth knowing about (a search that *usually* wastes nothing but
 /// *occasionally* burns hundreds of milliseconds on a discarded
-/// iteration) -- this is the evidence a predictive time policy (only
-/// start a depth if it can plausibly finish) would need to justify
-/// itself against `TimePolicy::Baseline`.
+/// iteration) -- this was the evidence that justified making search
+/// predict whether a depth can plausibly finish before starting it
+/// (only starting it if so), now the engine's only behavior rather
+/// than an A/B-tested option.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct TimeManagementStats {
     /// How many `go`s produced a `bee-tm` line at all -- the

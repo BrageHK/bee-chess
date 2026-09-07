@@ -739,16 +739,6 @@ fn run_event_loop<W: Write>(
                             "option name MoveOverhead type spin default {} min 0 max 1000",
                             DEFAULT_MOVE_OVERHEAD_MS
                         )?;
-                        // See `crate::search::TimePolicy`'s docs --
-                        // `Baseline` is the default (and today's
-                        // unchanged behavior) so this option is purely
-                        // additive; `Predictive` is the A/B-testable
-                        // alternative Bee Lab's experiment runner can
-                        // switch on.
-                        writeln!(
-                            output,
-                            "option name TimePolicy type combo default Baseline var Baseline var Predictive"
-                        )?;
                         writeln!(output, "uciok")?;
                     }
                     UciCommand::IsReady => {
@@ -841,13 +831,20 @@ fn run_event_loop<W: Write>(
                                 ),
                             }
                         } else if name.eq_ignore_ascii_case("TimePolicy") {
-                            match crate::search::TimePolicy::parse(&value) {
-                                Some(policy) => engine.set_time_policy(policy),
-                                None => engine.emit_diagnostic(
-                                    DiagnosticLevel::Warn,
-                                    format!("ignored invalid TimePolicy value: {value}"),
-                                ),
-                            }
+                            // Deprecated: the predictive depth-cost
+                            // check this used to gate behind
+                            // `TimePolicy=Predictive` is now the
+                            // engine's only behavior (see
+                            // `search::search_iterative_with_budget`'s
+                            // docs) -- no longer advertised in the
+                            // `uci` handshake, but still accepted and
+                            // silently ignored here so an old Lab
+                            // experiment config that still sends it
+                            // doesn't start failing.
+                            engine.emit_diagnostic(
+                                DiagnosticLevel::Info,
+                                "ignored deprecated option TimePolicy.",
+                            );
                         } else {
                             engine.emit_diagnostic(
                                 DiagnosticLevel::Info,
@@ -1034,7 +1031,6 @@ fn next_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::TimePolicy;
     use bee_chess_core::MoveFlag;
     use std::io::BufReader;
 
@@ -1403,8 +1399,10 @@ mod tests {
         assert!(text.contains("option name UseDeltaPruning type check default true"));
         assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name OpeningBook type combo default None"));
-        assert!(text.contains("option name TimePolicy type combo default Baseline"));
-        assert!(text.contains("var Predictive"));
+        assert!(
+            !text.contains("TimePolicy"),
+            "TimePolicy is deprecated and no longer advertised"
+        );
         assert!(text.contains("uciok"));
         assert!(text.contains("readyok"));
     }
@@ -1468,27 +1466,20 @@ mod tests {
     }
 
     #[test]
-    fn setoption_selects_the_predictive_time_policy() {
-        let input = b"setoption name TimePolicy value Predictive\nquit\n".as_slice();
+    fn setoption_time_policy_is_accepted_but_ignored() {
+        // TimePolicy is deprecated (see the `setoption` handler's
+        // docs): the predictive check it used to gate is now the
+        // engine's only behavior. An old Lab experiment config that
+        // still sends this must not error or otherwise disrupt the
+        // rest of the session.
+        let input =
+            b"debug on\nsetoption name TimePolicy value Predictive\nisready\nquit\n".as_slice();
         let mut output = Vec::new();
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
-        assert_eq!(engine.time_policy(), TimePolicy::Predictive);
-    }
-
-    #[test]
-    fn engine_defaults_to_the_baseline_time_policy() {
-        let engine = Engine::default();
-        assert_eq!(engine.time_policy(), TimePolicy::Baseline);
-    }
-
-    #[test]
-    fn invalid_time_policy_value_keeps_the_current_setting() {
-        let input = b"setoption name TimePolicy value Nonsense\nquit\n".as_slice();
-        let mut output = Vec::new();
-        let mut engine = Engine::default();
-        run(input, &mut output, &mut engine).expect("run should succeed");
-        assert_eq!(engine.time_policy(), TimePolicy::Baseline);
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("ignored deprecated option TimePolicy"));
+        assert!(text.contains("readyok"));
     }
 
     #[test]
