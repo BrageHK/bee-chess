@@ -360,19 +360,22 @@ pub fn search_iterative_with_stop(
 /// reconstructed by a caller from a sequence of `on_depth_complete`
 /// calls after the fact.
 ///
-/// `policy` (see [`super::TimePolicy`]'s docs) governs one thing only:
-/// whether, once the soft deadline hasn't been reached yet, this also
-/// estimates the next depth's likely cost (from the last two completed
-/// depths' own timings, see [`super::estimate_next_depth_cost`]) and
-/// skips starting it at all if that estimate suggests it plausibly
-/// can't finish before the hard deadline. This never replaces the hard
+/// Once the soft deadline hasn't been reached yet, this also estimates
+/// the next depth's likely cost (from the last two completed depths'
+/// own timings, see [`super::estimate_next_depth_cost`]) and skips
+/// starting it at all if that estimate suggests it plausibly can't
+/// finish before the hard deadline. This never replaces the hard
 /// deadline itself as the correctness backstop -- an iteration that
 /// *is* started can still be aborted mid-flight exactly as it always
 /// could; prediction only ever avoids starting a depth this search
 /// wouldn't have finished anyway, per the real `bee-tm` telemetry
 /// (~17% of searches hitting the hard deadline mid-iteration in a
 /// 20-game 10+0.1 Fischer experiment) that motivated building this.
-#[allow(clippy::too_many_arguments)]
+/// This used to be switchable behind a `TimePolicy` UCI option
+/// (`Baseline` vs `Predictive`); once the A/B experiment confirmed the
+/// predictive check was a strict improvement, it was made the only
+/// behavior and the option was deprecated (still accepted, ignored --
+/// see `crate::uci`'s `setoption` handling).
 pub fn search_iterative_with_budget(
     position: &mut Position,
     budget: super::TimeBudget,
@@ -380,7 +383,6 @@ pub fn search_iterative_with_budget(
     history: &[u64],
     options: SearchOptions,
     stop: StopSignal,
-    policy: super::TimePolicy,
     mut on_depth_complete: impl FnMut(&SearchResult),
 ) -> Option<(SearchResult, super::TimeManagementTelemetry)> {
     let search_start = std::time::Instant::now();
@@ -399,11 +401,10 @@ pub fn search_iterative_with_budget(
     let mut last_score_delta: Option<Score> = None;
     let mut aborted = std::time::Duration::ZERO;
     // The last two completed depths' own wall-clock durations, oldest
-    // first -- exactly what `estimate_next_depth_cost` (under
-    // `TimePolicy::Predictive`) needs to project the next depth's
-    // likely cost. `previous_depth_duration` starts `None` (only depth
-    // 1 has completed so far) and gains a real value once depth 2
-    // completes.
+    // first -- exactly what `estimate_next_depth_cost` needs to
+    // project the next depth's likely cost. `previous_depth_duration`
+    // starts `None` (only depth 1 has completed so far) and gains a
+    // real value once depth 2 completes.
     #[allow(unused_assignments)]
     let mut previous_depth_duration: Option<std::time::Duration> = None;
     let mut last_depth_duration: std::time::Duration;
@@ -436,7 +437,7 @@ pub fn search_iterative_with_budget(
     if super::mate_in_plies(last_completed.score).is_some() {
         return Some((
             last_completed,
-            telemetry(budget, policy, depth, aborted, best_move_changes, None),
+            telemetry(budget, depth, aborted, best_move_changes, None),
         ));
     }
 
@@ -444,14 +445,7 @@ pub fn search_iterative_with_budget(
         if depth >= MAX_ITERATIVE_DEPTH {
             return Some((
                 last_completed,
-                telemetry(
-                    budget,
-                    policy,
-                    depth,
-                    aborted,
-                    best_move_changes,
-                    last_score_delta,
-                ),
+                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
             ));
         }
         depth += 1;
@@ -482,14 +476,7 @@ pub fn search_iterative_with_budget(
                 if found_mate || search_saturated {
                     return Some((
                         last_completed,
-                        telemetry(
-                            budget,
-                            policy,
-                            depth,
-                            aborted,
-                            best_move_changes,
-                            last_score_delta,
-                        ),
+                        telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
                     ));
                 }
             }
@@ -510,7 +497,6 @@ pub fn search_iterative_with_budget(
                     last_completed,
                     telemetry(
                         budget,
-                        policy,
                         depth - 1,
                         aborted,
                         best_move_changes,
@@ -528,47 +514,32 @@ pub fn search_iterative_with_budget(
             // another depth," not "abort the one that just finished."
             return Some((
                 last_completed,
-                telemetry(
-                    budget,
-                    policy,
-                    depth,
-                    aborted,
-                    best_move_changes,
-                    last_score_delta,
-                ),
+                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
             ));
         }
 
-        if policy == super::TimePolicy::Predictive {
-            let estimated_next_ms = super::estimate_next_depth_cost(
-                last_depth_duration.as_millis() as u64,
-                previous_depth_duration.map(|d| d.as_millis() as u64),
-            );
-            let affordable = super::next_depth_is_affordable(
-                search_start.elapsed().as_millis() as u64,
-                estimated_next_ms,
-                budget.hard.as_millis() as u64,
-            );
-            if !affordable {
-                // The next depth probably can't finish before the hard
-                // deadline anyway -- skip starting it at all, rather
-                // than starting it and almost certainly needing the
-                // hard deadline to abort it partway through (the exact
-                // waste `TimePolicy::Predictive` exists to avoid). The
-                // hard deadline remains the backstop for every depth
-                // that *is* started, under either policy.
-                return Some((
-                    last_completed,
-                    telemetry(
-                        budget,
-                        policy,
-                        depth,
-                        aborted,
-                        best_move_changes,
-                        last_score_delta,
-                    ),
-                ));
-            }
+        // Predict how long the next depth will take, and skip starting
+        // it at all if it plausibly won't fit -- see this function's
+        // docs.
+        let estimated_next_ms = super::estimate_next_depth_cost(
+            last_depth_duration.as_millis() as u64,
+            previous_depth_duration.map(|d| d.as_millis() as u64),
+        );
+        let affordable = super::next_depth_is_affordable(
+            search_start.elapsed().as_millis() as u64,
+            estimated_next_ms,
+            budget.hard.as_millis() as u64,
+        );
+        if !affordable {
+            // The next depth probably can't finish before the hard
+            // deadline anyway -- skip starting it at all, rather
+            // than starting it and almost certainly needing the hard
+            // deadline to abort it partway through. The hard deadline
+            // remains the backstop for every depth that *is* started.
+            return Some((
+                last_completed,
+                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+            ));
         }
     }
 }
@@ -580,7 +551,6 @@ pub fn search_iterative_with_budget(
 /// literal five times.
 fn telemetry(
     budget: super::TimeBudget,
-    policy: super::TimePolicy,
     completed_depth: u32,
     aborted: std::time::Duration,
     best_move_changes: u32,
@@ -593,7 +563,6 @@ fn telemetry(
         aborted_ms: aborted.as_millis() as u64,
         best_move_changes,
         score_delta_cp,
-        policy,
     }
 }
 
@@ -1467,7 +1436,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             StopSignal::new(),
-            super::super::TimePolicy::Baseline,
             |_| {},
         );
 
@@ -1497,7 +1465,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             StopSignal::new(),
-            super::super::TimePolicy::Baseline,
             |_| {},
         );
 
@@ -1529,7 +1496,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             StopSignal::new(),
-            super::super::TimePolicy::Baseline,
             |_| {},
         )
         .expect("depth 1 should complete with a generous budget");
@@ -1551,55 +1517,29 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_reports_whichever_policy_was_actually_used() {
-        let mut position = Position::startpos();
-        let history = [position.zobrist_hash()];
-        let budget = super::super::TimeBudget {
-            soft: Duration::from_secs(60),
-            hard: Duration::from_secs(60),
-        };
-        let stop = StopSignal::new();
-        let stop_from_callback = stop.clone();
-
-        let (_result, telemetry) = search_iterative_with_budget(
-            &mut position,
-            budget,
-            &MaterialEvaluator,
-            &history,
-            SearchOptions::default(),
-            stop,
-            super::super::TimePolicy::Predictive,
-            move |_| stop_from_callback.request_stop(),
-        )
-        .expect("depth 1 should complete before the stop takes effect");
-
-        assert_eq!(telemetry.policy, super::super::TimePolicy::Predictive);
-    }
-
-    #[test]
-    fn predictive_policy_declines_to_start_a_depth_it_estimates_wont_finish() {
+    fn search_declines_to_start_a_depth_it_estimates_wont_finish() {
         // A budget where depth 1 and depth 2 both complete comfortably
         // (a generous soft/hard budget overall), but the hard budget
         // is deliberately tightened to just barely more than what
         // depth 1 + depth 2 together are expected to cost, on a
         // position deep enough that depth 3 is genuinely, measurably
         // more expensive than depth 2 (real branching-factor growth,
-        // not a contrived StopSignal) -- `Predictive` should stop
-        // *without* attempting (and therefore without aborting) depth
-        // 3, unlike `Baseline`, which has no such estimate and would
-        // only find out depth 3 didn't fit by actually trying it.
+        // not a contrived StopSignal) -- search should stop *without*
+        // attempting (and therefore without aborting) depth 3, rather
+        // than starting it and only finding out it didn't fit by
+        // actually trying it.
         //
         // This is inherently a real-timing-based test (unlike the
         // StopSignal-driven determinism used elsewhere in this file),
         // so it only asserts the one thing that's true regardless of
-        // exact machine speed: whenever `Predictive` stops *without*
-        // having aborted an iteration (`aborted_ms == 0`), the depth it
+        // exact machine speed: whenever search stops *without* having
+        // aborted an iteration (`aborted_ms == 0`), the depth it
         // stopped at must be the one it estimated, not one attempt-
-        // and-abort would have reached instead -- i.e. `Predictive`
-        // never *aborts* a depth under this budget (soft is generous;
-        // only the predictive check or the hard limit can stop it, and
+        // and-abort would have reached instead -- i.e. this never
+        // *aborts* a depth under this budget (soft is generous; only
+        // the predictive check or the hard limit can stop it, and
         // hitting the hard limit exactly as a real depth boundary
-        // lines up is possible but doesn't invalidate the policy).
+        // lines up is possible but doesn't invalidate the claim).
         let mut position = Position::startpos();
         let history = [position.zobrist_hash()];
         let budget = super::super::TimeBudget {
@@ -1614,22 +1554,22 @@ mod tests {
             &history,
             SearchOptions::default(),
             StopSignal::new(),
-            super::super::TimePolicy::Predictive,
             |_| {},
         )
         .expect("depth 1 should always complete");
 
-        // The core claim: under `Predictive`, a depth that genuinely
-        // wouldn't have fit is never *started* (and therefore never
-        // needs aborting) once there's real growth-factor history to
-        // estimate from -- `aborted_ms` should stay 0 far more
-        // reliably than it would under `Baseline` with the same tight
-        // hard budget (see the module's own real-experiment telemetry
-        // showing `Baseline` aborts ~17% of searches under a
-        // comparable real hard budget).
+        // The core claim: a depth that genuinely wouldn't have fit is
+        // never *started* (and therefore never needs aborting) once
+        // there's real growth-factor history to estimate from --
+        // `aborted_ms` should stay 0 far more reliably than it would
+        // under the old start-whenever-the-soft-deadline-allows
+        // behavior with the same tight hard budget (see the module's
+        // own real-experiment telemetry showing that older behavior
+        // aborting ~17% of searches under a comparable real hard
+        // budget -- the evidence that motivated this check).
         assert_eq!(
             telemetry.aborted_ms, 0,
-            "Predictive should decline to start a depth it estimates won't fit, \
+            "search should decline to start a depth it estimates won't fit, \
              rather than starting it and needing the hard deadline to abort it"
         );
     }
@@ -1658,7 +1598,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             stop,
-            super::super::TimePolicy::Baseline,
             move |_| stop_from_callback.request_stop(),
         )
         .expect("depth 1 should still complete");
@@ -1688,7 +1627,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             StopSignal::new(),
-            super::super::TimePolicy::Baseline,
             |result| best_moves.push(result.best_move),
         )
         .expect("should complete at least depth 1");
@@ -1738,7 +1676,6 @@ mod tests {
             &history,
             SearchOptions::default(),
             stop,
-            super::super::TimePolicy::Baseline,
             move |_| stop_from_callback.request_stop(),
         )
         .expect("depth 1 should complete before the stop takes effect");
