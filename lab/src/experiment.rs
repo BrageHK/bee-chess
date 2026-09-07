@@ -97,8 +97,8 @@ fn opening_seed(id: ExperimentId) -> u32 {
 }
 
 use crate::game::{
-    EngineConfig, EngineSlots, GameId, GameResult, GameStatus, GameStore, UciLogColor,
-    UciLogDirection, UciLogEntry,
+    EngineConfig, EngineSlots, FinishReason, GameId, GameResult, GameStatus, GameStore,
+    TimeControl, UciLogColor, UciLogDirection, UciLogEntry,
 };
 
 /// The git commit `bee-lab` itself was built from -- embedded at
@@ -152,7 +152,11 @@ pub struct ExperimentSpec {
     pub requested_games: u32,
     /// Maximum games run at once. Each game launches two engine processes.
     pub concurrency: u32,
-    pub move_time_ms: u64,
+    /// Both variants play under the same clock -- see `TimeControl`'s
+    /// docs on why time control belongs to the experiment itself
+    /// rather than either variant: it's the environment being
+    /// measured in, not a thing being A/B'd.
+    pub time_control: TimeControl,
 }
 
 /// Enough about how/when an experiment ran to make its numbers
@@ -179,6 +183,13 @@ pub struct ExperimentMetadata {
     /// them from, so aren't duplicated here.
     pub variant_a_argv: Vec<String>,
     pub variant_b_argv: Vec<String>,
+    /// Both variants' shared clock policy -- part of reproducibility
+    /// provenance for the same reason the engine argv is: a score by
+    /// itself doesn't say whether it was measured at `1+0` or `3+2`
+    /// (or a fixed movetime), and those aren't comparable to each
+    /// other. See `TimeControl`'s docs on why time control is the
+    /// experiment's own configuration, not either variant's.
+    pub time_control: TimeControl,
     pub started_at: DateTime<Utc>,
     /// `None` while the experiment is still running -- see
     /// `Experiment::finish`.
@@ -192,6 +203,7 @@ impl ExperimentMetadata {
             opening_seed: opening_seed(id),
             variant_a_argv: spec.variant_a.config.spec.argv.clone(),
             variant_b_argv: spec.variant_b.config.spec.argv.clone(),
+            time_control: spec.time_control,
             started_at: Utc::now(),
             finished_at: None,
         }
@@ -250,6 +262,7 @@ struct SearchTotals {
     nmp_cutoffs: u64,
     delta_attempts: u64,
     delta_pruned: u64,
+    time_management: TimeManagementTotals,
 }
 
 impl SearchTotals {
@@ -269,6 +282,94 @@ impl SearchTotals {
         self.nmp_cutoffs += other.nmp_cutoffs;
         self.delta_attempts += other.delta_attempts;
         self.delta_pruned += other.delta_pruned;
+        self.time_management.add(other.time_management);
+    }
+}
+
+/// Running totals from every `bee-tm` telemetry line seen (see
+/// `bee_engine::search::TimeManagementTelemetry`'s docs on the wire
+/// format) -- kept separate from `SearchTotals`'s other fields since
+/// `bee-tm` is a distinct, optional telemetry capability: only a
+/// `search_with_clock` search (a real `go wtime/btime`) ever emits one
+/// at all, so `samples` can legitimately stay `0` for a whole
+/// experiment (a `TimeControl::MoveTime` one, an older engine build,
+/// or any engine that isn't Bee).
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeManagementTotals {
+    samples: u64,
+    soft_ms_sum: u64,
+    hard_ms_sum: u64,
+    aborted_ms_sum: u64,
+    max_aborted_ms: u64,
+    searches_with_aborted_iteration: u64,
+    best_move_changes_sum: u64,
+    score_delta_cp_sum: i64,
+    score_delta_cp_samples: u64,
+}
+
+impl TimeManagementTotals {
+    fn add(&mut self, other: Self) {
+        self.samples += other.samples;
+        self.soft_ms_sum += other.soft_ms_sum;
+        self.hard_ms_sum += other.hard_ms_sum;
+        self.aborted_ms_sum += other.aborted_ms_sum;
+        self.max_aborted_ms = self.max_aborted_ms.max(other.max_aborted_ms);
+        self.searches_with_aborted_iteration += other.searches_with_aborted_iteration;
+        self.best_move_changes_sum += other.best_move_changes_sum;
+        self.score_delta_cp_sum += other.score_delta_cp_sum;
+        self.score_delta_cp_samples += other.score_delta_cp_samples;
+    }
+
+    /// Parses one `bee-tm` payload (the text after `"info string
+    /// bee-tm "`, e.g. `"v=1 soft_ms=164 hard_ms=492
+    /// completed_depth=6 aborted_ms=354 best_move_changes=0
+    /// score_delta_cp=-12"`) into a single-sample `TimeManagementTotals`,
+    /// or `None` if it's missing/malformed in a way that makes it
+    /// unsafe to trust at all (no recognizable `v=1`, or a required
+    /// field is missing/unparseable) -- per the wire format's own
+    /// forward-compatibility rules (see
+    /// `bee_engine::search::TimeManagementTelemetry`'s docs), an
+    /// *unknown* key is always ignored rather than treated as
+    /// malformed, and a missing *optional* field (`score_delta_cp`) is
+    /// expected, not an error. Malformed telemetry only ever means
+    /// "this one record contributes nothing to the aggregate" -- it
+    /// never affects the game or the rest of that move's ordinary
+    /// search stats (see `summarize_searches`, the only caller).
+    fn parse(payload: &str) -> Option<Self> {
+        let mut fields = std::collections::HashMap::new();
+        for token in payload.split_whitespace() {
+            if let Some((key, value)) = token.split_once('=') {
+                fields.insert(key, value);
+            }
+        }
+
+        if fields.get("v").copied() != Some("1") {
+            return None;
+        }
+        let soft_ms: u64 = fields.get("soft_ms")?.parse().ok()?;
+        let hard_ms: u64 = fields.get("hard_ms")?.parse().ok()?;
+        let aborted_ms: u64 = fields.get("aborted_ms")?.parse().ok()?;
+        let best_move_changes: u64 = fields.get("best_move_changes")?.parse().ok()?;
+        // Optional: absent (or unparseable, which shouldn't happen per
+        // the emitter's own contract, but this parser doesn't trust
+        // that blindly) just means "no delta available for this
+        // sample" rather than invalidating the whole record.
+        let score_delta_cp: Option<i64> = fields
+            .get("score_delta_cp")
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(i64::from);
+
+        Some(TimeManagementTotals {
+            samples: 1,
+            soft_ms_sum: soft_ms,
+            hard_ms_sum: hard_ms,
+            aborted_ms_sum: aborted_ms,
+            max_aborted_ms: aborted_ms,
+            searches_with_aborted_iteration: u64::from(aborted_ms > 0),
+            best_move_changes_sum: best_move_changes,
+            score_delta_cp_sum: score_delta_cp.unwrap_or(0),
+            score_delta_cp_samples: u64::from(score_delta_cp.is_some()),
+        })
     }
 }
 
@@ -283,7 +384,10 @@ impl SearchTotals {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GameOutcome {
     Pending,
-    Finished { result: GameResult },
+    Finished {
+        result: GameResult,
+        reason: FinishReason,
+    },
     Aborted,
 }
 
@@ -364,7 +468,7 @@ impl Experiment {
         let mut draws = 0;
         let mut wins_b = 0;
         for game in &self.games {
-            let GameOutcome::Finished { result } = game.outcome else {
+            let GameOutcome::Finished { result, .. } = game.outcome else {
                 continue;
             };
             let a_won = match (result, game.variant_a_is_white) {
@@ -474,6 +578,13 @@ pub struct ExperimentStats {
     pub games_per_hour: Option<f64>,
     pub variant_a_search: ExperimentSearchStats,
     pub variant_b_search: ExperimentSearchStats,
+    /// How many settled games ended by a clock flag (`FinishReason::
+    /// Timeout`) rather than a real chess result or an abort -- the
+    /// first slice of the "aggregate timeouts across an experiment"
+    /// telemetry the module docs describe. Meaningful only for a
+    /// `TimeControl::Fischer` experiment; always `0` for `MoveTime`,
+    /// which has no clock to flag on.
+    pub timeouts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -496,6 +607,72 @@ pub struct ExperimentSearchStats {
     pub delta_attempts: u64,
     pub delta_pruned: u64,
     pub delta_prune_rate: Option<f64>,
+    /// Aggregated `bee-tm` telemetry (see `bee_engine::search::
+    /// TimeManagementTelemetry`'s docs) across every search that
+    /// produced one -- `None` if none did (a `TimeControl::MoveTime`
+    /// experiment, an older engine build, a non-Bee engine, or simply
+    /// no games having settled yet). A distinct, optional capability
+    /// from the generic depth/nodes/NPS stats above, not folded into
+    /// them -- see this field's own type's docs.
+    pub time_management: Option<TimeManagementStats>,
+}
+
+/// Aggregated time-management telemetry for one variant across an
+/// experiment's settled games -- see `TimeManagementTotals`, the raw
+/// accumulator this is derived from, and `bee_engine::search::
+/// TimeManagementTelemetry`'s docs for what each underlying field
+/// means on a single search. `total_aborted_ms`/`max_aborted_ms`/
+/// `searches_with_aborted_iteration` are deliberately the most
+/// prominent fields here: an average alone can hide the exact problem
+/// worth knowing about (a search that *usually* wastes nothing but
+/// *occasionally* burns hundreds of milliseconds on a discarded
+/// iteration) -- this is the evidence a predictive time policy (only
+/// start a depth if it can plausibly finish) would need to justify
+/// itself against `TimePolicy::Baseline`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TimeManagementStats {
+    /// How many `go`s produced a `bee-tm` line at all -- the
+    /// denominator for every average below, and worth reporting on its
+    /// own since it's possible for only some of an experiment's
+    /// searches to have clock-based telemetry (e.g. a book hit or a
+    /// forced-fallback move never allocates a real budget to report on).
+    pub searches_with_telemetry: u64,
+    pub avg_soft_ms: f64,
+    pub avg_hard_ms: f64,
+    pub total_aborted_ms: u64,
+    pub avg_aborted_ms: f64,
+    pub max_aborted_ms: u64,
+    /// How many searches had a nonzero `aborted_ms` at all -- distinct
+    /// from `avg_aborted_ms`, which a handful of expensive outliers
+    /// among many zero-waste searches can make look deceptively small.
+    pub searches_with_aborted_iteration: u64,
+    pub avg_best_move_changes: f64,
+    /// `None` if no search reported a `score_delta_cp` at all (every
+    /// sample only ever completed a single depth) -- see
+    /// `TimeManagementTelemetry::score_delta_cp`'s own docs on why that
+    /// field itself is optional per-search.
+    pub avg_score_delta_cp: Option<f64>,
+}
+
+impl From<TimeManagementTotals> for Option<TimeManagementStats> {
+    fn from(t: TimeManagementTotals) -> Self {
+        if t.samples == 0 {
+            return None;
+        }
+        let per_sample = |value: u64| value as f64 / t.samples as f64;
+        Some(TimeManagementStats {
+            searches_with_telemetry: t.samples,
+            avg_soft_ms: per_sample(t.soft_ms_sum),
+            avg_hard_ms: per_sample(t.hard_ms_sum),
+            total_aborted_ms: t.aborted_ms_sum,
+            avg_aborted_ms: per_sample(t.aborted_ms_sum),
+            max_aborted_ms: t.max_aborted_ms,
+            searches_with_aborted_iteration: t.searches_with_aborted_iteration,
+            avg_best_move_changes: per_sample(t.best_move_changes_sum),
+            avg_score_delta_cp: (t.score_delta_cp_samples > 0)
+                .then(|| t.score_delta_cp_sum as f64 / t.score_delta_cp_samples as f64),
+        })
+    }
 }
 
 impl From<SearchTotals> for ExperimentSearchStats {
@@ -523,6 +700,7 @@ impl From<SearchTotals> for ExperimentSearchStats {
             delta_pruned: t.delta_pruned,
             delta_prune_rate: (t.delta_attempts > 0)
                 .then(|| t.delta_pruned as f64 / t.delta_attempts as f64),
+            time_management: t.time_management.into(),
         }
     }
 }
@@ -564,6 +742,19 @@ impl ExperimentStats {
             search_b.add(game.search_b);
         }
 
+        let timeouts = settled
+            .iter()
+            .filter(|g| {
+                matches!(
+                    g.outcome,
+                    GameOutcome::Finished {
+                        reason: FinishReason::Timeout,
+                        ..
+                    }
+                )
+            })
+            .count() as u32;
+
         ExperimentStats {
             avg_game_duration_ms,
             avg_plies,
@@ -571,6 +762,7 @@ impl ExperimentStats {
             games_per_hour,
             variant_a_search: search_a.into(),
             variant_b_search: search_b.into(),
+            timeouts,
         }
     }
 }
@@ -831,7 +1023,7 @@ async fn run_experiment_game(
 
     let white_info = engine_participant_info(white);
     let black_info = engine_participant_info(black);
-    let snapshot = store.create_for_experiment(white_info, black_info, id);
+    let snapshot = store.create_for_experiment(white_info, black_info, spec.time_control, id);
     experiments.record_game_started(id, snapshot.id, variant_a_is_white);
 
     for &mv in opening_moves_for_game(game_index, opening_seed(id)) {
@@ -848,7 +1040,7 @@ async fn run_experiment_game(
         white: Some(white.config.clone()),
         black: Some(black.config.clone()),
     };
-    crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.move_time_ms).await;
+    crate::game::run_engine_loop(store.clone(), snapshot.id, slots, spec.time_control).await;
 
     // `run_engine_loop` only returns once the game reached a
     // terminal status (Finished or Aborted) -- see its own docs --
@@ -865,7 +1057,7 @@ async fn run_experiment_game(
         };
         experiments.record_game_search(id, snapshot.id, search_a, search_b);
         let outcome = match final_snapshot.status {
-            GameStatus::Finished { result } => GameOutcome::Finished { result },
+            GameStatus::Finished { result, reason } => GameOutcome::Finished { result, reason },
             GameStatus::Aborted { .. } => GameOutcome::Aborted,
             GameStatus::Running => {
                 unreachable!("run_engine_loop only returns once the game is no longer Running")
@@ -887,7 +1079,19 @@ fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
         } else {
             1
         };
-        if entry.line.starts_with("info ") {
+        if let Some(payload) = entry.line.strip_prefix("info string bee-tm ") {
+            // Attaches to the same pending search as the `info depth`
+            // lines above it and the `bestmove` that follows -- same
+            // "accumulate into `pending[side]`, flush on `bestmove`"
+            // shape, so a `bee-tm` line is naturally paired with the
+            // right move even though it's a separate log entry. A
+            // malformed/unparseable payload contributes nothing (see
+            // `TimeManagementTotals::parse`'s docs) rather than
+            // corrupting this move's other search stats.
+            if let Some(time_management) = TimeManagementTotals::parse(payload) {
+                pending[side].time_management = time_management;
+            }
+        } else if entry.line.starts_with("info ") {
             let tokens: Vec<&str> = entry.line.split_whitespace().collect();
             // `info string ...` is free-form diagnostic text, not structured
             // search telemetry. It may legitimately contain words such as
@@ -1024,7 +1228,7 @@ mod tests {
             },
             requested_games,
             concurrency: 2,
-            move_time_ms: 5,
+            time_control: TimeControl::fixed_move_time(5),
         }
     }
 
@@ -1107,6 +1311,149 @@ mod tests {
     }
 
     #[test]
+    fn time_management_totals_parse_reads_every_field() {
+        let parsed = TimeManagementTotals::parse(
+            "v=1 soft_ms=164 hard_ms=492 completed_depth=6 aborted_ms=354 best_move_changes=2 score_delta_cp=-12",
+        )
+        .expect("well-formed payload should parse");
+
+        assert_eq!(parsed.samples, 1);
+        assert_eq!(parsed.soft_ms_sum, 164);
+        assert_eq!(parsed.hard_ms_sum, 492);
+        assert_eq!(parsed.aborted_ms_sum, 354);
+        assert_eq!(parsed.max_aborted_ms, 354);
+        assert_eq!(parsed.searches_with_aborted_iteration, 1);
+        assert_eq!(parsed.best_move_changes_sum, 2);
+        assert_eq!(parsed.score_delta_cp_sum, -12);
+        assert_eq!(parsed.score_delta_cp_samples, 1);
+    }
+
+    #[test]
+    fn time_management_totals_parse_treats_zero_aborted_ms_as_no_aborted_iteration() {
+        let parsed = TimeManagementTotals::parse(
+            "v=1 soft_ms=100 hard_ms=300 completed_depth=5 aborted_ms=0 best_move_changes=0",
+        )
+        .expect("well-formed payload should parse");
+
+        assert_eq!(parsed.aborted_ms_sum, 0);
+        assert_eq!(parsed.searches_with_aborted_iteration, 0);
+        assert_eq!(
+            parsed.score_delta_cp_samples, 0,
+            "score_delta_cp is optional and was omitted here"
+        );
+    }
+
+    #[test]
+    fn time_management_totals_parse_ignores_unknown_fields() {
+        // Forward compatibility: a future engine version might add a
+        // new key (e.g. `policy=Predictive`) -- this parser must not
+        // choke on it.
+        let parsed = TimeManagementTotals::parse(
+            "v=1 policy=Predictive soft_ms=100 hard_ms=300 completed_depth=5 aborted_ms=0 best_move_changes=0",
+        );
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn time_management_totals_parse_rejects_missing_or_wrong_version() {
+        assert!(TimeManagementTotals::parse(
+            "soft_ms=100 hard_ms=300 aborted_ms=0 best_move_changes=0"
+        )
+        .is_none());
+        assert!(
+            TimeManagementTotals::parse(
+                "v=2 soft_ms=100 hard_ms=300 aborted_ms=0 best_move_changes=0"
+            )
+            .is_none(),
+            "an unrecognized version must not be trusted, even if every known field is present"
+        );
+    }
+
+    #[test]
+    fn time_management_totals_parse_rejects_a_missing_required_field() {
+        assert!(
+            TimeManagementTotals::parse("v=1 soft_ms=100 hard_ms=300 best_move_changes=0").is_none(),
+            "missing aborted_ms (a required field, unlike score_delta_cp) invalidates the whole record"
+        );
+    }
+
+    #[test]
+    fn summarize_searches_attaches_bee_tm_to_the_move_it_preceded() {
+        let received = |color, line: &str| UciLogEntry {
+            color,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received(UciLogColor::White, "info depth 6 nodes 300 time 10 score cp 30"),
+            received(
+                UciLogColor::White,
+                "info string bee-tm v=1 soft_ms=164 hard_ms=492 completed_depth=6 aborted_ms=354 best_move_changes=0",
+            ),
+            received(UciLogColor::White, "bestmove e2e4"),
+            // A second move with no bee-tm line at all (e.g. a
+            // fixed-depth go) -- must not carry over the previous
+            // move's telemetry.
+            received(UciLogColor::White, "info depth 4 nodes 100 time 5 score cp 5"),
+            received(UciLogColor::White, "bestmove g1f3"),
+        ];
+
+        let (white, _black) = summarize_searches(&log);
+
+        assert_eq!(white.searches, 2);
+        let stats: Option<TimeManagementStats> = white.time_management.into();
+        let stats = stats.expect("one of the two searches had bee-tm telemetry");
+        assert_eq!(
+            stats.searches_with_telemetry, 1,
+            "only the first move had a bee-tm line"
+        );
+        assert_eq!(stats.avg_soft_ms, 164.0);
+        assert_eq!(stats.avg_hard_ms, 492.0);
+        assert_eq!(stats.total_aborted_ms, 354);
+        assert_eq!(stats.max_aborted_ms, 354);
+        assert_eq!(stats.searches_with_aborted_iteration, 1);
+    }
+
+    #[test]
+    fn summarize_searches_ignores_a_malformed_bee_tm_line_without_affecting_other_stats() {
+        let received = |color, line: &str| UciLogEntry {
+            color,
+            direction: UciLogDirection::Received,
+            line: line.to_string(),
+        };
+        let log = vec![
+            received(
+                UciLogColor::White,
+                "info depth 6 nodes 300 time 10 score cp 30",
+            ),
+            received(
+                UciLogColor::White,
+                "info string bee-tm garbage not a real payload",
+            ),
+            received(UciLogColor::White, "bestmove e2e4"),
+        ];
+
+        let (white, _black) = summarize_searches(&log);
+
+        assert_eq!(
+            white.searches, 1,
+            "the move's ordinary stats must still be recorded"
+        );
+        assert_eq!(white.nodes, 300);
+        let stats: Option<TimeManagementStats> = white.time_management.into();
+        assert_eq!(
+            stats, None,
+            "a malformed bee-tm payload must not be trusted at all"
+        );
+    }
+
+    #[test]
+    fn experiment_search_stats_time_management_is_none_without_any_bee_tm_lines() {
+        let stats = ExperimentSearchStats::from(SearchTotals::default());
+        assert_eq!(stats.time_management, None);
+    }
+
+    #[test]
     fn search_summary_ignores_free_form_info_string_diagnostics() {
         let received = |line: &str| UciLogEntry {
             color: UciLogColor::White,
@@ -1128,7 +1475,11 @@ mod tests {
     #[test]
     fn every_built_in_opening_is_legal_and_non_terminal() {
         for opening in OPENING_SUITE {
-            let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+            let mut game = Game::new(
+                ParticipantInfo::Human,
+                ParticipantInfo::Human,
+                TimeControl::fixed_move_time(200),
+            );
             for &mv in *opening {
                 game.apply_move(mv).unwrap_or_else(|err| {
                     panic!("illegal move {mv} in opening {opening:?}: {err:?}")
@@ -1204,6 +1555,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(30),
         );
@@ -1260,6 +1612,7 @@ mod tests {
             a,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(40),
         );
@@ -1269,6 +1622,7 @@ mod tests {
             b,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(80),
         );
@@ -1294,6 +1648,7 @@ mod tests {
             finished,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(50),
         );
@@ -1321,6 +1676,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(10),
         );
@@ -1388,6 +1744,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(42),
         );
@@ -1395,7 +1752,8 @@ mod tests {
         assert_eq!(
             after.games[0].outcome,
             GameOutcome::Finished {
-                result: GameResult::WhiteWins
+                result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             }
         );
         assert_eq!(after.games[0].plies, Some(42));
@@ -1419,6 +1777,7 @@ mod tests {
             game_a_white,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(30),
         );
@@ -1429,6 +1788,7 @@ mod tests {
             game_a_black,
             GameOutcome::Finished {
                 result: GameResult::WhiteWins,
+                reason: FinishReason::Checkmate,
             },
             Some(50),
         );
@@ -1457,6 +1817,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(80),
         );
@@ -1509,6 +1870,7 @@ mod tests {
             game_id,
             GameOutcome::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Checkmate,
             },
             Some(60),
         );

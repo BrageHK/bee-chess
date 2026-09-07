@@ -24,12 +24,26 @@ const LAB_WS_BASE_URL = `ws://localhost:${LAB_PORT}`;
 
 export type Color = "white" | "black";
 
+/** Mirrors `game::FinishReason`'s JSON shape exactly -- *why* a
+ * `Finished` game ended, alongside *what* the result was. A clock flag
+ * (`"timeout"`) is a legitimate `Finished` reason, not an `Aborted`
+ * one -- see `game::GameStatus`'s docs. */
+export type FinishReason = "checkmate" | "stalemate" | "repetition" | "fifty_move_rule" | "timeout";
+
 /** Mirrors `game::GameStatus`'s JSON shape exactly (`#[serde(flatten)]`
  * puts `result`/`reason` as siblings of `status`, not nested). */
 export type GameStatus =
   | { status: "running" }
-  | { status: "finished"; result: "white_wins" | "black_wins" | "draw" }
+  | { status: "finished"; result: "white_wins" | "black_wins" | "draw"; reason: FinishReason }
   | { status: "aborted"; reason: string };
+
+/** Mirrors `game::TimeControl`'s JSON shape exactly -- a game's clock
+ * policy. `MoveTime` remains the simplest, deterministic default for
+ * development/benchmarks; `Fischer` is a real per-side clock with
+ * increment, the shape a real Lichess game uses. */
+export type TimeControl =
+  | { type: "move_time"; move_time_ms: number }
+  | { type: "fischer"; initial_ms: number; increment_ms: number };
 
 /** Mirrors `game::ParticipantInfo`'s JSON shape exactly -- who plays
  * one side of a game, and enough to reconstruct that side's UI (is it
@@ -55,6 +69,17 @@ export type GameSnapshot = {
    * reached (the dashboard, an experiment's own game list, or a
    * bookmarked link). */
   experiment_id: string | null;
+  /** This game's clock policy -- see `TimeControl`. */
+  time_control: TimeControl;
+  /** Live remaining clock for each side, in milliseconds -- `null`
+   * for a `move_time` game (nothing to show) or a game with no clock
+   * at all. Server-authoritative: only updates when a new snapshot
+   * arrives (a move was applied, or a live `GameEvent`), never ticked
+   * down client-side -- see `lab::game::GameSnapshot`'s docs on why an
+   * animated countdown would just be a second, potentially-
+   * disagreeing clock. */
+  white_clock_ms: number | null;
+  black_clock_ms: number | null;
 } & GameStatus;
 
 /** One side's requested participant for `createGame` -- mirrors
@@ -67,6 +92,11 @@ export type ParticipantRequest =
 export interface CreateGameRequest {
   white?: ParticipantRequest;
   black?: ParticipantRequest;
+  /** Preferred over `moveTimeMs` -- see `api::CreateGameRequest`'s
+   * docs on the resolution order (`timeControl` wins if present). */
+  timeControl?: TimeControl;
+  /** Deprecated alias for `timeControl: {type: "move_time",
+   * move_time_ms: ...}`. */
   moveTimeMs?: number;
 }
 
@@ -102,6 +132,13 @@ export interface CreateExperimentRequest {
   variantB: ExperimentVariantRequest;
   games: number;
   concurrency?: number;
+  /** Both variants play under the same clock -- see `TimeControl`'s
+   * docs on why time control belongs to the experiment, not either
+   * variant. Preferred over `moveTimeMs` -- see `api::
+   * CreateExperimentRequest`'s docs on the resolution order. */
+  timeControl?: TimeControl;
+  /** Deprecated alias for `timeControl: {type: "move_time",
+   * move_time_ms: ...}`. */
   moveTimeMs?: number;
   debug?: boolean;
 }
@@ -110,7 +147,7 @@ export interface CreateExperimentRequest {
  * `#[serde(tag = "status", rename_all = "snake_case")]` enum). */
 export type GameOutcome =
   | { status: "pending" }
-  | { status: "finished"; result: "white_wins" | "black_wins" | "draw" }
+  | { status: "finished"; result: "white_wins" | "black_wins" | "draw"; reason: FinishReason }
   | { status: "aborted" };
 
 /** Mirrors `lab::experiment::ExperimentGame`'s JSON shape exactly. */
@@ -134,6 +171,10 @@ export interface ExperimentMetadata {
   opening_seed: number;
   variant_a_argv: string[];
   variant_b_argv: string[];
+  /** Both variants' shared clock policy -- part of reproducibility
+   * provenance, same reasoning as the argv fields: a score isn't
+   * comparable across different time controls. */
+  time_control: TimeControl;
   started_at: string;
   finished_at: string | null;
 }
@@ -148,6 +189,10 @@ export interface ExperimentStats {
   games_per_hour: number | null;
   variant_a_search: ExperimentSearchStats;
   variant_b_search: ExperimentSearchStats;
+  /** How many settled games ended by a clock flag rather than a real
+   * chess result or an abort. Meaningful only for a `fischer`
+   * experiment; always `0` for `move_time`. */
+  timeouts: number;
 }
 
 export interface ExperimentSearchStats {
@@ -169,6 +214,28 @@ export interface ExperimentSearchStats {
   delta_attempts: number;
   delta_pruned: number;
   delta_prune_rate: number | null;
+  /** Aggregated `bee-tm` time-management telemetry (see
+   * `bee_engine::search::TimeManagementTelemetry`), or `null` if no
+   * search produced one (a `move_time` experiment, an older engine
+   * build, or a non-Bee engine). */
+  time_management: TimeManagementStats | null;
+}
+
+/** Mirrors `lab::experiment::TimeManagementStats`'s JSON shape
+ * exactly -- see that Rust type's docs for what each field means and
+ * why `total_aborted_ms`/`max_aborted_ms`/
+ * `searches_with_aborted_iteration` are the most load-bearing ones: an
+ * average alone can hide an occasional expensive discarded iteration. */
+export interface TimeManagementStats {
+  searches_with_telemetry: number;
+  avg_soft_ms: number;
+  avg_hard_ms: number;
+  total_aborted_ms: number;
+  avg_aborted_ms: number;
+  max_aborted_ms: number;
+  searches_with_aborted_iteration: number;
+  avg_best_move_changes: number;
+  avg_score_delta_cp: number | null;
 }
 
 /** Mirrors `lab::experiment::ExperimentSnapshot`'s JSON shape exactly
@@ -219,6 +286,7 @@ export async function createGame(request: CreateGameRequest = {}): Promise<GameS
   const body: Record<string, unknown> = {};
   if (request.white !== undefined) body.white = request.white;
   if (request.black !== undefined) body.black = request.black;
+  if (request.timeControl !== undefined) body.time_control = request.timeControl;
   if (request.moveTimeMs !== undefined) body.move_time_ms = request.moveTimeMs;
 
   const response = await fetch(`${LAB_BASE_URL}/api/games`, {
@@ -265,6 +333,7 @@ export async function createExperiment(request: CreateExperimentRequest): Promis
   };
   if (request.engine !== undefined) body.engine = request.engine;
   if (request.concurrency !== undefined) body.concurrency = request.concurrency;
+  if (request.timeControl !== undefined) body.time_control = request.timeControl;
   if (request.moveTimeMs !== undefined) body.move_time_ms = request.moveTimeMs;
   if (request.debug !== undefined) body.debug = request.debug;
 

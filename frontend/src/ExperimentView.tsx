@@ -166,6 +166,29 @@ export function ExperimentView({
         </PanelBody>
       </Panel>
 
+      {(snapshot.stats.variant_a_search.time_management || snapshot.stats.variant_b_search.time_management) && (
+        <Panel className="w-full overflow-hidden">
+          <PanelHeader>Time management</PanelHeader>
+          <PanelBody className="overflow-x-auto p-0">
+            <table className="w-full text-right font-mono text-xs">
+              <thead className="text-subtle">
+                <tr>
+                  <th className="px-3 py-2 text-left font-normal">Variant</th>
+                  <th className="px-3 py-2 font-normal">Soft avg</th>
+                  <th className="px-3 py-2 font-normal">Hard avg</th>
+                  <th className="px-3 py-2 font-normal">Aborted (total / max)</th>
+                  <th className="px-3 py-2 font-normal">BM changes avg</th>
+                </tr>
+              </thead>
+              <tbody>
+                <TimeManagementRow label={snapshot.label_a} stats={snapshot.stats.variant_a_search.time_management} />
+                <TimeManagementRow label={snapshot.label_b} stats={snapshot.stats.variant_b_search.time_management} />
+              </tbody>
+            </table>
+          </PanelBody>
+        </Panel>
+      )}
+
       <Panel className="w-full">
         <PanelHeader>Stats</PanelHeader>
         <PanelBody className="grid grid-cols-4 gap-2 text-center font-mono text-sm">
@@ -252,6 +275,37 @@ function AdvancedMetricTable({
         </tbody>
       </table>
     </section>
+  );
+}
+
+/** One row of `TimeManagementStats` -- see that type's docs. `stats`
+ * is only ever `null` here for a variant with zero `bee-tm` samples
+ * (e.g. a book-only game); the panel itself is hidden entirely (see
+ * the caller) unless at least one variant has real data. */
+function TimeManagementRow({ label, stats }: { label: string; stats: ExperimentSnapshot["stats"]["variant_a_search"]["time_management"] }) {
+  if (!stats) {
+    return (
+      <tr className="border-t border-border">
+        <th className="px-3 py-2 text-left font-sans font-medium">{label}</th>
+        <td className="px-3 py-2 text-subtle" colSpan={4}>
+          no bee-tm telemetry
+        </td>
+      </tr>
+    );
+  }
+  return (
+    <tr className="border-t border-border">
+      <th className="px-3 py-2 text-left font-sans font-medium">{label}</th>
+      <td className="px-3 py-2">{stats.avg_soft_ms.toFixed(0)} ms</td>
+      <td className="px-3 py-2">{stats.avg_hard_ms.toFixed(0)} ms</td>
+      <td className="px-3 py-2">
+        {stats.total_aborted_ms.toFixed(0)} ms / {stats.max_aborted_ms.toFixed(0)} ms
+        {stats.searches_with_aborted_iteration > 0 && (
+          <span className="text-subtle"> ({stats.searches_with_aborted_iteration}x)</span>
+        )}
+      </td>
+      <td className="px-3 py-2">{stats.avg_best_move_changes.toFixed(2)}</td>
+    </tr>
   );
 }
 

@@ -46,11 +46,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bee_chess_core::{Color, PieceKind, Position, Square};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::uci_process::{UciDirection, UciProcess};
+use crate::uci_process::{GoSpec, UciDirection, UciProcess};
 
 /// How many events a slow (or absent) subscriber can lag behind before
 /// the broadcast channel starts dropping its oldest ones. Deliberately
@@ -110,8 +110,12 @@ pub enum GameEvent {
     /// The authoritative snapshot changed -- a move was applied
     /// (human or engine) or the game reached a terminal status.
     /// Carries the new snapshot directly so a subscriber doesn't need
-    /// a separate `GET` just to find out what changed.
-    Updated(GameSnapshot),
+    /// a separate `GET` just to find out what changed. Boxed since
+    /// `GameSnapshot` is now large enough (moves, UCI log, clocks,
+    /// ...) to make `Uci`, the other variant, needlessly bulky by
+    /// comparison -- every `GameEvent` would otherwise be sized for
+    /// the biggest variant regardless of which one it actually is.
+    Updated(Box<GameSnapshot>),
 }
 
 /// Opaque game identifier, serialized as a plain string over the API.
@@ -142,12 +146,23 @@ impl std::str::FromStr for GameId {
 /// to explain themselves in a snapshot without the client needing to
 /// infer anything from the position alone (e.g. "no legal moves" is
 /// ambiguous between checkmate and stalemate; `GameResult` isn't).
+///
+/// A clock flag (a side running out of time under a `TimeControl::
+/// Fischer` game -- see `GameClock`) is a `Finished` result with
+/// `reason: FinishReason::Timeout`, **not** `Aborted`: running out of
+/// the clock is a normal, legitimate way for a real chess game to end,
+/// exactly like checkmate or a claimed draw -- not an infrastructure
+/// failure. `Aborted` stays reserved for what its own docs already
+/// describe: an engine crashing, replying with something illegal, or
+/// some other condition that stopped the game short of a real chess
+/// result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GameStatus {
     Running,
     Finished {
         result: GameResult,
+        reason: FinishReason,
     },
     /// An engine failed, or some other condition stopped the game
     /// short of a real chess result. Distinct from `Finished` so a
@@ -164,6 +179,128 @@ pub enum GameResult {
     WhiteWins,
     BlackWins,
     Draw,
+}
+
+/// *Why* a `Finished` game ended, alongside *what* the result was
+/// (`GameResult`) -- e.g. `0-1` alone doesn't say whether that was
+/// checkmate or a flag fall, and an experiment's stats eventually want
+/// to distinguish those (see the module docs' timeout-tracking plan).
+/// One canonical reason field rather than a one-off `Timeout` bool
+/// bolted on next to it, so a future reason (resignation, adjudication)
+/// has an obvious place to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Checkmate,
+    Stalemate,
+    /// Draw by threefold (or more) repetition -- see
+    /// `Game::update_status_after_move`'s repetition check.
+    Repetition,
+    /// Draw by the fifty-move rule -- see
+    /// `Game::update_status_after_move`'s halfmove-clock check.
+    FiftyMoveRule,
+    /// A side's `GameClock` reached zero before it moved -- see
+    /// `GameClock::record_move`. The *other* side wins.
+    Timeout,
+}
+
+/// How much time an engine-driven game's sides get to think, given at
+/// creation and shared by both sides -- see the module docs. Fixed
+/// `MoveTime` remains supported (and is still the default) because a
+/// deterministic per-move budget, independent of any clock, is genuinely
+/// simpler for development and benchmarking; `Fischer` is what actually
+/// exercises `bee-engine`'s clock-aware `TimeManager`
+/// (`Engine::search_with_clock`) the way a real Lichess game would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimeControl {
+    MoveTime { move_time_ms: u64 },
+    Fischer { initial_ms: u64, increment_ms: u64 },
+}
+
+impl TimeControl {
+    /// A fixed `move_time_ms` budget per move, matching the pre-clock
+    /// default this crate always had -- named so `Default` reads
+    /// clearly as "no clock, just movetime" at call sites, without a
+    /// magic-looking bare `TimeControl::MoveTime { .. }` literal
+    /// everywhere the default is needed.
+    pub fn fixed_move_time(move_time_ms: u64) -> Self {
+        TimeControl::MoveTime { move_time_ms }
+    }
+}
+
+/// Authoritative per-game clocks for a `TimeControl::Fischer` game --
+/// Lab, not either engine, owns these, exactly like it owns the
+/// position itself; a `go wtime/btime/winc/binc` sent to an engine is
+/// this state turned into UCI text, never the other way around. `None`
+/// for a `TimeControl::MoveTime` game, which has no clock to track.
+///
+/// Deliberately holds no wall-clock source of its own (no
+/// `Instant::now()` calls inside this type) -- `record_move` takes an
+/// already-measured `elapsed` instead of measuring it itself, so the
+/// clock arithmetic is pure and can be unit tested with made-up
+/// durations rather than real `sleep`s (see this module's tests).
+/// `run_engine_loop` is what actually measures `Instant::now()` around
+/// an engine's `go`, since only it knows when a request truly started
+/// and ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameClock {
+    white_remaining: Duration,
+    black_remaining: Duration,
+    increment: Duration,
+}
+
+/// The outcome of one side's clock after their move -- either they
+/// still have time left (and it's been updated: `elapsed` subtracted,
+/// `increment` added), or they didn't (a flag fall, per
+/// `GameClock::record_move`'s docs on ordering: increment is never
+/// awarded once a side has already flagged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockOutcome {
+    Ok,
+    Flagged,
+}
+
+impl GameClock {
+    /// Starts a new clock at `initial`/`increment` for both sides, per
+    /// `TimeControl::Fischer`'s fields.
+    pub fn new(initial: Duration, increment: Duration) -> Self {
+        GameClock {
+            white_remaining: initial,
+            black_remaining: initial,
+            increment,
+        }
+    }
+
+    pub fn remaining(&self, color: Color) -> Duration {
+        match color {
+            Color::White => self.white_remaining,
+            Color::Black => self.black_remaining,
+        }
+    }
+
+    /// Records that `color` took `elapsed` wall-clock time to produce
+    /// their move. If `elapsed >= remaining` (before this call), that
+    /// side has flagged: `remaining` is clamped to zero (never awarding
+    /// the increment on top of a flag fall -- see the module docs'
+    /// explicit "do not award increment after the player has already
+    /// flagged" requirement) and `ClockOutcome::Flagged` is returned so
+    /// the caller can end the game via `Game::finish_by_timeout`.
+    /// Otherwise, `elapsed` is subtracted and `increment` is added, and
+    /// `ClockOutcome::Ok` is returned.
+    #[must_use]
+    pub fn record_move(&mut self, color: Color, elapsed: Duration) -> ClockOutcome {
+        let remaining = match color {
+            Color::White => &mut self.white_remaining,
+            Color::Black => &mut self.black_remaining,
+        };
+        if elapsed >= *remaining {
+            *remaining = Duration::ZERO;
+            return ClockOutcome::Flagged;
+        }
+        *remaining = *remaining - elapsed + self.increment;
+        ClockOutcome::Ok
+    }
 }
 
 /// Which kind of participant plays one side, and enough about it for
@@ -214,6 +351,14 @@ pub struct Game {
     /// random `Uuid::new_v4`, so it carries no creation-order
     /// information of its own to sort by instead.
     created_seq: u64,
+    /// This game's time control, and (for `Fischer`) its live clocks.
+    /// `None` `clock` means either `TimeControl::MoveTime` (nothing to
+    /// track) or a game with no time control recorded at all (e.g. a
+    /// human-vs-human game created before clocks existed, or one with
+    /// no engine side). See `GameClock`'s docs -- Lab, not either
+    /// engine, owns this state.
+    time_control: TimeControl,
+    clock: Option<GameClock>,
 }
 
 /// Source for `Game::created_seq` -- process-lifetime only (like
@@ -239,10 +384,23 @@ pub enum ApplyMoveError {
 impl Game {
     /// Starts a new game from the standard starting position, with
     /// `white`/`black` recorded as this game's participants (see
-    /// `ParticipantInfo`).
-    pub fn new(white: ParticipantInfo, black: ParticipantInfo) -> Self {
+    /// `ParticipantInfo`) and `time_control` as its clock policy (see
+    /// `TimeControl`) -- a `Fischer` control starts `clock` running
+    /// immediately at its `initial_ms`; `MoveTime` has no clock to
+    /// track at all.
+    pub fn new(white: ParticipantInfo, black: ParticipantInfo, time_control: TimeControl) -> Self {
         let position = Position::startpos();
         let position_history = vec![position.zobrist_hash()];
+        let clock = match time_control {
+            TimeControl::MoveTime { .. } => None,
+            TimeControl::Fischer {
+                initial_ms,
+                increment_ms,
+            } => Some(GameClock::new(
+                Duration::from_millis(initial_ms),
+                Duration::from_millis(increment_ms),
+            )),
+        };
         Game {
             id: GameId::new(),
             position,
@@ -254,6 +412,8 @@ impl Game {
             black_participant: black,
             experiment_id: None,
             created_seq: next_game_seq(),
+            time_control,
+            clock,
         }
     }
 
@@ -261,8 +421,8 @@ impl Game {
     /// terminal-status handling (checkmate/stalemate) can be tested
     /// directly against a hand-picked FEN instead of needing a real
     /// legal move sequence that happens to reach one. Participants
-    /// default to human/human -- irrelevant to what this constructor
-    /// exists to test.
+    /// default to human/human and time control to a nominal fixed
+    /// movetime -- irrelevant to what this constructor exists to test.
     #[cfg(test)]
     fn from_position(position: Position) -> Self {
         let position_history = vec![position.zobrist_hash()];
@@ -277,6 +437,8 @@ impl Game {
             black_participant: ParticipantInfo::Human,
             experiment_id: None,
             created_seq: next_game_seq(),
+            time_control: TimeControl::fixed_move_time(200),
+            clock: None,
         };
         game.update_status_after_move();
         game
@@ -313,6 +475,38 @@ impl Game {
         self.position.side_to_move()
     }
 
+    pub fn time_control(&self) -> TimeControl {
+        self.time_control
+    }
+
+    /// Current clocks, if this game has any -- see `clock`'s docs.
+    pub fn clock(&self) -> Option<GameClock> {
+        self.clock
+    }
+
+    /// Records that `color` (who must already be the side that just
+    /// moved) took `elapsed` to produce their last move, updating
+    /// `clock` via `GameClock::record_move` and, if that flagged them,
+    /// ending the game via `finish_by_timeout` right here (so this
+    /// method alone is a complete, correct thing to call -- a caller
+    /// never needs to separately check the outcome and remember to
+    /// call `finish_by_timeout` itself). A no-op (returns `Ok`, same as
+    /// an unclocked game) if this game has no clock at all --
+    /// `run_engine_loop` calls this unconditionally after every
+    /// engine-driven move regardless of `time_control`, rather than
+    /// branching on it itself.
+    #[must_use]
+    pub fn record_move_time(&mut self, color: Color, elapsed: Duration) -> ClockOutcome {
+        let outcome = match &mut self.clock {
+            Some(clock) => clock.record_move(color, elapsed),
+            None => ClockOutcome::Ok,
+        };
+        if outcome == ClockOutcome::Flagged {
+            self.finish_by_timeout(color);
+        }
+        outcome
+    }
+
     /// Marks the game aborted with `reason` -- called when the engine
     /// loop can't continue (a process failed to spawn, died mid-game,
     /// or replied with something that isn't actually legal here despite
@@ -325,6 +519,23 @@ impl Game {
         if self.status == GameStatus::Running {
             self.status = GameStatus::Aborted {
                 reason: reason.into(),
+            };
+        }
+    }
+
+    /// Marks the game finished because `flagged` ran out of its clock
+    /// (see `GameClock::record_move`) -- the *other* side wins. A
+    /// legitimate chess result, not an error; see `GameStatus`'s docs
+    /// on why this is `Finished`, not `Aborted`. A no-op if the game
+    /// already has a terminal status, for the same reason `abort` is.
+    pub fn finish_by_timeout(&mut self, flagged: Color) {
+        if self.status == GameStatus::Running {
+            self.status = GameStatus::Finished {
+                result: match flagged {
+                    Color::White => GameResult::BlackWins,
+                    Color::Black => GameResult::WhiteWins,
+                },
+                reason: FinishReason::Timeout,
             };
         }
     }
@@ -363,8 +574,9 @@ impl Game {
 
     fn update_status_after_move(&mut self) {
         if self.position.generate_legal_moves().is_empty() {
+            let in_check = self.position.in_check();
             self.status = GameStatus::Finished {
-                result: if self.position.in_check() {
+                result: if in_check {
                     // The side to move is checkmated -- the *other* side won.
                     if self.position.side_to_move() == bee_chess_core::Color::White {
                         GameResult::BlackWins
@@ -373,6 +585,11 @@ impl Game {
                     }
                 } else {
                     GameResult::Draw // stalemate
+                },
+                reason: if in_check {
+                    FinishReason::Checkmate
+                } else {
+                    FinishReason::Stalemate
                 },
             };
             return;
@@ -384,9 +601,15 @@ impl Game {
             .iter()
             .filter(|&&hash| hash == current_hash)
             .count();
-        if self.position.halfmove_clock() >= 100 || repetitions >= 3 {
+        if repetitions >= 3 {
             self.status = GameStatus::Finished {
                 result: GameResult::Draw,
+                reason: FinishReason::Repetition,
+            };
+        } else if self.position.halfmove_clock() >= 100 {
+            self.status = GameStatus::Finished {
+                result: GameResult::Draw,
+                reason: FinishReason::FiftyMoveRule,
             };
         }
     }
@@ -447,12 +670,27 @@ pub struct GameSnapshot {
     /// `POST /api/games` game. See `Game::experiment_id`/
     /// `GameStore::create_for_experiment`.
     pub experiment_id: Option<crate::experiment::ExperimentId>,
+    /// This game's clock policy -- see `TimeControl`. Included (rather
+    /// than left implicit) so a client can tell a `MoveTime` game from
+    /// a `Fischer` one, e.g. to decide whether `white_clock_ms`/
+    /// `black_clock_ms` mean anything to render at all.
+    pub time_control: TimeControl,
+    /// Live remaining clock for each side, in milliseconds, if this
+    /// game has a `Fischer` clock -- `None` for `MoveTime` (nothing to
+    /// show) or a game with no clock at all. Server-authoritative:
+    /// only updates when a new snapshot arrives (a move was applied, or
+    /// a `GameEvent::Updated`), never ticked down live in the browser
+    /// -- see the module docs on why an animated client-side countdown
+    /// would just be a second, potentially-disagreeing clock.
+    pub white_clock_ms: Option<u64>,
+    pub black_clock_ms: Option<u64>,
     #[serde(flatten)]
     pub status: GameStatus,
 }
 
 impl From<&Game> for GameSnapshot {
     fn from(game: &Game) -> Self {
+        let clock = game.clock();
         GameSnapshot {
             id: game.id,
             fen: game.fen(),
@@ -461,6 +699,9 @@ impl From<&Game> for GameSnapshot {
             white: game.white_participant().clone(),
             black: game.black_participant().clone(),
             experiment_id: game.experiment_id(),
+            time_control: game.time_control(),
+            white_clock_ms: clock.map(|c| c.remaining(Color::White).as_millis() as u64),
+            black_clock_ms: clock.map(|c| c.remaining(Color::Black).as_millis() as u64),
             status: game.status().clone(),
         }
     }
@@ -489,9 +730,15 @@ impl GameStore {
     }
 
     /// Creates a new game with `white`/`black` as its participants
-    /// (see `ParticipantInfo`) and returns its snapshot.
-    pub fn create(&self, white: ParticipantInfo, black: ParticipantInfo) -> GameSnapshot {
-        self.insert(Game::new(white, black))
+    /// (see `ParticipantInfo`) and `time_control` as its clock policy,
+    /// and returns its snapshot.
+    pub fn create(
+        &self,
+        white: ParticipantInfo,
+        black: ParticipantInfo,
+        time_control: TimeControl,
+    ) -> GameSnapshot {
+        self.insert(Game::new(white, black, time_control))
     }
 
     /// Same as `create`, but records `experiment_id` as the game's
@@ -502,9 +749,10 @@ impl GameStore {
         &self,
         white: ParticipantInfo,
         black: ParticipantInfo,
+        time_control: TimeControl,
         experiment_id: crate::experiment::ExperimentId,
     ) -> GameSnapshot {
-        let mut game = Game::new(white, black);
+        let mut game = Game::new(white, black, time_control);
         game.experiment_id = Some(experiment_id);
         self.insert(game)
     }
@@ -582,8 +830,33 @@ impl GameStore {
             game.apply_move(uci).map_err(Some)?;
             GameSnapshot::from(&*game)
         };
-        self.publish(id, GameEvent::Updated(snapshot.clone()));
+        self.publish(id, GameEvent::Updated(Box::new(snapshot.clone())));
         Ok(snapshot)
+    }
+
+    /// Records that `color` took `elapsed` to move in `id`'s game (see
+    /// `Game::record_move_time`), ending the game via
+    /// `Game::finish_by_timeout` if that flagged them. Called
+    /// unconditionally by `run_engine_loop` after every engine move,
+    /// regardless of `TimeControl` -- a no-op for an unclocked
+    /// (`MoveTime`) game. Silently does nothing if the game doesn't
+    /// exist, for the same reason `abort` does. Broadcasts
+    /// `GameEvent::Updated` if the game existed (whether or not this
+    /// particular call caused a flag fall), since the clock itself is
+    /// part of the snapshot.
+    pub(crate) fn record_move_time(&self, id: GameId, color: Color, elapsed: Duration) {
+        let snapshot = {
+            let mut games = self.games.lock().expect("game store mutex poisoned");
+            let Some(game) = games.get_mut(&id) else {
+                return;
+            };
+            // `Game::record_move_time` already ends the game via
+            // `finish_by_timeout` on a flag -- nothing more to do with
+            // its `ClockOutcome` here.
+            let _ = game.record_move_time(color, elapsed);
+            GameSnapshot::from(&*game)
+        };
+        self.publish(id, GameEvent::Updated(Box::new(snapshot)));
     }
 
     /// Marks `id`'s game aborted with `reason`, if it still exists and
@@ -602,7 +875,7 @@ impl GameStore {
             game.abort(reason);
             GameSnapshot::from(&*game)
         };
-        self.publish(id, GameEvent::Updated(snapshot));
+        self.publish(id, GameEvent::Updated(Box::new(snapshot)));
     }
 
     /// Subscribes to `id`'s live event stream. Returns `None` if no
@@ -721,11 +994,23 @@ impl EngineSlots {
 }
 
 /// Drives `id`'s game to completion automatically, asking whichever
-/// engine-controlled side is on move for a `bestmove` (with a
-/// `move_time_ms` budget per move) and applying it via
+/// engine-controlled side is on move for a `bestmove` under
+/// `time_control` (see `TimeControl`) and applying it via
 /// `GameStore::apply_move` -- the same path a human's API call goes
 /// through, so there is exactly one place legality/status is decided,
 /// regardless of who's moving.
+///
+/// For `TimeControl::Fischer`, this loop is what makes Lab
+/// authoritative over the clock, exactly like it already is over the
+/// position: it measures the actual wall-clock time an engine's `go`
+/// took (`Instant::now()` immediately before and after
+/// `UciProcess::go_for_move`), and records that via
+/// `GameStore::record_move_time` -- never trusting either engine to
+/// self-report how long it took or to know when it's flagged. Bee's
+/// own `MoveOverhead`/`TimeManager` are a separate, engine-internal
+/// safety margin (see `bee_engine::search::TimeManagerConfig`'s docs);
+/// Lab's clock enforcement here doesn't depend on the engine
+/// respecting them at all.
 ///
 /// A side with no `EngineConfig` in `slots` is a human slot: the loop
 /// polls (checking back every `HUMAN_MOVE_POLL_INTERVAL`) until that
@@ -739,12 +1024,17 @@ impl EngineSlots {
 /// process per ply.
 ///
 /// Ends (returns) once the game reaches any terminal status --
-/// `Finished` (checkmate/stalemate, detected the same way 69a already
-/// did) or `Aborted` (a process failed to spawn or died mid-game, or
-/// the store says the game no longer exists at all -- e.g. this
-/// process restarted, though there's no persistence yet to make that
-/// likely in practice).
-pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, move_time_ms: u64) {
+/// `Finished` (checkmate/stalemate/timeout, detected the same way 69a
+/// already did for the first two) or `Aborted` (a process failed to
+/// spawn or died mid-game, or the store says the game no longer exists
+/// at all -- e.g. this process restarted, though there's no
+/// persistence yet to make that likely in practice).
+pub async fn run_engine_loop(
+    store: GameStore,
+    id: GameId,
+    slots: EngineSlots,
+    time_control: TimeControl,
+) {
     const HUMAN_MOVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
     let mut white_process = None;
@@ -812,7 +1102,54 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
         }
         let process = process_slot.as_mut().expect("just ensured Some above");
 
-        let mv = match process.best_move(&snapshot.moves, move_time_ms).await {
+        let go_spec = match time_control {
+            TimeControl::MoveTime { move_time_ms } => GoSpec::MoveTime {
+                budget_ms: move_time_ms,
+            },
+            TimeControl::Fischer { .. } => {
+                // `snapshot.white_clock_ms`/`black_clock_ms` are the
+                // authoritative current clocks (see `GameSnapshot`'s
+                // docs) -- a `Fischer` game always has both `Some`
+                // once created, so these `unwrap_or(0)`s are a
+                // defensive floor, not an expected path.
+                let clock = snapshot.white_clock_ms.zip(snapshot.black_clock_ms);
+                let (white_time_ms, black_time_ms) = clock.unwrap_or((0, 0));
+                let increment_ms = match time_control {
+                    TimeControl::Fischer { increment_ms, .. } => increment_ms,
+                    TimeControl::MoveTime { .. } => unreachable!(),
+                };
+                GoSpec::Clock {
+                    white_time_ms,
+                    black_time_ms,
+                    white_increment_ms: increment_ms,
+                    black_increment_ms: increment_ms,
+                }
+            }
+        };
+
+        let move_started_at = std::time::Instant::now();
+        let go_result = process.go_for_move(&snapshot.moves, &go_spec).await;
+        let elapsed = move_started_at.elapsed();
+
+        // Record elapsed time (and, if it flagged this side, end the
+        // game) *before* looking at what the engine returned -- a
+        // flag fall ends the game regardless of whether the engine
+        // also happened to reply with a move, and Lab's clock
+        // enforcement must never depend on trusting the engine's own
+        // response to notice it. A no-op for a `MoveTime` game (see
+        // `Game::record_move_time`'s docs).
+        store.record_move_time(id, side_to_move, elapsed);
+        if matches!(
+            store.snapshot(id).map(|s| s.status),
+            Some(GameStatus::Finished {
+                reason: FinishReason::Timeout,
+                ..
+            })
+        ) {
+            return; // this move flagged -- game already ended, nothing left to apply
+        }
+
+        let mv = match go_result {
             Ok(Some(mv)) => mv,
             Ok(None) => {
                 // The engine itself says no legal move (bestmove
@@ -850,9 +1187,292 @@ pub async fn run_engine_loop(store: GameStore, id: GameId, slots: EngineSlots, m
 mod tests {
     use super::*;
 
+    // -- GameClock: pure arithmetic, no real sleeps (see the module
+    // docs on why `record_move` takes an already-measured `elapsed`
+    // rather than reading a clock itself) --
+
+    #[test]
+    fn record_move_subtracts_elapsed_and_adds_increment() {
+        // 1000ms remaining, 300ms used, 200ms increment -> 900ms left.
+        let mut clock = GameClock::new(Duration::from_millis(1000), Duration::from_millis(200));
+
+        let outcome = clock.record_move(Color::White, Duration::from_millis(300));
+
+        assert_eq!(outcome, ClockOutcome::Ok);
+        assert_eq!(clock.remaining(Color::White), Duration::from_millis(900));
+        // Black's clock is untouched by White's move.
+        assert_eq!(clock.remaining(Color::Black), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn record_move_flags_when_elapsed_reaches_remaining() {
+        // 100ms remaining, engine used 101ms -> flagged, no increment
+        // awarded on top.
+        let mut clock = GameClock::new(Duration::from_millis(100), Duration::from_millis(200));
+
+        let outcome = clock.record_move(Color::White, Duration::from_millis(101));
+
+        assert_eq!(outcome, ClockOutcome::Flagged);
+        assert_eq!(clock.remaining(Color::White), Duration::ZERO);
+    }
+
+    #[test]
+    fn record_move_flags_exactly_at_the_remaining_boundary() {
+        // Using *exactly* all remaining time (not more) is still a
+        // flag -- there's no time left to have made the move in.
+        let mut clock = GameClock::new(Duration::from_millis(500), Duration::ZERO);
+
+        let outcome = clock.record_move(Color::Black, Duration::from_millis(500));
+
+        assert_eq!(outcome, ClockOutcome::Flagged);
+        assert_eq!(clock.remaining(Color::Black), Duration::ZERO);
+    }
+
+    #[test]
+    fn record_move_never_awards_increment_after_flagging() {
+        let mut clock = GameClock::new(Duration::from_millis(50), Duration::from_millis(10_000));
+
+        let outcome = clock.record_move(Color::White, Duration::from_millis(200));
+
+        assert_eq!(outcome, ClockOutcome::Flagged);
+        // A huge increment must not paper over the flag fall.
+        assert_eq!(clock.remaining(Color::White), Duration::ZERO);
+    }
+
+    #[test]
+    fn record_move_time_is_a_no_op_for_a_movetime_game() {
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
+        assert_eq!(game.clock(), None);
+
+        let outcome = game.record_move_time(Color::White, Duration::from_secs(9999));
+
+        assert_eq!(outcome, ClockOutcome::Ok);
+        assert_eq!(game.status(), &GameStatus::Running);
+    }
+
+    #[test]
+    fn a_fischer_game_starts_with_both_clocks_at_the_initial_time() {
+        let game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::Fischer {
+                initial_ms: 180_000,
+                increment_ms: 2_000,
+            },
+        );
+
+        let clock = game.clock().expect("Fischer game should have a clock");
+        assert_eq!(
+            clock.remaining(Color::White),
+            Duration::from_millis(180_000)
+        );
+        assert_eq!(
+            clock.remaining(Color::Black),
+            Duration::from_millis(180_000)
+        );
+    }
+
+    #[test]
+    fn record_move_time_flags_and_finishes_the_game_by_timeout() {
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::Fischer {
+                initial_ms: 100,
+                increment_ms: 0,
+            },
+        );
+
+        let outcome = game.record_move_time(Color::White, Duration::from_millis(150));
+
+        assert_eq!(outcome, ClockOutcome::Flagged);
+        assert_eq!(
+            game.status(),
+            &GameStatus::Finished {
+                result: GameResult::BlackWins,
+                reason: FinishReason::Timeout,
+            },
+            "White flagged -- Black wins"
+        );
+    }
+
+    #[test]
+    fn record_move_time_does_not_flag_when_time_remains() {
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::Fischer {
+                initial_ms: 10_000,
+                increment_ms: 1_000,
+            },
+        );
+
+        let outcome = game.record_move_time(Color::White, Duration::from_millis(500));
+
+        assert_eq!(outcome, ClockOutcome::Ok);
+        assert_eq!(game.status(), &GameStatus::Running);
+        let clock = game.clock().unwrap();
+        assert_eq!(clock.remaining(Color::White), Duration::from_millis(10_500));
+    }
+
+    #[test]
+    fn game_store_record_move_time_publishes_an_updated_snapshot_on_flag() {
+        let store = GameStore::new();
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::Fischer {
+                initial_ms: 50,
+                increment_ms: 0,
+            },
+        );
+        let mut events = store.subscribe(created.id).unwrap();
+
+        store.record_move_time(created.id, Color::White, Duration::from_millis(100));
+
+        let snapshot = store.snapshot(created.id).unwrap();
+        assert_eq!(
+            snapshot.status,
+            GameStatus::Finished {
+                result: GameResult::BlackWins,
+                reason: FinishReason::Timeout,
+            }
+        );
+        assert_eq!(snapshot.white_clock_ms, Some(0));
+
+        let event = events.try_recv().expect("should have published an update");
+        match event {
+            GameEvent::Updated(updated) => assert_eq!(*updated, snapshot),
+            other => panic!("expected GameEvent::Updated, got {other:?}"),
+        }
+    }
+
+    /// A minimal fake engine (same shape as `experiment`/`api`'s own
+    /// test doubles) that always replies `bestmove e2e4` -- enough to
+    /// drive `run_engine_loop` for real without needing an actual
+    /// `bee`/Stockfish binary in the test environment.
+    fn fake_engine_spec() -> EngineSpec {
+        EngineSpec {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"
+                while read -r line; do
+                    case "$line" in
+                        uci) echo "uciok" ;;
+                        isready) echo "readyok" ;;
+                        go*) echo "bestmove e2e4" ;;
+                    esac
+                done
+                "#
+                .to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_engine_loop_sends_real_uci_clock_fields_for_a_fischer_game() {
+        // End-to-end: a `Fischer` game's `run_engine_loop` must build
+        // real `go wtime/btime/winc/binc` lines (not `go movetime`),
+        // and record the actual wall-clock time the fake engine took
+        // against the mover's own clock afterward.
+        let store = GameStore::new();
+        let snapshot = store.create(
+            ParticipantInfo::Engine {
+                name: "fake".to_string(),
+                debug: false,
+            },
+            ParticipantInfo::Human,
+            TimeControl::Fischer {
+                initial_ms: 10_000,
+                increment_ms: 500,
+            },
+        );
+
+        let slots = EngineSlots {
+            white: Some(EngineConfig {
+                spec: fake_engine_spec(),
+                options: Vec::new(),
+                debug: false,
+            }),
+            black: None, // human slot -- the loop returns once White has moved and it's Black's turn
+        };
+
+        // `run_engine_loop` only returns once the game is no longer
+        // `Running`, which a human slot never causes on its own -- run
+        // it in the background and just wait for the one move we
+        // expect, rather than awaiting the whole (otherwise-unending)
+        // loop.
+        let store_for_loop = store.clone();
+        let id = snapshot.id;
+        let handle = tokio::spawn(async move {
+            run_engine_loop(
+                store_for_loop,
+                id,
+                slots,
+                TimeControl::Fischer {
+                    initial_ms: 10_000,
+                    increment_ms: 500,
+                },
+            )
+            .await;
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(snapshot) = store.snapshot(id) {
+                if !snapshot.moves.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "White's move never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+
+        let snapshot = store.snapshot(id).unwrap();
+        assert_eq!(snapshot.moves, vec!["e2e4".to_string()]);
+
+        // White's clock should have decreased by (at least a little)
+        // real elapsed time and then gained the 500ms increment, so
+        // it should now read *above* its starting value minus any
+        // plausible engine latency, and specifically not be untouched
+        // (exactly 10_000) or clamped to zero (flagged).
+        let white_clock_ms = snapshot.white_clock_ms.expect("Fischer game has a clock");
+        assert!(white_clock_ms > 0, "White should not have flagged");
+
+        let go_line = snapshot
+            .uci_log
+            .iter()
+            .find(|entry| entry.line.starts_with("go "))
+            .expect("should have sent a go command");
+        assert!(
+            go_line.line.contains("wtime") && go_line.line.contains("btime"),
+            "Fischer game should send real clock fields, got: {}",
+            go_line.line
+        );
+        assert!(
+            !go_line.line.contains("movetime"),
+            "Fischer game must not fall back to movetime, got: {}",
+            go_line.line
+        );
+    }
+
     #[test]
     fn new_game_starts_at_the_standard_position() {
-        let game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         assert_eq!(game.fen(), Position::startpos().to_fen());
         assert!(game.moves().is_empty());
         assert_eq!(game.status(), &GameStatus::Running);
@@ -860,7 +1480,11 @@ mod tests {
 
     #[test]
     fn legal_move_updates_position_and_move_list() {
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         game.apply_move("e2e4")
             .expect("e2e4 should be legal from startpos");
 
@@ -871,7 +1495,11 @@ mod tests {
 
     #[test]
     fn illegal_move_is_rejected_and_state_is_unchanged() {
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         let before_fen = game.fen();
 
         let result = game.apply_move("e2e5"); // not a legal pawn move
@@ -883,7 +1511,11 @@ mod tests {
 
     #[test]
     fn malformed_move_text_is_rejected() {
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         let result = game.apply_move("not a move");
         assert_eq!(result, Err(ApplyMoveError::NotAWellFormedMove));
     }
@@ -891,7 +1523,11 @@ mod tests {
     #[test]
     fn checkmate_finishes_the_game_with_the_mating_sides_win() {
         // Fool's mate: fastest possible checkmate, White gets mated.
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         for mv in ["f2f3", "e7e5", "g2g4", "d8h4"] {
             game.apply_move(mv)
                 .expect("scholar/fool's mate setup should be legal");
@@ -900,14 +1536,19 @@ mod tests {
         assert_eq!(
             game.status(),
             &GameStatus::Finished {
-                result: GameResult::BlackWins
+                result: GameResult::BlackWins,
+                reason: FinishReason::Checkmate,
             }
         );
     }
 
     #[test]
     fn a_move_after_the_game_is_finished_is_rejected() {
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         for mv in ["f2f3", "e7e5", "g2g4", "d8h4"] {
             game.apply_move(mv).expect("setup move should be legal");
         }
@@ -932,7 +1573,8 @@ mod tests {
         assert_eq!(
             game.status(),
             &GameStatus::Finished {
-                result: GameResult::Draw
+                result: GameResult::Draw,
+                reason: FinishReason::Stalemate,
             }
         );
     }
@@ -949,14 +1591,19 @@ mod tests {
         assert_eq!(
             game.status(),
             &GameStatus::Finished {
-                result: GameResult::Draw
+                result: GameResult::Draw,
+                reason: FinishReason::FiftyMoveRule,
             }
         );
     }
 
     #[test]
     fn third_occurrence_of_a_position_finishes_as_a_draw() {
-        let mut game = Game::new(ParticipantInfo::Human, ParticipantInfo::Human);
+        let mut game = Game::new(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         for mv in [
             "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
@@ -967,7 +1614,8 @@ mod tests {
         assert_eq!(
             game.status(),
             &GameStatus::Finished {
-                result: GameResult::Draw
+                result: GameResult::Draw,
+                reason: FinishReason::Repetition,
             }
         );
     }
@@ -975,7 +1623,11 @@ mod tests {
     #[test]
     fn game_store_create_then_snapshot_round_trips() {
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         let snapshot = store
             .snapshot(created.id)
@@ -988,7 +1640,11 @@ mod tests {
     #[test]
     fn a_game_created_directly_has_no_experiment_id() {
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         assert_eq!(created.experiment_id, None);
     }
 
@@ -1001,6 +1657,7 @@ mod tests {
         let created = store.create_for_experiment(
             ParticipantInfo::Human,
             ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
             experiment_id,
         );
 
@@ -1015,9 +1672,21 @@ mod tests {
     #[test]
     fn list_returns_every_game_newest_first() {
         let store = GameStore::new();
-        let first = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
-        let second = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
-        let third = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let first = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
+        let second = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
+        let third = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         let listed: Vec<GameId> = store.list().into_iter().map(|g| g.id).collect();
 
@@ -1044,7 +1713,11 @@ mod tests {
         };
         let black = ParticipantInfo::Human;
 
-        let created = store.create(white.clone(), black.clone());
+        let created = store.create(
+            white.clone(),
+            black.clone(),
+            TimeControl::fixed_move_time(200),
+        );
 
         assert_eq!(created.white, white);
         assert_eq!(created.black, black);
@@ -1063,7 +1736,11 @@ mod tests {
     #[test]
     fn game_store_apply_move_updates_the_stored_game() {
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         let snapshot = store
             .apply_move(created.id, "e2e4")
@@ -1086,7 +1763,11 @@ mod tests {
     #[test]
     fn game_store_apply_move_illegal_is_err_some() {
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
         let result = store.apply_move(created.id, "e2e5");
         assert_eq!(result, Err(Some(ApplyMoveError::IllegalMove)));
     }
@@ -1102,7 +1783,11 @@ mod tests {
     #[test]
     fn uci_lines_are_retained_in_the_game_snapshot() {
         let store = GameStore::new();
-        let created = store.create(ParticipantInfo::Human, ParticipantInfo::Human);
+        let created = store.create(
+            ParticipantInfo::Human,
+            ParticipantInfo::Human,
+            TimeControl::fixed_move_time(200),
+        );
 
         store.record_uci_line(
             created.id,

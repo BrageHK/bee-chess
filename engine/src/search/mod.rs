@@ -14,10 +14,13 @@ mod time_manager;
 
 pub use alpha_beta::{
     search, search_iterative, search_iterative_with_budget, search_iterative_with_history,
-    search_iterative_with_options, search_with_history, search_with_options,
+    search_iterative_with_options, search_iterative_with_stop, search_with_history,
+    search_with_options,
 };
+pub use deadline::StopSignal;
 pub use time_manager::{
-    allocate_time, ClockTimeControl, TimeBudget, TimeManagerConfig, DEFAULT_MOVE_OVERHEAD_MS,
+    allocate_time, ClockTimeControl, TimeBudget, TimeManagementTelemetry, TimeManagerConfig,
+    BEE_TM_VERSION, DEFAULT_MOVE_OVERHEAD_MS,
 };
 
 /// Toggles for experimental search features, exposed to UCI as
