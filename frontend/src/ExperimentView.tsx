@@ -161,6 +161,15 @@ export function ExperimentView({
                   ["Pruned", (stats) => formatCountAndRate(stats.delta_pruned, stats.delta_attempts)],
                 ]}
               />
+              <AdvancedMetricTable
+                title="Static exchange evaluation"
+                labels={[snapshot.label_a, snapshot.label_b]}
+                rows={[snapshot.stats.variant_a_search, snapshot.stats.variant_b_search]}
+                columns={[
+                  ["Attempts", (stats) => formatCompact(stats.see_attempts)],
+                  ["Pruned", (stats) => formatCountAndRate(stats.see_pruned, stats.see_attempts)],
+                ]}
+              />
             </div>
           </details>
         </PanelBody>

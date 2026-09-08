@@ -344,7 +344,7 @@ fn write_search_info<W: Write>(
     };
     write!(
         output,
-        "info depth {} score {score_field} nodes {} time {} lmr_attempts {} lmr_fail_lows {} lmr_researches {} nmp_attempts {} nmp_cutoffs {} delta_attempts {} delta_pruned {}",
+        "info depth {} score {score_field} nodes {} time {} lmr_attempts {} lmr_fail_lows {} lmr_researches {} nmp_attempts {} nmp_cutoffs {} delta_attempts {} delta_pruned {} see_attempts {} see_pruned {}",
         result.depth,
         result.nodes,
         elapsed.as_millis(),
@@ -355,6 +355,8 @@ fn write_search_info<W: Write>(
         result.null_move.cutoffs,
         result.delta_pruning.attempts,
         result.delta_pruning.pruned,
+        result.see_pruning.attempts,
+        result.see_pruning.pruned,
     )?;
     if !result.pv.is_empty() {
         write!(output, " pv")?;
@@ -721,6 +723,7 @@ fn run_event_loop<W: Write>(
                             output,
                             "option name UseEnhancedQuiescence type check default true"
                         )?;
+                        writeln!(output, "option name UseSee type check default true")?;
                         // See `crate::eval::EvalOptions`'s docs -- the
                         // evaluator's own A/B-testable feature switch,
                         // same convention as the search-side ones above.
@@ -816,6 +819,14 @@ fn run_event_loop<W: Write>(
                                 None => engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid UseDeltaPruning value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("UseSee") {
+                            match parse_uci_check(&value) {
+                                Some(enabled) => engine.set_use_see(enabled),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid UseSee value: {value}"),
                                 ),
                             }
                         } else if name.eq_ignore_ascii_case("UseMobility") {
@@ -1418,6 +1429,7 @@ mod tests {
         assert!(text.contains("option name UseNullMove type check default true"));
         assert!(text.contains("option name UseAdaptiveNullMove type check default true"));
         assert!(text.contains("option name UseDeltaPruning type check default true"));
+        assert!(text.contains("option name UseSee type check default true"));
         assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name UseMobility type check default true"));
         assert!(text.contains("option name UseKingSafety type check default true"));
@@ -1538,6 +1550,32 @@ mod tests {
         let text = String::from_utf8(output).expect("output should be valid utf8");
         assert!(text.contains("ignored invalid UseKingSafety value: Nonsense"));
         assert!(engine.eval_options().use_king_safety);
+    }
+
+    #[test]
+    fn setoption_disables_see() {
+        let input = b"setoption name UseSee value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.search_options().use_see);
+    }
+
+    #[test]
+    fn engine_defaults_to_see_enabled() {
+        let engine = Engine::default();
+        assert!(engine.search_options().use_see);
+    }
+
+    #[test]
+    fn invalid_use_see_value_keeps_the_current_setting() {
+        let input = b"debug on\nsetoption name UseSee value Nonsense\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("ignored invalid UseSee value: Nonsense"));
+        assert!(engine.search_options().use_see);
     }
 
     #[test]
@@ -1917,6 +1955,8 @@ mod tests {
         assert!(info_line.contains("lmr_attempts"));
         assert!(info_line.contains("nmp_attempts"));
         assert!(info_line.contains("delta_attempts"));
+        assert!(info_line.contains("see_attempts"));
+        assert!(info_line.contains("see_pruned"));
 
         let info_index = text.lines().position(|line| line == info_line).unwrap();
         let bestmove_index = text

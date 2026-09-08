@@ -37,6 +37,7 @@ mod moves;
 mod perft;
 mod piece;
 mod position;
+mod see;
 mod square;
 mod zobrist;
 

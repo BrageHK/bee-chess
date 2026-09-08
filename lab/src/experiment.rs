@@ -262,6 +262,8 @@ struct SearchTotals {
     nmp_cutoffs: u64,
     delta_attempts: u64,
     delta_pruned: u64,
+    see_attempts: u64,
+    see_pruned: u64,
     time_management: TimeManagementTotals,
 }
 
@@ -282,6 +284,8 @@ impl SearchTotals {
         self.nmp_cutoffs += other.nmp_cutoffs;
         self.delta_attempts += other.delta_attempts;
         self.delta_pruned += other.delta_pruned;
+        self.see_attempts += other.see_attempts;
+        self.see_pruned += other.see_pruned;
         self.time_management.add(other.time_management);
     }
 }
@@ -607,6 +611,9 @@ pub struct ExperimentSearchStats {
     pub delta_attempts: u64,
     pub delta_pruned: u64,
     pub delta_prune_rate: Option<f64>,
+    pub see_attempts: u64,
+    pub see_pruned: u64,
+    pub see_prune_rate: Option<f64>,
     /// Aggregated `bee-tm` telemetry (see `bee_engine::search::
     /// TimeManagementTelemetry`'s docs) across every search that
     /// produced one -- `None` if none did (a `TimeControl::MoveTime`
@@ -701,6 +708,10 @@ impl From<SearchTotals> for ExperimentSearchStats {
             delta_pruned: t.delta_pruned,
             delta_prune_rate: (t.delta_attempts > 0)
                 .then(|| t.delta_pruned as f64 / t.delta_attempts as f64),
+            see_attempts: t.see_attempts,
+            see_pruned: t.see_pruned,
+            see_prune_rate: (t.see_attempts > 0)
+                .then(|| t.see_pruned as f64 / t.see_attempts as f64),
             time_management: t.time_management.into(),
         }
     }
@@ -1157,6 +1168,16 @@ fn summarize_searches(log: &[UciLogEntry]) -> (SearchTotals, SearchTotals) {
                             pending[side].delta_pruned = v as u64;
                         }
                     }
+                    "see_attempts" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].see_attempts = v as u64;
+                        }
+                    }
+                    "see_pruned" => {
+                        if let Some(v) = value.filter(|v| *v >= 0) {
+                            pending[side].see_pruned = v as u64;
+                        }
+                    }
                     "score" if tokens[i + 1] == "cp" && i + 2 < tokens.len() => {
                         if let Ok(v) = tokens[i + 2].parse::<i64>() {
                             pending[side].eval_cp_sum = v;
@@ -1281,7 +1302,7 @@ mod tests {
             received(UciLogColor::White, "bestmove e2e4"),
             received(
                 UciLogColor::White,
-                "info depth 8 nodes 500 time 20 score cp -10 lmr_attempts 50 lmr_fail_lows 42 lmr_researches 8 nmp_attempts 25 nmp_cutoffs 15 delta_attempts 20 delta_pruned 12",
+                "info depth 8 nodes 500 time 20 score cp -10 lmr_attempts 50 lmr_fail_lows 42 lmr_researches 8 nmp_attempts 25 nmp_cutoffs 15 delta_attempts 20 delta_pruned 12 see_attempts 30 see_pruned 9",
             ),
             received(UciLogColor::White, "bestmove g1f3"),
         ];
@@ -1308,6 +1329,9 @@ mod tests {
             ExperimentSearchStats::from(white).delta_prune_rate,
             Some(0.6)
         );
+        assert_eq!(white.see_attempts, 30);
+        assert_eq!(white.see_pruned, 9);
+        assert_eq!(ExperimentSearchStats::from(white).see_prune_rate, Some(0.3));
         assert_eq!(black.searches, 0);
     }
 

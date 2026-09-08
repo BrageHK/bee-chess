@@ -161,6 +161,7 @@ describe("ExperimentView", () => {
     expect(screen.getByText("Late move reductions")).toBeInTheDocument();
     expect(screen.getByText("Null-move pruning")).toBeInTheDocument();
     expect(screen.getByText("Quiescence delta pruning")).toBeInTheDocument();
+    expect(screen.getByText("Static exchange evaluation")).toBeInTheDocument();
   });
 
   it("shows a placeholder for stats that have no data yet", async () => {

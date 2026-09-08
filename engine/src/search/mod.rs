@@ -64,6 +64,14 @@ pub struct SearchOptions {
     /// Whether hopeless captures may be skipped in quiescence when their
     /// maximum material gain plus a safety margin cannot reach alpha.
     pub use_delta_pruning: bool,
+    /// Whether captures are ordered by Static Exchange Evaluation (see
+    /// `alpha_beta::static_exchange_evaluation`'s docs) instead of plain
+    /// MVV-LVA, and whether quiescence skips captures SEE judges as a
+    /// clear material loss. Disabling this reproduces the exact
+    /// pre-SEE ordering/pruning behavior, letting Bee Lab A/B whether
+    /// the richer (but not free) exchange simulation is worth its cost
+    /// over plain victim-value ordering.
+    pub use_see: bool,
 }
 
 impl Default for SearchOptions {
@@ -76,6 +84,7 @@ impl Default for SearchOptions {
             use_null_move: true,
             use_adaptive_null_move: true,
             use_delta_pruning: true,
+            use_see: true,
         }
     }
 }
@@ -179,6 +188,7 @@ pub struct SearchResult {
     pub lmr: LmrStats,
     pub null_move: NullMoveStats,
     pub delta_pruning: DeltaPruningStats,
+    pub see_pruning: SeeStats,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -201,6 +211,17 @@ pub struct NullMoveStats {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeltaPruningStats {
+    pub attempts: u64,
+    pub pruned: u64,
+}
+
+/// How often quiescence considered skipping a capture SEE judges as a
+/// clear material loss (see `alpha_beta::should_see_prune`), and how
+/// often it actually did (a capture SEE scores as non-negative is
+/// still searched normally -- `attempts` counts every capture this was
+/// even asked about, `pruned` only the ones actually skipped).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeeStats {
     pub attempts: u64,
     pub pruned: u64,
 }
