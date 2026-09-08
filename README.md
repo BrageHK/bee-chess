@@ -1,5 +1,6 @@
 # bee-chess
 
+[![Lichess Stats](https://lichess-readme-stats.vercel.app/api?username=beechessjohan)](https://lichess.org/@/beechessjohan)
 [![Lichess Stats](https://lichess-readme-stats.vercel.app/api?username=beechessmagnus)](https://lichess.org/@/beechessmagnus)
 
 This is a crazy Transformer based chess engine with cool stuff.
