@@ -17,13 +17,13 @@
 
 use std::collections::HashMap;
 
-use crate::chess::{Color, Move, MoveFlag, PieceKind, Position, Square};
+use crate::chess::{Color, Move, MoveFlag, Piece, PieceKind, Position, Square};
 use crate::eval::Evaluator;
 
 use super::deadline::{Deadline, StopSignal};
 use super::{
-    DeltaPruningStats, LmrStats, NullMoveStats, Score, SearchOptions, SearchResult, SCORE_INF,
-    SCORE_MATE,
+    DeltaPruningStats, LmrStats, NullMoveStats, Score, SearchOptions, SearchResult, SeeStats,
+    SCORE_INF, SCORE_MATE,
 };
 
 const MAX_TT_ENTRIES: usize = 1 << 20;
@@ -57,6 +57,7 @@ struct SearchState {
     lmr: LmrStats,
     null_move: NullMoveStats,
     delta_pruning: DeltaPruningStats,
+    see_pruning: SeeStats,
 }
 
 impl SearchState {
@@ -70,6 +71,7 @@ impl SearchState {
             lmr: LmrStats::default(),
             null_move: NullMoveStats::default(),
             delta_pruning: DeltaPruningStats::default(),
+            see_pruning: SeeStats::default(),
         }
     }
 }
@@ -580,6 +582,7 @@ fn search_to_depth(
     state.lmr = LmrStats::default();
     state.null_move = NullMoveStats::default();
     state.delta_pruning = DeltaPruningStats::default();
+    state.see_pruning = SeeStats::default();
     let mut nodes = 0u64;
     let mut moves = position.generate_legal_moves();
 
@@ -596,6 +599,7 @@ fn search_to_depth(
             lmr: state.lmr,
             null_move: state.null_move,
             delta_pruning: state.delta_pruning,
+            see_pruning: state.see_pruning,
         });
     }
 
@@ -613,6 +617,7 @@ fn search_to_depth(
             lmr: state.lmr,
             null_move: state.null_move,
             delta_pruning: state.delta_pruning,
+            see_pruning: state.see_pruning,
         });
     }
 
@@ -668,6 +673,7 @@ fn search_to_depth(
         lmr: state.lmr,
         null_move: state.null_move,
         delta_pruning: state.delta_pruning,
+        see_pruning: state.see_pruning,
     })
 }
 
@@ -1041,9 +1047,13 @@ fn quiescence(
                 || (state.options.use_enhanced_quiescence && mv.flag().promotion_kind().is_some())
         })
         .collect();
-    noisy_moves.sort_unstable_by_key(|&mv| std::cmp::Reverse(capture_order_score(position, mv)));
+    noisy_moves.sort_unstable_by_key(|&mv| {
+        std::cmp::Reverse(capture_ordering_score(position, mv, state.options))
+    });
     for mv in noisy_moves {
-        if should_delta_prune(position, mv, stand_pat, alpha, must_evade_check, state) {
+        if should_delta_prune(position, mv, stand_pat, alpha, must_evade_check, state)
+            || should_see_prune(position, mv, must_evade_check, state)
+        {
             continue;
         }
         let undo = position.make_move(mv);
@@ -1114,6 +1124,45 @@ fn should_delta_prune(
     prune
 }
 
+/// Whether `mv` (already known to be a capture -- see `should_delta_
+/// prune`'s docs on the same contract) can be skipped in quiescence
+/// because SEE judges it a clear material loss. Unlike delta pruning
+/// (a margin-based heuristic bounding the *best case* a capture could
+/// possibly reach), this is exact: if the full simulated exchange on
+/// the destination square nets negative material, no positional
+/// compensation quiescence itself could ever discover changes that --
+/// quiescence only ever explores captures/checks/promotions, so a
+/// losing trade's actual downstream position is never evaluated here
+/// regardless.
+///
+/// Not applied while in check (must_evade_check) or with mate-range
+/// bounds in play, for the same reasons `should_delta_prune` excludes
+/// those cases: a check response can't be pruned away by a material
+/// heuristic, and mate-range alpha/beta values aren't ordinary
+/// centipawn comparisons SEE's material-only result should be
+/// compared against.
+fn should_see_prune(
+    position: &Position,
+    mv: Move,
+    must_evade_check: bool,
+    state: &mut SearchState,
+) -> bool {
+    if !state.options.use_see
+        || must_evade_check
+        || !is_capture(position, mv)
+        || mv.flag().promotion_kind().is_some()
+    {
+        return false;
+    }
+
+    state.see_pruning.attempts += 1;
+    let prune = static_exchange_evaluation(position, mv) < 0;
+    if prune {
+        state.see_pruning.pruned += 1;
+    }
+    prune
+}
+
 fn has_major_material(position: &Position) -> bool {
     (0..Square::COUNT as u8).any(|index| {
         position
@@ -1133,7 +1182,7 @@ fn order_moves(
         let score = if Some(mv) == tt_move {
             2_000_000
         } else if is_capture(position, mv) || mv.flag().promotion_kind().is_some() {
-            1_000_000 + capture_order_score(position, mv)
+            1_000_000 + capture_ordering_score(position, mv, state.options)
         } else if state
             .killers
             .get(ply)
@@ -1203,6 +1252,23 @@ fn capture_order_score(position: &Position, mv: Move) -> i32 {
     victim * 16 - attacker + promotion
 }
 
+/// The score `order_moves`/quiescence's capture sort actually uses for
+/// a capture: SEE's real exchange result when `use_see` is on (falling
+/// back to plain `capture_order_score`'s MVV-LVA heuristic when it's
+/// off, or for a non-capturing promotion, which SEE has nothing to say
+/// about -- promotions still need *some* ordering score, and MVV-LVA's
+/// existing `victim * 16 - attacker + promotion` term already handles
+/// that case correctly). A caller must still ensure `mv` is actually a
+/// capture-or-promotion before calling this; it doesn't check that
+/// itself, matching `capture_order_score`'s own contract.
+fn capture_ordering_score(position: &Position, mv: Move, options: SearchOptions) -> i32 {
+    if options.use_see && is_capture(position, mv) {
+        static_exchange_evaluation(position, mv)
+    } else {
+        capture_order_score(position, mv)
+    }
+}
+
 const fn ordering_piece_value(kind: PieceKind) -> i32 {
     match kind {
         PieceKind::Pawn => 100,
@@ -1212,6 +1278,110 @@ const fn ordering_piece_value(kind: PieceKind) -> i32 {
         PieceKind::Queen => 900,
         PieceKind::King => 20_000,
     }
+}
+
+/// Static Exchange Evaluation: simulates the likely capture sequence on
+/// `mv`'s destination square (both sides always recapturing with their
+/// cheapest available attacker, per `Position::least_valuable_attacker`)
+/// and returns the net material result in centipawns, from the mover's
+/// perspective -- positive means the exchange favors whoever plays
+/// `mv`, negative means it doesn't.
+///
+/// This is a heuristic, not truth: it ignores checks, pins, discovered
+/// attacks, and any positional consequence of the exchange (see this
+/// module's docs on why quiescence and alpha-beta are what actually
+/// resolve real tactics; SEE only ever informs move ordering and
+/// pruning decisions about *which* captures are worth investigating
+/// further). Not called for `mv`s that aren't captures at all --
+/// `capture_order_score`'s callers already filter for that.
+///
+/// Runs on a cloned scratch board via `Position::set_piece` rather than
+/// `make_move`/`unmake_move`: the simulation only cares about which
+/// pieces occupy which squares as the exchange proceeds, never about
+/// turn order, castling rights, en passant, or move counters, so a
+/// direct piece-by-piece mutation is both simpler and cheaper than
+/// threading a full move through the normal make/unmake machinery.
+fn static_exchange_evaluation(position: &Position, mv: Move) -> i32 {
+    let target = mv.to();
+    let mover_color = match position.piece_at(mv.from()) {
+        Some(piece) => piece.color,
+        // A capture always has a piece on its own `from` square in any
+        // position this is ever called against; falling back to "the
+        // exchange is worthless" rather than panicking keeps this
+        // total for a caller that somehow asks about a malformed move.
+        None => return 0,
+    };
+    let Some(mut attacker_kind) = position.piece_at(mv.from()).map(|piece| piece.kind) else {
+        return 0;
+    };
+
+    let mut board = position.clone();
+    // The first capture's gain is fixed by the move itself (en passant
+    // captures a pawn that isn't actually on the destination square,
+    // exactly like `is_capture`/`capture_order_score` already special-
+    // case), not re-derived from `least_valuable_attacker` below.
+    let mut gains = vec![if mv.flag() == MoveFlag::EnPassant {
+        ordering_piece_value(PieceKind::Pawn)
+    } else {
+        board
+            .piece_at(target)
+            .map_or(0, |piece| ordering_piece_value(piece.kind))
+    }];
+    board.set_piece(mv.from(), None);
+    if mv.flag() == MoveFlag::EnPassant {
+        // The captured pawn sits beside the destination square, not on
+        // it -- see `is_capture`'s docs.
+        let captured_pawn_rank = mv.from().rank();
+        board.set_piece(
+            Square::from_file_rank(target.file(), captured_pawn_rank),
+            None,
+        );
+    }
+    board.set_piece(target, Some(Piece::new(attacker_kind, mover_color)));
+
+    let mut side_to_capture = mover_color.opposite();
+    while let Some((attacker_square, kind)) = board.least_valuable_attacker(target, side_to_capture)
+    {
+        // Each new gain is "what this recapture wins" (the value of
+        // whatever is currently sitting on `target`, i.e. the previous
+        // attacker) minus whatever the previous exchange already
+        // banked, negated -- the standard SEE swap-list recurrence:
+        // a recapture is only worth playing if it doesn't leave the
+        // position worse than simply not recapturing at all, which
+        // `resolve_see_gains` (the final minimax-over-the-list step
+        // below) accounts for regardless of how deep the list goes.
+        let captured_value = ordering_piece_value(attacker_kind);
+        gains.push(captured_value - *gains.last().expect("gains is never empty"));
+
+        board.set_piece(attacker_square, None);
+        board.set_piece(target, Some(Piece::new(kind, side_to_capture)));
+        attacker_kind = kind;
+        side_to_capture = side_to_capture.opposite();
+    }
+
+    resolve_see_gains(&gains)
+}
+
+/// Folds a SEE swap list (`gains[0]` is the value of the very first
+/// piece captured; each `gains[d]` after that is `piece_value(the
+/// attacker that just moved onto the target square at step d-1) -
+/// gains[d-1]`, exactly as `static_exchange_evaluation` builds it) into
+/// the single net result the *first* mover actually achieves, assuming
+/// both sides play optimally -- i.e. a side only "recaptures" if doing
+/// so doesn't leave them worse off than simply stopping the exchange
+/// right there. This is the standard SEE fold (see the chess
+/// programming wiki's "Static Exchange Evaluation" article for the
+/// same recurrence under the same name): walking backward,
+/// `gains[i] = -max(-gains[i], gains[i+1])` -- "the side to move at
+/// step `i` either takes the (negated, since it's now their turn to
+/// decide) result of continuing at `i+1`, or declines and banks
+/// `gains[i]` outright, whichever is better for them."
+fn resolve_see_gains(gains: &[i32]) -> i32 {
+    let mut folded: Vec<i32> = gains.to_vec();
+    for i in (0..folded.len().saturating_sub(1)).rev() {
+        folded[i] = -(-folded[i]).max(folded[i + 1]);
+    }
+    folded.first().copied().unwrap_or(0)
 }
 
 fn score_to_tt(score: Score, ply: u32) -> Score {
@@ -1848,6 +2018,111 @@ mod tests {
     }
 
     #[test]
+    fn resolve_see_gains_returns_the_single_gain_of_an_undefended_capture() {
+        // Just "I capture a rook and nobody recaptures" -- the whole
+        // exchange's value is exactly what the first capture won.
+        assert_eq!(resolve_see_gains(&[500]), 500);
+    }
+
+    #[test]
+    fn resolve_see_gains_takes_a_recapture_that_denies_more_than_it_costs() {
+        // gains[0] = 500: the first capture wins a rook. gains[1] =
+        // -180 encodes "if the opponent recaptures the (knight-valued)
+        // attacker now sitting on the square, that costs the *first*
+        // side's running total 320 - 500 = -180" (i.e. the opponent
+        // gives up their knight but the first side is left with only
+        // 500 - (320 knight lost in trade for what they captured) --
+        // the standard SEE fold, `gains[0] = -max(-gains[0],
+        // gains[1])`, correctly has the opponent *take* this recapture:
+        // it reduces what the first side nets from 500 down to 180,
+        // which is a better outcome for the opponent than letting the
+        // full 500 stand, even though it costs them their knight.
+        assert_eq!(resolve_see_gains(&[500, -180]), 180);
+    }
+
+    #[test]
+    fn resolve_see_gains_walks_a_four_deep_swap_list_correctly() {
+        // A hand-verified swap list, folded with the standard backward
+        // recurrence `gains[i] = -max(-gains[i], gains[i+1])`, walking
+        // i from len-2 down to 0:
+        //   i=2: gains[2] = -max(-30, -10) = 10   -> [100, -20, 10, -10]
+        //   i=1: gains[1] = -max(20, 10)   = -20  -> [100, -20, 10, -10]
+        //   i=0: gains[0] = -max(-100, -20) = 20  -> [20, -20, 10, -10]
+        assert_eq!(resolve_see_gains(&[100, -20, 30, -10]), 20);
+    }
+
+    fn see_move(position: &Position, from: &str, to: &str) -> Move {
+        let from: Square = from.parse().unwrap();
+        let to: Square = to.parse().unwrap();
+        position
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| mv.from() == from && mv.to() == to)
+            .unwrap_or_else(|| panic!("no legal move {from}{to} in {}", position.to_fen()))
+    }
+
+    #[test]
+    fn see_scores_an_undefended_capture_as_a_clean_win() {
+        // White rook takes an undefended pawn: nobody can recapture,
+        // so the result is exactly the pawn's value.
+        let position = Position::from_fen("4k3/8/8/8/8/8/p7/R3K3 w - - 0 1").unwrap();
+        let mv = see_move(&position, "a1", "a2");
+        assert_eq!(static_exchange_evaluation(&position, mv), 100);
+    }
+
+    #[test]
+    fn see_scores_a_defended_capture_as_a_loss_for_a_more_valuable_attacker() {
+        // White queen takes a pawn on b2 that's defended by a knight on
+        // d3 (a real knight move, d3-b2): the knight recaptures the
+        // queen, so the exchange is a clear loss for White
+        // (100 - 900 = -800) despite winning a pawn up front. White's
+        // own king sits on h1 rather than e1, since d3's knight also
+        // attacks e1 -- putting the king there would make every non-
+        // king move illegal (already in check) rather than exercising
+        // the capture this test is actually about.
+        let position = Position::from_fen("4k3/8/8/8/8/3n4/1p6/Q6K w - - 0 1").unwrap();
+        let mv = see_move(&position, "a1", "b2");
+        assert_eq!(static_exchange_evaluation(&position, mv), 100 - 900);
+    }
+
+    #[test]
+    fn see_recognizes_an_undefended_pawn_capture_by_a_minor_piece_as_favorable() {
+        // White knight on c3 takes an undefended pawn on d1 (a real
+        // knight move -- c3 to d1) -- a clean win of exactly the
+        // pawn's value, with no recapture available at all.
+        let position = Position::from_fen("4k3/8/8/8/8/2N5/8/3pK3 w - - 0 1").unwrap();
+        let mv = see_move(&position, "c3", "d1");
+        assert_eq!(static_exchange_evaluation(&position, mv), 100);
+    }
+
+    #[test]
+    fn see_handles_a_multi_piece_exchange_correctly() {
+        // White bishop on h2 takes a pawn on e5 (clean diagonal,
+        // h2-g3-f4-e5), defended by a Black knight on d3 (a real
+        // knight move, d3-e5). Nothing defends the knight in turn, so
+        // the full sequence is: Bxe5 (+100), Nxe5 (-330 running) --
+        // White should decline any further recapture (there isn't a
+        // legal one here anyway), so the net result is a losing trade
+        // for White: a bishop for a pawn (100 - 330 = -230). White's
+        // king sits on h1, not e1 -- d3's knight also attacks e1 (see
+        // the queen/knight test above for the same pitfall).
+        let position = Position::from_fen("4k3/8/8/4p3/8/3n4/7B/7K w - - 0 1").unwrap();
+        let mv = see_move(&position, "h2", "e5");
+        assert_eq!(static_exchange_evaluation(&position, mv), 100 - 330);
+    }
+
+    #[test]
+    fn see_handles_en_passant_captures() {
+        // White pawn captures en passant on d6, winning the pawn on d5
+        // (which does not sit on the destination square) -- nothing
+        // else attacks d6, so the result is exactly one pawn.
+        let position = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let mv = see_move(&position, "e5", "d6");
+        assert_eq!(mv.flag(), MoveFlag::EnPassant);
+        assert_eq!(static_exchange_evaluation(&position, mv), 100);
+    }
+
+    #[test]
     fn transposition_table_reuses_a_completed_search() {
         let mut position = Position::startpos();
         let mut state = SearchState::default();
@@ -1905,6 +2180,7 @@ mod tests {
             use_null_move: true,
             use_adaptive_null_move: true,
             use_delta_pruning: true,
+            use_see: true,
         });
         let mut path = vec![position.zobrist_hash()];
         let mut nodes = 0;
@@ -2093,6 +2369,7 @@ mod tests {
                 use_null_move: true,
                 use_adaptive_null_move: true,
                 use_delta_pruning: true,
+                use_see: true,
             },
         );
 

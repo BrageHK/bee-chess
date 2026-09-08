@@ -279,6 +279,10 @@ impl Engine {
         self.search_options.use_delta_pruning = enabled;
     }
 
+    pub fn set_use_see(&mut self, enabled: bool) {
+        self.search_options.use_see = enabled;
+    }
+
     pub const fn eval_options(&self) -> crate::eval::EvalOptions {
         self.eval_options
     }
@@ -429,6 +433,7 @@ impl Engine {
             lmr: Default::default(),
             null_move: Default::default(),
             delta_pruning: Default::default(),
+            see_pruning: Default::default(),
         })
     }
 
@@ -619,6 +624,7 @@ impl Engine {
                 lmr: Default::default(),
                 null_move: Default::default(),
                 delta_pruning: Default::default(),
+                see_pruning: Default::default(),
             }
         })
     }
@@ -732,6 +738,7 @@ impl Engine {
                         lmr: Default::default(),
                         null_move: Default::default(),
                         delta_pruning: Default::default(),
+                        see_pruning: Default::default(),
                     },
                     None,
                 )

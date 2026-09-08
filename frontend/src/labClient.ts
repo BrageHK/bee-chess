@@ -214,6 +214,9 @@ export interface ExperimentSearchStats {
   delta_attempts: number;
   delta_pruned: number;
   delta_prune_rate: number | null;
+  see_attempts: number;
+  see_pruned: number;
+  see_prune_rate: number | null;
   /** Aggregated `bee-tm` time-management telemetry (see
    * `bee_engine::search::TimeManagementTelemetry`), or `null` if no
    * search produced one (a `move_time` experiment, an older engine

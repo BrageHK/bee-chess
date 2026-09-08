@@ -63,6 +63,9 @@ function emptySearchStats() {
     delta_attempts: 0,
     delta_pruned: 0,
     delta_prune_rate: null,
+    see_attempts: 0,
+    see_pruned: 0,
+    see_prune_rate: null,
     time_management: null,
   };
 }
