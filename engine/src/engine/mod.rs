@@ -287,6 +287,10 @@ impl Engine {
         self.eval_options.use_mobility = enabled;
     }
 
+    pub fn set_use_king_safety(&mut self, enabled: bool) {
+        self.eval_options.use_king_safety = enabled;
+    }
+
     pub const fn move_overhead(&self) -> std::time::Duration {
         self.time_manager_config.move_overhead
     }
