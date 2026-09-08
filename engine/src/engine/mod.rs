@@ -46,6 +46,11 @@ pub struct Engine {
     /// than about performance.
     opening_book: Box<dyn OpeningBook>,
     search_options: SearchOptions,
+    /// Toggles for `PositionalEvaluator`'s optional terms (e.g.
+    /// mobility) -- see `crate::eval::EvalOptions`'s docs. Unused by
+    /// `MaterialEvaluator`/`ExperimentalEvaluator`, which take no
+    /// configuration at all.
+    eval_options: crate::eval::EvalOptions,
     position: Position,
     diagnostics: DiagnosticBuffer,
     /// Zobrist hash of every position reached so far in the current
@@ -157,6 +162,7 @@ impl Engine {
             opening_book_kind: OpeningBookKind::default(),
             opening_book: OpeningBookKind::default().book(),
             search_options: SearchOptions::default(),
+            eval_options: crate::eval::EvalOptions::default(),
             position,
             diagnostics: DiagnosticBuffer::new(),
             position_history,
@@ -271,6 +277,14 @@ impl Engine {
 
     pub fn set_use_delta_pruning(&mut self, enabled: bool) {
         self.search_options.use_delta_pruning = enabled;
+    }
+
+    pub const fn eval_options(&self) -> crate::eval::EvalOptions {
+        self.eval_options
+    }
+
+    pub fn set_use_mobility(&mut self, enabled: bool) {
+        self.eval_options.use_mobility = enabled;
     }
 
     pub const fn move_overhead(&self) -> std::time::Duration {
@@ -480,7 +494,9 @@ impl Engine {
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
-            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator {
+                options: self.eval_options,
+            }),
         };
         if let Some(result) = book_result {
             return result;
@@ -503,7 +519,9 @@ impl Engine {
             EvaluatorKind::Positional => search::search_with_options(
                 &mut self.position,
                 depth,
-                &PositionalEvaluator,
+                &PositionalEvaluator {
+                    options: self.eval_options,
+                },
                 &self.position_history,
                 self.search_options,
             ),
@@ -542,7 +560,9 @@ impl Engine {
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
-            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator {
+                options: self.eval_options,
+            }),
         };
         if let Some(result) = book_result {
             return result;
@@ -571,7 +591,9 @@ impl Engine {
             EvaluatorKind::Positional => search::search_iterative_with_stop(
                 &mut self.position,
                 budget,
-                &PositionalEvaluator,
+                &PositionalEvaluator {
+                    options: self.eval_options,
+                },
                 &self.position_history,
                 self.search_options,
                 stop,
@@ -646,7 +668,9 @@ impl Engine {
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
-            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator),
+            EvaluatorKind::Positional => self.book_move(&PositionalEvaluator {
+                options: self.eval_options,
+            }),
         };
         if let Some(result) = book_result {
             return (result, None);
@@ -677,7 +701,9 @@ impl Engine {
             EvaluatorKind::Positional => search::search_iterative_with_budget(
                 &mut self.position,
                 budget,
-                &PositionalEvaluator,
+                &PositionalEvaluator {
+                    options: self.eval_options,
+                },
                 &self.position_history,
                 self.search_options,
                 stop,
