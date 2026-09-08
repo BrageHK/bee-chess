@@ -142,6 +142,69 @@ impl Position {
         }
     }
 
+    /// Counts pseudo-legal destination squares for one piece -- the same
+    /// movement geometry `generate_offset_moves`/`generate_sliding_moves`
+    /// walk, but a running count instead of allocating a `Vec<Move>`, and
+    /// callable for *either* color regardless of whose turn it is (unlike
+    /// `generate_pseudo_legal_moves`, which only generates for the side to
+    /// move). Meant for evaluation's mobility term (see `bee_engine::eval`),
+    /// which needs "how much can this piece do" for both sides on every leaf
+    /// -- cheap enough to call there specifically because it never builds a
+    /// `Move` or a `Vec` at all.
+    ///
+    /// Only knight/bishop/rook/queen are supported (`None` for pawn/king):
+    /// mobility isn't a meaningful positional signal for a king (it should
+    /// generally stay put in the middlegame regardless of how many squares
+    /// it could step to) or a pawn (its "mobility" is fully captured by
+    /// existing pawn-structure terms), so there's no case to fill in, not an
+    /// oversight.
+    #[must_use]
+    pub fn mobility_squares(&self, from: Square, kind: PieceKind, color: Color) -> Option<u32> {
+        let mut count = 0u32;
+        match kind {
+            PieceKind::Knight => {
+                for &(df, dr) in &KNIGHT_OFFSETS {
+                    if let Some(to) = offset_square(from, df, dr) {
+                        if !self.occupied_by(to, color) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            PieceKind::Bishop => {
+                count = self.count_sliding_squares(from, color, &BISHOP_DIRECTIONS)
+            }
+            PieceKind::Rook => count = self.count_sliding_squares(from, color, &ROOK_DIRECTIONS),
+            PieceKind::Queen => {
+                count = self.count_sliding_squares(from, color, &BISHOP_DIRECTIONS)
+                    + self.count_sliding_squares(from, color, &ROOK_DIRECTIONS);
+            }
+            PieceKind::Pawn | PieceKind::King => return None,
+        }
+        Some(count)
+    }
+
+    fn count_sliding_squares(&self, from: Square, side: Color, directions: &[(i8, i8)]) -> u32 {
+        let mut count = 0u32;
+        for &(df, dr) in directions {
+            let mut current = from;
+            while let Some(to) = offset_square(current, df, dr) {
+                match self.piece_at(to) {
+                    None => {
+                        count += 1;
+                        current = to;
+                    }
+                    Some(occupant) if occupant.color != side => {
+                        count += 1;
+                        break;
+                    }
+                    Some(_) => break,
+                }
+            }
+        }
+        count
+    }
+
     fn generate_pawn_moves(&self, from: Square, side: Color, moves: &mut Vec<Move>) {
         let (forward, start_rank, promotion_rank): (i8, u8, u8) = match side {
             Color::White => (1, 1, 7),
@@ -500,5 +563,117 @@ mod tests {
             position.unmake_move(mv, undo);
             assert_eq!(position, before);
         }
+    }
+
+    #[test]
+    fn mobility_squares_is_none_for_pawn_and_king() {
+        let position = Position::startpos();
+        assert_eq!(
+            position.mobility_squares(sq(4, 1), PieceKind::Pawn, Color::White),
+            None
+        );
+        assert_eq!(
+            position.mobility_squares(sq(4, 0), PieceKind::King, Color::White),
+            None
+        );
+    }
+
+    #[test]
+    fn knight_mobility_matches_pseudo_legal_move_count() {
+        // A knight in the corner of an otherwise empty board (plus both
+        // kings, so the position stays well-formed) has exactly 2 squares
+        // available -- the textbook minimum.
+        let position = Position::from_fen("7k/8/8/8/8/8/8/N3K3 w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(0, 0), PieceKind::Knight, Color::White),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn knight_mobility_excludes_squares_blocked_by_its_own_side() {
+        // Same corner knight (a1); its only two reachable squares are b3
+        // and c2 -- both now occupied by a friendly pawn, so mobility must
+        // drop to 0, not count squares it could reach if they were empty.
+        let position = Position::from_fen("7k/8/8/8/8/1P6/2P5/N3K3 w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(0, 0), PieceKind::Knight, Color::White),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn knight_mobility_counts_a_capturable_enemy_square() {
+        // Same corner knight, but b3/c2 now each hold an enemy piece --
+        // both count as available (capturable), unlike the
+        // friendly-blocked case above.
+        let position = Position::from_fen("7k/8/8/8/8/1p6/2p5/N3K3 w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(0, 0), PieceKind::Knight, Color::White),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rook_mobility_on_an_open_board_reaches_fourteen_squares() {
+        // A rook alone in the middle of an empty board reaches every
+        // square on its rank and file: 7 + 7 = 14. Both kings sit off the
+        // rook's rank/file entirely so they can't block or shrink the count.
+        let position = Position::from_fen("k7/8/8/8/4R3/8/8/7K w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(4, 3), PieceKind::Rook, Color::White),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn rook_mobility_is_blocked_by_a_friendly_pawn_but_not_past_it() {
+        let position = Position::from_fen("k7/8/8/8/4R3/4P3/8/7K w - - 0 1").expect("valid FEN");
+        // Full rank (7) + upward file (4, to the edge) + downward file
+        // (0 -- the very next square is its own pawn, so it can't even
+        // land there) = 11.
+        assert_eq!(
+            position.mobility_squares(sq(4, 3), PieceKind::Rook, Color::White),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn bishop_mobility_matches_the_geometric_diagonal_count() {
+        // A bishop on d4 (an empty board) reaches all 13 squares on its
+        // two diagonals.
+        let position = Position::from_fen("k7/8/8/8/3B4/8/8/7K w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(3, 3), PieceKind::Bishop, Color::White),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn queen_mobility_is_the_sum_of_rook_and_bishop_mobility() {
+        let position = Position::from_fen("k7/8/8/8/3Q4/8/8/7K w - - 0 1").expect("valid FEN");
+        let rook_like = position
+            .mobility_squares(sq(3, 3), PieceKind::Rook, Color::White)
+            .unwrap();
+        let bishop_like = position
+            .mobility_squares(sq(3, 3), PieceKind::Bishop, Color::White)
+            .unwrap();
+        assert_eq!(
+            position.mobility_squares(sq(3, 3), PieceKind::Queen, Color::White),
+            Some(rook_like + bishop_like)
+        );
+    }
+
+    #[test]
+    fn mobility_squares_works_for_either_color_regardless_of_side_to_move() {
+        // Unlike generate_pseudo_legal_moves (only the side to move),
+        // mobility_squares must answer for whichever color is asked --
+        // evaluation needs both sides' mobility on every leaf regardless
+        // of whose turn it is.
+        let position = Position::from_fen("7k/8/8/8/8/8/8/N3K3 w - - 0 1").expect("valid FEN");
+        assert_eq!(
+            position.mobility_squares(sq(0, 0), PieceKind::Knight, Color::White),
+            Some(2)
+        );
     }
 }

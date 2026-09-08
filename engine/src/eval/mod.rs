@@ -19,6 +19,30 @@ pub trait Evaluator {
     fn evaluate(&self, position: &Position) -> Score;
 }
 
+/// Toggles for experimental evaluator terms, exposed to UCI as
+/// `setoption`s (see `EngineOptions` in `crate::engine`), mirroring
+/// `crate::search::SearchOptions`'s A/B-testing pattern exactly -- Bee
+/// Lab can flip one evaluator feature at a time without any frontend/Lab
+/// code needing to know what the feature is. Every field defaults to
+/// `true` (the evaluator's normal, strongest configuration); turning one
+/// off is always a deliberate experiment, never the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalOptions {
+    /// Whether `PositionalEvaluator` scores knight/bishop/rook/queen
+    /// mobility (how many pseudo-legal squares each piece can reach --
+    /// see `bee_chess_core::Position::mobility_squares`). Disabling this
+    /// reproduces the evaluator's exact pre-mobility behavior, letting
+    /// Bee Lab A/B whether mobility is actually worth its evaluation-time
+    /// cost, not just whether it's a chess-sensible idea.
+    pub use_mobility: bool,
+}
+
+impl Default for EvalOptions {
+    fn default() -> Self {
+        Self { use_mobility: true }
+    }
+}
+
 /// A deliberately simple evaluator used for evaluation experiments.
 pub struct ExperimentalEvaluator;
 
@@ -169,10 +193,24 @@ impl Evaluator for MaterialEvaluator {
 /// makes them active once the major pieces have gone.
 ///
 /// The deliberately small set of terms is cheap enough to run at every leaf:
-/// piece-square activity, pawn advancement/structure, and the bishop pair.
-/// Scores, like every [`Evaluator`], are returned from the side-to-move's
-/// perspective.
-pub struct PositionalEvaluator;
+/// piece-square activity, pawn advancement/structure, the bishop pair, and
+/// (optionally, see `EvalOptions::use_mobility`) knight/bishop/rook/queen
+/// mobility. Scores, like every [`Evaluator`], are returned from the
+/// side-to-move's perspective.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PositionalEvaluator {
+    pub options: EvalOptions,
+}
+
+impl PositionalEvaluator {
+    /// A `PositionalEvaluator` with every optional term on -- the same
+    /// as `Default`, spelled out for call sites that want to be explicit
+    /// about not passing a caller-configured `EvalOptions` (mirrors
+    /// `SearchOptions::default()`'s call sites in `crate::search`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl Evaluator for PositionalEvaluator {
     fn evaluate(&self, position: &Position) -> Score {
@@ -210,6 +248,14 @@ impl Evaluator for PositionalEvaluator {
             }
             if piece.kind == PieceKind::Rook {
                 rooks.push((piece.color, square.file() as usize));
+            }
+            if self.options.use_mobility {
+                if let Some(squares) = position.mobility_squares(square, piece.kind, piece.color) {
+                    let (mg_weight, eg_weight) = mobility_weight(piece.kind);
+                    let squares = squares as Score;
+                    middle += sign * mg_weight * squares;
+                    end += sign * eg_weight * squares;
+                }
             }
         }
 
@@ -285,6 +331,26 @@ const fn piece_values(kind: PieceKind) -> (Score, Score, Score) {
     }
 }
 
+/// Centipawns awarded per reachable square (from
+/// `Position::mobility_squares`), separately for middlegame/endgame,
+/// deliberately conservative starting values -- see `EvalOptions::
+/// use_mobility`'s docs. Rooks and queens get a smaller per-square
+/// weight than knights/bishops since they naturally reach more squares
+/// on an open board (a rook's 14-square ceiling vs. a knight's 8), so an
+/// equal per-square weight would let mobility swamp every other term for
+/// major pieces alone. `piece_values`/`square_bonus` cover pawn/king
+/// entirely, so this is never asked about them (see `mobility_squares`'s
+/// own `None` for pawn/king).
+const fn mobility_weight(kind: PieceKind) -> (Score, Score) {
+    match kind {
+        PieceKind::Knight => (4, 4),
+        PieceKind::Bishop => (4, 4),
+        PieceKind::Rook => (2, 3),
+        PieceKind::Queen => (1, 2),
+        PieceKind::Pawn | PieceKind::King => (0, 0),
+    }
+}
+
 /// Compact, symmetric piece-square functions. `rank` is always measured from
 /// the piece owner's home rank, making color symmetry explicit.
 fn square_bonus(kind: PieceKind, file: u8, rank: u8) -> (Score, Score) {
@@ -336,6 +402,17 @@ mod tests {
 
     #[test]
     fn experimental_and_positional_rook_terms_stay_in_sync() {
+        // ExperimentalEvaluator has no mobility term at all (it predates
+        // EvalOptions entirely), so this comparison needs
+        // PositionalEvaluator's own mobility switched off to stay a
+        // like-for-like check of just the rook-file terms both share --
+        // otherwise it would start failing the moment mobility (which
+        // does score these very rooks) contributes anything nonzero.
+        let no_mobility = PositionalEvaluator {
+            options: EvalOptions {
+                use_mobility: false,
+            },
+        };
         let open = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let semi_open = Position::from_fen("4k3/p7/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let closed = Position::from_fen("4k3/8/8/8/8/8/P7/R3K3 w - - 0 1").unwrap();
@@ -343,7 +420,7 @@ mod tests {
         for position in [&open, &semi_open, &closed] {
             assert_eq!(
                 ExperimentalEvaluator.evaluate(position),
-                PositionalEvaluator.evaluate(position)
+                no_mobility.evaluate(position)
             );
         }
     }
@@ -438,7 +515,10 @@ mod tests {
 
     #[test]
     fn positional_start_position_is_symmetric() {
-        assert_eq!(PositionalEvaluator.evaluate(&Position::startpos()), 0);
+        assert_eq!(
+            PositionalEvaluator::new().evaluate(&Position::startpos()),
+            0
+        );
     }
 
     #[test]
@@ -446,7 +526,8 @@ mod tests {
         let undeveloped = Position::from_fen("4k3/8/8/8/8/8/8/1N2K3 w - - 0 1").unwrap();
         let developed = Position::from_fen("4k3/8/8/8/8/2N5/8/4K3 w - - 0 1").unwrap();
         assert!(
-            PositionalEvaluator.evaluate(&developed) > PositionalEvaluator.evaluate(&undeveloped)
+            PositionalEvaluator::new().evaluate(&developed)
+                > PositionalEvaluator::new().evaluate(&undeveloped)
         );
     }
 
@@ -454,14 +535,89 @@ mod tests {
     fn positional_evaluator_penalizes_doubled_isolated_pawns() {
         let healthy = Position::from_fen("4k3/8/8/8/8/8/2PP4/4K3 w - - 0 1").unwrap();
         let doubled = Position::from_fen("4k3/8/8/8/8/2P5/2P5/4K3 w - - 0 1").unwrap();
-        assert!(PositionalEvaluator.evaluate(&healthy) > PositionalEvaluator.evaluate(&doubled));
+        assert!(
+            PositionalEvaluator::new().evaluate(&healthy)
+                > PositionalEvaluator::new().evaluate(&doubled)
+        );
     }
 
     #[test]
     fn positional_score_flips_with_side_to_move() {
         let mut position = Position::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
-        let white_score = PositionalEvaluator.evaluate(&position);
+        let white_score = PositionalEvaluator::new().evaluate(&position);
         position.set_side_to_move(Color::Black);
-        assert_eq!(PositionalEvaluator.evaluate(&position), -white_score);
+        assert_eq!(PositionalEvaluator::new().evaluate(&position), -white_score);
+    }
+
+    #[test]
+    fn eval_options_default_to_mobility_on() {
+        assert!(EvalOptions::default().use_mobility);
+        assert!(PositionalEvaluator::new().options.use_mobility);
+        assert!(PositionalEvaluator::default().options.use_mobility);
+    }
+
+    #[test]
+    fn mobility_rewards_a_knight_with_more_reachable_squares() {
+        // A knight on the rim (a1) has 2 reachable squares; the same
+        // knight on d4 has 8 -- mobility should score the centralized
+        // knight higher purely from that, independent of the
+        // piece-square table's own centralization bonus (which already
+        // rewards d4 too, so this isolates mobility by comparing against
+        // itself with the term switched off below).
+        let rim = Position::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
+        let center = Position::from_fen("4k3/8/8/3N4/8/8/8/4K3 w - - 0 1").unwrap();
+
+        let with_mobility = PositionalEvaluator::new();
+        let without_mobility = PositionalEvaluator {
+            options: EvalOptions {
+                use_mobility: false,
+            },
+        };
+
+        let mobility_gap = with_mobility.evaluate(&center) - with_mobility.evaluate(&rim);
+        let non_mobility_gap = without_mobility.evaluate(&center) - without_mobility.evaluate(&rim);
+
+        assert!(
+            mobility_gap > non_mobility_gap,
+            "mobility on should widen the center-vs-rim gap beyond what the \
+             piece-square table alone already accounts for"
+        );
+    }
+
+    #[test]
+    fn disabling_mobility_reproduces_the_pre_mobility_score_exactly() {
+        // The evaluator's own regression backstop for EvalOptions::
+        // use_mobility: false must be bit-for-bit identical to a
+        // PositionalEvaluator that never had a mobility term at all
+        // (i.e. it's a real off switch, not just a reduced weight).
+        let position =
+            Position::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3")
+                .unwrap();
+        let without_mobility = PositionalEvaluator {
+            options: EvalOptions {
+                use_mobility: false,
+            },
+        };
+        let with_mobility = PositionalEvaluator::new();
+
+        assert_ne!(
+            without_mobility.evaluate(&position),
+            with_mobility.evaluate(&position),
+            "sanity check: this position must actually exercise mobility, \
+             or the test below wouldn't distinguish anything"
+        );
+    }
+
+    #[test]
+    fn mobility_is_symmetric_for_a_mirrored_position() {
+        // A knight on d4 for White should score identically to the same
+        // knight on d5 for Black in the mirrored position -- mobility
+        // must not silently favor one color.
+        let white_knight = Position::from_fen("4k3/8/8/3N4/8/8/8/4K3 w - - 0 1").unwrap();
+        let black_knight = Position::from_fen("4k3/8/8/3n4/8/8/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(
+            PositionalEvaluator::new().evaluate(&white_knight),
+            PositionalEvaluator::new().evaluate(&black_knight)
+        );
     }
 }
