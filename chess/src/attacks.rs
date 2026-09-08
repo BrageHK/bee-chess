@@ -99,7 +99,13 @@ impl Position {
             .collect()
     }
 
-    fn find_king(&self, color: Color) -> Option<Square> {
+    /// `color`'s king square, or `None` for a malformed position with no
+    /// king of that color at all (see `in_check`'s docs on why that's
+    /// handled rather than panicking). Public since evaluation (see
+    /// `bee_engine::eval`) needs this too, for terms like king safety
+    /// that have to find each side's king without generating any moves.
+    #[must_use]
+    pub fn find_king(&self, color: Color) -> Option<Square> {
         (0..Square::COUNT as u8).map(Square::new).find(|&square| {
             matches!(
                 self.piece_at(square),

@@ -725,6 +725,7 @@ fn run_event_loop<W: Write>(
                         // evaluator's own A/B-testable feature switch,
                         // same convention as the search-side ones above.
                         writeln!(output, "option name UseMobility type check default true")?;
+                        writeln!(output, "option name UseKingSafety type check default true")?;
                         // See `crate::book`'s module docs -- `None` is the
                         // default (a book is an opt-in experiment), `Cow` is
                         // the first, deliberately small opening book.
@@ -823,6 +824,14 @@ fn run_event_loop<W: Write>(
                                 None => engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid UseMobility value: {value}"),
+                                ),
+                            }
+                        } else if name.eq_ignore_ascii_case("UseKingSafety") {
+                            match parse_uci_check(&value) {
+                                Some(enabled) => engine.set_use_king_safety(enabled),
+                                None => engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid UseKingSafety value: {value}"),
                                 ),
                             }
                         } else if name.eq_ignore_ascii_case("OpeningBook") {
@@ -1411,6 +1420,7 @@ mod tests {
         assert!(text.contains("option name UseDeltaPruning type check default true"));
         assert!(text.contains("option name UseEnhancedQuiescence type check default true"));
         assert!(text.contains("option name UseMobility type check default true"));
+        assert!(text.contains("option name UseKingSafety type check default true"));
         assert!(text.contains("option name OpeningBook type combo default None"));
         assert!(
             !text.contains("TimePolicy"),
@@ -1502,6 +1512,32 @@ mod tests {
         let text = String::from_utf8(output).expect("output should be valid utf8");
         assert!(text.contains("ignored invalid UseMobility value: Nonsense"));
         assert!(engine.eval_options().use_mobility);
+    }
+
+    #[test]
+    fn setoption_disables_king_safety() {
+        let input = b"setoption name UseKingSafety value false\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert!(!engine.eval_options().use_king_safety);
+    }
+
+    #[test]
+    fn engine_defaults_to_king_safety_enabled() {
+        let engine = Engine::default();
+        assert!(engine.eval_options().use_king_safety);
+    }
+
+    #[test]
+    fn invalid_use_king_safety_value_keeps_the_current_setting() {
+        let input = b"debug on\nsetoption name UseKingSafety value Nonsense\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("ignored invalid UseKingSafety value: Nonsense"));
+        assert!(engine.eval_options().use_king_safety);
     }
 
     #[test]

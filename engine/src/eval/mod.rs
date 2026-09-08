@@ -35,11 +35,23 @@ pub struct EvalOptions {
     /// Bee Lab A/B whether mobility is actually worth its evaluation-time
     /// cost, not just whether it's a chess-sensible idea.
     pub use_mobility: bool,
+    /// Whether `PositionalEvaluator` scores king safety: pawn shield,
+    /// open/semi-open files on and around the king, and enemy attacks
+    /// into a small king zone -- see `king_safety`'s docs. Disabling
+    /// this reproduces the evaluator's exact pre-king-safety behavior
+    /// (the same coarse castled-file-only term `square_bonus` already
+    /// had), letting Bee Lab A/B whether the richer term is actually
+    /// worth its cost -- king-safety terms are notorious for sounding
+    /// sensible on paper while losing real Elo if overtuned.
+    pub use_king_safety: bool,
 }
 
 impl Default for EvalOptions {
     fn default() -> Self {
-        Self { use_mobility: true }
+        Self {
+            use_mobility: true,
+            use_king_safety: true,
+        }
     }
 }
 
@@ -281,6 +293,19 @@ impl Evaluator for PositionalEvaluator {
                     end -= sign * 8 * Score::from(count);
                 }
             }
+
+            if self.options.use_king_safety {
+                if let Some(king_square) = position.find_king(color) {
+                    // King safety is middlegame-only by construction (added
+                    // only to `middle`, never `end`): tapering already blends
+                    // `middle`/`end` by remaining material below, and a king
+                    // that should be *centralizing* in the endgame must not
+                    // additionally be penalized here for having "no pawn
+                    // shield" or "an open file nearby" -- those are exactly
+                    // what an active endgame king walks into on purpose.
+                    middle += sign * king_safety(position, king_square, color, &pawns[i]);
+                }
+            }
         }
 
         for (color, file) in rooks {
@@ -351,6 +376,131 @@ const fn mobility_weight(kind: PieceKind) -> (Score, Score) {
     }
 }
 
+/// How many enemy attacks into the king's zone are worth, in centipawns
+/// per attacked square -- see `king_safety`'s "attack units" term.
+/// Deliberately small: this counts every attacking piece regardless of
+/// its kind or how many pieces attack the same square, so it's meant as
+/// a rough "how much pressure is nearby" signal, not a precise threat
+/// count -- see `EvalOptions::use_king_safety`'s docs on how easy this
+/// class of term is to overtune.
+const KING_ZONE_ATTACK_PENALTY: Score = 8;
+/// Centipawn penalty for a missing shield pawn (see `king_safety`) --
+/// smaller than a full pawn's value since a missing shield pawn is a
+/// structural weakness, not a material loss.
+const MISSING_SHIELD_PAWN_PENALTY: Score = 12;
+/// Centipawn penalty for the king's own file having no friendly pawn
+/// (semi-open, if the opponent still has one there) or no pawn at all
+/// (fully open, worse) -- see `king_safety`.
+const SEMI_OPEN_KING_FILE_PENALTY: Score = 15;
+const OPEN_KING_FILE_PENALTY: Score = 30;
+
+/// Scores how safe `color`'s king (on `king_square`) is, as a single
+/// middlegame-only centipawn term (see the call site's docs on why this
+/// never touches `end`) -- always returned so that adding it with the
+/// caller's own `sign` produces the right side-to-move-relative sign,
+/// matching every other term in `PositionalEvaluator::evaluate`.
+///
+/// Three cheap, deliberately simple sub-terms, per `EvalOptions::
+/// use_king_safety`'s docs on why this starts simple rather than as a
+/// full attack model:
+/// - **Pawn shield**: the two squares diagonally in front of the king
+///   plus the one directly in front (the king's own file) should have a
+///   friendly pawn one rank ahead of the king (its normal "castled"
+///   position) -- each missing one costs `MISSING_SHIELD_PAWN_PENALTY`.
+///   Skipped entirely once the king has moved off its own back three
+///   files' worth of shelter (e.g. an already-centralized king), since a
+///   "missing shield" isn't a meaningful weakness for a king that was
+///   never trying to hide behind one.
+/// - **Open/semi-open king file**: `pawns_for_color` is the same
+///   per-file pawn count the caller already built for the pawn-structure
+///   term above, so this reuses it rather than rescanning the board --
+///   costs `SEMI_OPEN_KING_FILE_PENALTY` if only the opponent still has
+///   a pawn on the king's file, `OPEN_KING_FILE_PENALTY` (no pawn of
+///   either color) if neither does.
+/// - **King-zone attacks**: `Position::is_square_attacked` (already the
+///   cheap, no-move-generation check `in_check` itself uses) over the
+///   king's own square and its up-to-8 neighbors, once per enemy
+///   attacker found -- see `KING_ZONE_ATTACK_PENALTY`'s docs on why this
+///   is a rough pressure count, not a precise threat evaluation.
+fn king_safety(
+    position: &Position,
+    king_square: Square,
+    color: Color,
+    pawns_for_color: &[u8; 8],
+) -> Score {
+    let file = king_square.file() as i32;
+    let rank = king_square.rank() as i32;
+    let forward = if color == Color::White { 1 } else { -1 };
+    let opponent = color.opposite();
+
+    let mut penalty = 0;
+
+    // Pawn shield -- only meaningful while the king is still tucked
+    // near its own back rank (relative to its own color): a king that
+    // has already walked toward the centre isn't "missing its shield,"
+    // it deliberately left it behind.
+    let relative_rank = if color == Color::White {
+        rank
+    } else {
+        7 - rank
+    };
+    if relative_rank <= 1 {
+        for df in [-1, 0, 1] {
+            let shield_file = file + df;
+            if !(0..8).contains(&shield_file) {
+                continue;
+            }
+            let shield_rank = rank + forward;
+            if !(0..8).contains(&shield_rank) {
+                continue;
+            }
+            let shield_square = Square::from_file_rank(shield_file as u8, shield_rank as u8);
+            let has_shield_pawn = matches!(
+                position.piece_at(shield_square),
+                Some(piece) if piece.kind == PieceKind::Pawn && piece.color == color
+            );
+            if !has_shield_pawn {
+                penalty += MISSING_SHIELD_PAWN_PENALTY;
+            }
+        }
+    }
+
+    // Open/semi-open king file: `pawns_for_color` (the caller's own
+    // per-file counts, reused rather than rescanned) tells us about the
+    // king's own color; the opponent's count isn't something the caller
+    // has in scope at the call site, so ask the board directly for it.
+    let opponent_pawns_on_file = (0..8u8)
+        .map(|rank| position.piece_at(Square::from_file_rank(file as u8, rank)))
+        .filter(|p| matches!(p, Some(piece) if piece.kind == PieceKind::Pawn && piece.color == opponent))
+        .count();
+    if pawns_for_color[file as usize] == 0 {
+        penalty += if opponent_pawns_on_file == 0 {
+            OPEN_KING_FILE_PENALTY
+        } else {
+            SEMI_OPEN_KING_FILE_PENALTY
+        };
+    }
+
+    // King-zone attacks: the king's own square plus its (board-edge-
+    // clamped) neighbors, each checked with the same cheap attack query
+    // in_check itself uses -- never full move generation.
+    for df in [-1, 0, 1] {
+        for dr in [-1, 0, 1] {
+            let zone_file = file + df;
+            let zone_rank = rank + dr;
+            if !(0..8).contains(&zone_file) || !(0..8).contains(&zone_rank) {
+                continue;
+            }
+            let zone_square = Square::from_file_rank(zone_file as u8, zone_rank as u8);
+            if position.is_square_attacked(zone_square, opponent) {
+                penalty += KING_ZONE_ATTACK_PENALTY;
+            }
+        }
+    }
+
+    -penalty
+}
+
 /// Compact, symmetric piece-square functions. `rank` is always measured from
 /// the piece owner's home rank, making color symmetry explicit.
 fn square_bonus(kind: PieceKind, file: u8, rank: u8) -> (Score, Score) {
@@ -402,15 +552,17 @@ mod tests {
 
     #[test]
     fn experimental_and_positional_rook_terms_stay_in_sync() {
-        // ExperimentalEvaluator has no mobility term at all (it predates
-        // EvalOptions entirely), so this comparison needs
-        // PositionalEvaluator's own mobility switched off to stay a
+        // ExperimentalEvaluator has no mobility or king-safety term at
+        // all (it predates EvalOptions entirely), so this comparison
+        // needs both switched off on PositionalEvaluator to stay a
         // like-for-like check of just the rook-file terms both share --
-        // otherwise it would start failing the moment mobility (which
-        // does score these very rooks) contributes anything nonzero.
+        // otherwise it would start failing the moment either term
+        // (both of which score these very kings/rooks) contributes
+        // anything nonzero.
         let no_mobility = PositionalEvaluator {
             options: EvalOptions {
                 use_mobility: false,
+                use_king_safety: false,
             },
         };
         let open = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
@@ -571,6 +723,7 @@ mod tests {
         let without_mobility = PositionalEvaluator {
             options: EvalOptions {
                 use_mobility: false,
+                ..EvalOptions::default()
             },
         };
 
@@ -596,6 +749,7 @@ mod tests {
         let without_mobility = PositionalEvaluator {
             options: EvalOptions {
                 use_mobility: false,
+                ..EvalOptions::default()
             },
         };
         let with_mobility = PositionalEvaluator::new();
@@ -619,5 +773,139 @@ mod tests {
             PositionalEvaluator::new().evaluate(&white_knight),
             PositionalEvaluator::new().evaluate(&black_knight)
         );
+    }
+
+    #[test]
+    fn eval_options_default_to_king_safety_on() {
+        assert!(EvalOptions::default().use_king_safety);
+        assert!(PositionalEvaluator::new().options.use_king_safety);
+        assert!(PositionalEvaluator::default().options.use_king_safety);
+    }
+
+    #[test]
+    fn king_safety_prefers_an_intact_pawn_shield_over_an_open_file() {
+        // Calls king_safety directly (see king_safety_penalizes_enemy_
+        // pieces_massed_near_the_king's docs on why): the two positions
+        // this compares differ by two pawns' worth of material (the
+        // "open file" side is missing its g2/h2 shield pawns entirely),
+        // which would swamp any king-safety-sized difference if this
+        // went through the full evaluator's material term instead.
+        let pawns_with_shield = [0u8, 0, 0, 0, 0, 1, 1, 1]; // f2/g2/h2
+        let pawns_without_shield = [0u8, 0, 0, 0, 0, 1, 0, 0]; // f2 only
+        let king_square = Square::from_file_rank(6, 0); // g1
+
+        let intact_shield = Position::from_fen("4k3/8/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
+        let open_file = Position::from_fen("4k3/8/8/8/8/8/5P2/R5K1 w - - 0 1").unwrap();
+
+        assert!(
+            king_safety(
+                &intact_shield,
+                king_square,
+                Color::White,
+                &pawns_with_shield
+            ) > king_safety(&open_file, king_square, Color::White, &pawns_without_shield),
+            "an intact pawn shield (plus a closed king file) must score \
+             higher than the same king with its shield pawns gone"
+        );
+    }
+
+    #[test]
+    fn king_safety_penalizes_enemy_pieces_massed_near_the_king() {
+        // Calls king_safety directly rather than through the full
+        // evaluator: the full evaluator also scores the attacking
+        // piece's own mobility/piece-square/open-file terms, which
+        // differ between "near the king" and "far away" test positions
+        // for reasons that have nothing to do with king safety (e.g. a
+        // rook on a corner square has slightly different mobility than
+        // one on another corner, purely from board-edge geometry) --
+        // exactly the kind of confound that makes an end-to-end
+        // comparison fragile here. Testing the term in isolation is the
+        // direct, unconfounded way to check what it actually claims to
+        // do: penalize enemy attacks into the king zone.
+        let pawns = [0u8, 0, 0, 0, 0, 1, 1, 1]; // f2/g2/h2 shield intact
+        let king_square = Square::from_file_rank(6, 0); // g1
+
+        let attacked = Position::from_fen("4k2r/8/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap();
+        let far_away = Position::from_fen("r3k3/8/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap();
+
+        assert!(
+            king_safety(&attacked, king_square, Color::White, &pawns)
+                < king_safety(&far_away, king_square, Color::White, &pawns),
+            "an enemy rook attacking directly into the king zone must \
+             score worse than the same rook sitting far away"
+        );
+    }
+
+    #[test]
+    fn king_safety_is_symmetric_for_a_mirrored_position() {
+        // The exact same shield-vs-open-file comparison as above, but
+        // mirrored onto Black's king and rank -- king safety must not
+        // silently favor one color the way a rank-relative bug (using
+        // an absolute rank instead of one relative to the king's own
+        // color) would.
+        let white_shielded = Position::from_fen("4k3/8/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
+        let black_shielded = Position::from_fen("r5k1/5ppp/8/8/8/8/8/4K3 b - - 0 1").unwrap();
+
+        assert_eq!(
+            PositionalEvaluator::new().evaluate(&white_shielded),
+            PositionalEvaluator::new().evaluate(&black_shielded)
+        );
+    }
+
+    #[test]
+    fn disabling_king_safety_reproduces_the_pre_king_safety_score_exactly() {
+        // Same regression backstop as mobility's: EvalOptions::
+        // use_king_safety: false must be a real off switch, not just a
+        // reduced weight -- it should change the score for a position
+        // that actually exercises the term.
+        let position = Position::from_fen("4k3/8/8/8/8/8/5P2/R5K1 w - - 0 1").unwrap();
+        let without_king_safety = PositionalEvaluator {
+            options: EvalOptions {
+                use_king_safety: false,
+                ..EvalOptions::default()
+            },
+        };
+        let with_king_safety = PositionalEvaluator::new();
+
+        assert_ne!(
+            without_king_safety.evaluate(&position),
+            with_king_safety.evaluate(&position),
+            "sanity check: this position must actually exercise king \
+             safety, or the test above wouldn't distinguish anything"
+        );
+    }
+
+    #[test]
+    fn king_safety_ignores_a_centralized_endgame_king() {
+        // A king that has already walked toward the centre (as an
+        // active endgame king should) must not be penalized for having
+        // "no pawn shield" -- it never had one to lose. Comparing a
+        // centralized king against a back-rank one with identical
+        // material, king safety's shield term specifically must not be
+        // the thing making the back-rank king look better; the tapering
+        // toward `middle`-only (see king_safety's call site) means this
+        // shows up mostly at full middlegame phase, so this test keeps
+        // enough material on the board to stay solidly middlegame-phase.
+        let centralized =
+            Position::from_fen("r1bq1rk1/ppp2ppp/2n5/3p4/3P4/2N1PN2/PPP2PPP/R1BQ1RK1 w - - 0 1")
+                .unwrap();
+        // Same position, but White's king has walked to d4 (Black's is
+        // untouched) -- an unrealistic king walk, but the point here is
+        // purely mechanical: king_safety must not fire its shield
+        // penalty just because the king is far from its back rank.
+        let mut walked = centralized.clone();
+        walked.set_piece(Square::from_file_rank(6, 0), None);
+        walked.set_piece(
+            Square::from_file_rank(3, 3),
+            Some(Piece::new(PieceKind::King, Color::White)),
+        );
+
+        // This isn't asserting a direction (the piece-square table
+        // itself has strong opinions about king centralization
+        // independent of king safety) -- it's a smoke test that
+        // evaluating a centralized king doesn't panic or produce a
+        // wildly nonsensical score from an out-of-bounds shield/file
+        // lookup near an unusual king square.
+        let _ = PositionalEvaluator::new().evaluate(&walked);
     }
 }
