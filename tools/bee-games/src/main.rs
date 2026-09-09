@@ -1,12 +1,13 @@
 //! `bee-games`: a thin CLI over `bee-game-catalog`, so the catalog's real
 //! API is `GameCatalog` itself (see its crate docs) and not anything
-//! defined here. Deliberately boring for this first slice -- three
-//! subcommands, hand-rolled argument parsing (not worth a `clap` dependency
-//! for this few flags):
+//! defined here. Deliberately boring -- hand-rolled argument parsing (not
+//! worth a `clap` dependency for this few flags):
 //!
 //!   bee-games sync lichess <username>
 //!   bee-games count
 //!   bee-games list --limit 20
+//!   bee-games book build-experience --player <name> [--max-ply 20]
+//!       [--min-games 5] --output <path.book>
 //!
 //! The database path defaults to `data/games/catalog.sqlite3` under the
 //! repo root (resolved the same way `lab/src/main.rs` resolves its own
@@ -14,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use bee_game_catalog::book::{self, BuildConfig};
 use bee_game_catalog::{import::lichess, GameCatalog, GameFilter};
 
 #[tokio::main]
@@ -42,6 +44,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [cmd, rest @ ..] if cmd == "list" => list(&catalog, rest),
+        [cmd, sub, rest @ ..] if cmd == "book" && sub == "build-experience" => {
+            build_experience(&catalog, rest)
+        }
         _ => {
             print_usage();
             Err("unrecognized command".to_string())
@@ -91,9 +96,84 @@ fn parse_limit(args: &[String]) -> Result<usize, String> {
     }
 }
 
+/// Builds an `ExperienceBook` artifact from `player`'s games and writes
+/// both the `.book` binary and its `.book.json` manifest (same path,
+/// with `.json` appended) -- see `bee_game_catalog::book`'s docs for the
+/// pipeline this drives. `--player` and `--output` are required; `run`
+/// twice with the same catalog/flags is expected to produce a
+/// byte-identical `.book` (see `book::builder`'s determinism tests).
+fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
+    let mut player: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut config = BuildConfig::default();
+
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        let mut value = || {
+            iter.next()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
+        match flag.as_str() {
+            "--player" => player = Some(value()?.clone()),
+            "--output" => output = Some(PathBuf::from(value()?)),
+            "--max-ply" => {
+                config.max_ply = value()?
+                    .parse()
+                    .map_err(|_| "invalid --max-ply value".to_string())?;
+            }
+            "--min-games" => {
+                config.min_games = value()?
+                    .parse()
+                    .map_err(|_| "invalid --min-games value".to_string())?;
+            }
+            other => return Err(format!("unrecognized flag: {other}")),
+        }
+    }
+
+    let player = player.ok_or("--player is required")?;
+    let output = output.ok_or("--output is required")?;
+
+    let (entries, report) = book::build(catalog, &player, &config).map_err(|e| e.to_string())?;
+
+    let mut book_bytes = Vec::new();
+    book::write(&entries, &mut book_bytes).map_err(|e| e.to_string())?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&output, &book_bytes)
+        .map_err(|e| format!("writing {}: {e}", output.display()))?;
+
+    let manifest = book::Manifest::new(&player, &config, &report, &book_bytes);
+    let manifest_path = manifest_path_for(&output);
+    std::fs::write(&manifest_path, manifest.to_json())
+        .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
+
+    println!(
+        "built {} ({} positions) from {} game(s) for {player} ({} skipped as unresolvable)",
+        output.display(),
+        report.positions,
+        report.games_considered,
+        report.games_skipped_unresolvable,
+    );
+    println!("manifest: {}", manifest_path.display());
+
+    Ok(())
+}
+
+/// The manifest path for a given `.book` output path: the same path
+/// with `.json` appended (e.g. `experience-v1.book` ->
+/// `experience-v1.book.json`), matching the design's
+/// `experience-v1.book`/`experience-v1.json` pairing in spirit while
+/// keeping the two files unambiguously associated by name.
+fn manifest_path_for(book_path: &Path) -> PathBuf {
+    let mut manifest = book_path.as_os_str().to_owned();
+    manifest.push(".json");
+    PathBuf::from(manifest)
+}
+
 fn print_usage() {
     eprintln!(
-        "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]"
+        "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--max-ply 20] [--min-games 5] --output <path.book>"
     );
 }
 
