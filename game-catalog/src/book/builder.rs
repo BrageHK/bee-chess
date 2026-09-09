@@ -175,22 +175,38 @@ impl ExperienceStats {
 }
 
 /// Builds an `ExperienceBook` artifact (as ready-to-write `BookEntry`s,
-/// sorted by key) from `player`'s games in `catalog`. `player` is
-/// matched the same way `GameFilter::player` matches -- as either side.
+/// sorted by key) from `players`' games in `catalog`, treating every
+/// name in `players` as the same learning identity -- e.g. Bee's games
+/// played under two different Lichess accounts are pooled into one
+/// book, rather than needing a separate build (and a separate merge
+/// step) per account. Each name is matched the same way
+/// `GameFilter::player` matches a single one -- as either side.
+///
+/// A game gets counted at most once even if, in principle, more than
+/// one name in `players` could match it (an account playing itself is
+/// not a real scenario this needs to handle correctly, but `players`
+/// containing the same name twice, or two names that both happen to
+/// match one game, must not double-count that game's outcome).
 pub fn build(
     catalog: &GameCatalog,
-    player: &str,
+    players: &[&str],
     config: &BuildConfig,
 ) -> Result<(Vec<BookEntry>, BuildReport)> {
-    let games = catalog.games(&GameFilter::all().player(player))?;
     let mut stats = ExperienceStats::default();
     let mut games_considered = 0u64;
     let mut games_skipped_unresolvable = 0u64;
+    let mut seen_game_ids = std::collections::HashSet::new();
 
-    for game in &games {
-        match record_game(&mut stats, game, player, config) {
-            Ok(()) => games_considered += 1,
-            Err(_) => games_skipped_unresolvable += 1,
+    for &player in players {
+        let games = catalog.games(&GameFilter::all().player(player))?;
+        for game in &games {
+            if !seen_game_ids.insert(game.id.clone()) {
+                continue;
+            }
+            match record_game(&mut stats, game, player, config) {
+                Ok(()) => games_considered += 1,
+                Err(_) => games_skipped_unresolvable += 1,
+            }
         }
     }
 
@@ -360,7 +376,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (entries, report) = build(&catalog, "Bee", &BuildConfig::default()).unwrap();
+        let (entries, report) = build(&catalog, &["Bee"], &BuildConfig::default()).unwrap();
         assert_eq!(report.games_considered, 5);
         assert_eq!(report.games_skipped_unresolvable, 0);
 
@@ -385,7 +401,7 @@ mod tests {
             min_games: 5,
             ..BuildConfig::default()
         };
-        let (entries, _) = build(&catalog, "Bee", &config).unwrap();
+        let (entries, _) = build(&catalog, &["Bee"], &config).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -404,7 +420,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (entries, _) = build(&catalog, "Bee", &BuildConfig::default()).unwrap();
+        let (entries, _) = build(&catalog, &["Bee"], &BuildConfig::default()).unwrap();
         // Bee is Black here: it moved after "e4" (playing e5) and after
         // "Nf3" (playing Nc6) -- two distinct positions, not four.
         assert_eq!(entries.len(), 2);
@@ -430,7 +446,7 @@ mod tests {
             min_games: 1,
             ..BuildConfig::default()
         };
-        let (entries, _) = build(&catalog, "Bee", &config).unwrap();
+        let (entries, _) = build(&catalog, &["Bee"], &config).unwrap();
         // Only ply 0 (the position before "e4") is within max_ply=1.
         assert_eq!(entries.len(), 1);
     }
@@ -447,7 +463,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (_, report) = build(&catalog, "Bee", &BuildConfig::default()).unwrap();
+        let (_, report) = build(&catalog, &["Bee"], &BuildConfig::default()).unwrap();
         assert_eq!(report.games_considered, 5);
         assert_eq!(report.games_skipped_unresolvable, 1);
     }
@@ -467,8 +483,8 @@ mod tests {
         }
 
         let config = BuildConfig::default();
-        let (entries_a, _) = build(&catalog, "Bee", &config).unwrap();
-        let (entries_b, _) = build(&catalog, "Bee", &config).unwrap();
+        let (entries_a, _) = build(&catalog, &["Bee"], &config).unwrap();
+        let (entries_b, _) = build(&catalog, &["Bee"], &config).unwrap();
 
         let mut bytes_a = Vec::new();
         let mut bytes_b = Vec::new();
@@ -489,5 +505,62 @@ mod tests {
         // 10-game 500 prior must pull it well below that.
         assert!(score < 1000);
         assert!(score > 500);
+    }
+
+    #[test]
+    fn multiple_player_names_pool_into_one_identity() {
+        // Bee's own games played under two different accounts: build
+        // with both names should see every game from either account,
+        // as if they were one player.
+        let catalog = GameCatalog::open_in_memory().unwrap();
+        for i in 0..3 {
+            catalog
+                .upsert_game(&game(
+                    &format!("johan{i}"),
+                    "BeeJohan",
+                    "opp",
+                    "1-0",
+                    "e4 e5",
+                ))
+                .unwrap();
+        }
+        for i in 0..3 {
+            catalog
+                .upsert_game(&game(
+                    &format!("magnus{i}"),
+                    "BeeMagnus",
+                    "opp",
+                    "1-0",
+                    "e4 e5",
+                ))
+                .unwrap();
+        }
+
+        let config = BuildConfig {
+            min_games: 5,
+            ..BuildConfig::default()
+        };
+        let (entries, report) = build(&catalog, &["BeeJohan", "BeeMagnus"], &config).unwrap();
+
+        assert_eq!(report.games_considered, 6);
+        let startpos_key = book_position_key(&Position::startpos());
+        let entry = entries.iter().find(|e| e.key == startpos_key).unwrap();
+        // Pooled: 6 games total, clearing the min_games=5 threshold
+        // that neither account alone (3 games each) would clear.
+        assert_eq!(entry.candidates[0].games, 6);
+    }
+
+    #[test]
+    fn a_game_matching_more_than_one_requested_name_is_not_double_counted() {
+        // Contrived (a real account never plays itself), but the
+        // contract must hold regardless: the same game id must
+        // contribute its outcome at most once.
+        let catalog = GameCatalog::open_in_memory().unwrap();
+        catalog
+            .upsert_game(&game("g1", "Bee", "Bee", "1-0", "e4 e5"))
+            .unwrap();
+
+        let (_, report) = build(&catalog, &["Bee", "Bee"], &BuildConfig::default()).unwrap();
+        assert_eq!(report.games_considered, 1);
     }
 }

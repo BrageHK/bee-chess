@@ -17,7 +17,13 @@ use super::key::KEY_SCHEME_VERSION;
 pub struct Manifest {
     pub format_version: u16,
     pub key_scheme_version: u16,
-    pub player: String,
+    /// Every player identity pooled into this book -- see
+    /// `book::build`'s docs on treating multiple names (e.g. Bee's
+    /// games played under more than one Lichess account) as one
+    /// learning identity. A single-account book still stores a
+    /// one-element list, so a manifest reader never needs to special-
+    /// case "how many players".
+    pub players: Vec<String>,
     pub games_considered: u64,
     pub games_skipped_unresolvable: u64,
     pub positions: u64,
@@ -31,7 +37,7 @@ pub struct Manifest {
 impl Manifest {
     #[must_use]
     pub fn new(
-        player: &str,
+        players: &[&str],
         config: &BuildConfig,
         report: &BuildReport,
         book_bytes: &[u8],
@@ -39,7 +45,7 @@ impl Manifest {
         Self {
             format_version: FORMAT_VERSION,
             key_scheme_version: KEY_SCHEME_VERSION,
-            player: player.to_string(),
+            players: players.iter().map(|p| p.to_string()).collect(),
             games_considered: report.games_considered,
             games_skipped_unresolvable: report.games_skipped_unresolvable,
             positions: report.positions,
@@ -55,11 +61,17 @@ impl Manifest {
     /// declaration order, deterministically, on every call.
     #[must_use]
     pub fn to_json(&self) -> String {
+        let players = self
+            .players
+            .iter()
+            .map(|p| json_string(p))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "{{\n  \"format_version\": {},\n  \"key_scheme_version\": {},\n  \"player\": {},\n  \"games_considered\": {},\n  \"games_skipped_unresolvable\": {},\n  \"positions\": {},\n  \"max_ply\": {},\n  \"min_games\": {},\n  \"prior_games\": {},\n  \"prior_score_per_mille\": {},\n  \"book_sha256\": {}\n}}\n",
+            "{{\n  \"format_version\": {},\n  \"key_scheme_version\": {},\n  \"players\": [{}],\n  \"games_considered\": {},\n  \"games_skipped_unresolvable\": {},\n  \"positions\": {},\n  \"max_ply\": {},\n  \"min_games\": {},\n  \"prior_games\": {},\n  \"prior_score_per_mille\": {},\n  \"book_sha256\": {}\n}}\n",
             self.format_version,
             self.key_scheme_version,
-            json_string(&self.player),
+            players,
             self.games_considered,
             self.games_skipped_unresolvable,
             self.positions,
@@ -108,16 +120,30 @@ mod tests {
             games_skipped_unresolvable: 1,
             positions: 7,
         };
-        let manifest = Manifest::new("Bee\"Account", &config, &report, b"hello");
+        let manifest = Manifest::new(&["Bee\"Account"], &config, &report, b"hello");
         let json = manifest.to_json();
 
         assert!(json.contains("\"format_version\": 1"));
         assert!(json.contains("\"games_considered\": 42"));
-        assert!(json.contains("\"player\": \"Bee\\\"Account\""));
+        assert!(json.contains("\"players\": [\"Bee\\\"Account\"]"));
         // sha256("hello")
         assert!(json.contains(
             "\"book_sha256\": \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\""
         ));
+    }
+
+    #[test]
+    fn multiple_players_render_as_a_json_array() {
+        let config = BuildConfig::default();
+        let report = super::super::builder::BuildReport {
+            games_considered: 99,
+            games_skipped_unresolvable: 0,
+            positions: 12,
+        };
+        let manifest = Manifest::new(&["beechessjohan", "beechessmagnus"], &config, &report, b"x");
+        assert!(manifest
+            .to_json()
+            .contains("\"players\": [\"beechessjohan\", \"beechessmagnus\"]"));
     }
 
     #[test]
@@ -128,8 +154,8 @@ mod tests {
             games_skipped_unresolvable: 0,
             positions: 1,
         };
-        let a = Manifest::new("Bee", &config, &report, b"x").to_json();
-        let b = Manifest::new("Bee", &config, &report, b"x").to_json();
+        let a = Manifest::new(&["Bee"], &config, &report, b"x").to_json();
+        let b = Manifest::new(&["Bee"], &config, &report, b"x").to_json();
         assert_eq!(a, b);
     }
 }
