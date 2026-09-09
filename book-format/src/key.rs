@@ -9,7 +9,7 @@ use bee_chess_core::{Color, Piece, PieceKind, Position, Square};
 /// The book-key scheme version this build writes and reads. Bumped
 /// whenever the fields folded into the key change, so an artifact built
 /// under an old scheme is never silently misread as a newer one (or
-/// vice versa) -- see `book::format`'s header, which stores this
+/// vice versa) -- see `crate::format`'s header, which stores this
 /// alongside the artifact's own format version.
 pub const KEY_SCHEME_VERSION: u16 = 1;
 

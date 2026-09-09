@@ -149,7 +149,13 @@ fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String
     std::fs::write(&output, &book_bytes)
         .map_err(|e| format!("writing {}: {e}", output.display()))?;
 
-    let manifest = book::Manifest::new(&player_refs, &config, &report, &book_bytes);
+    let manifest = book::Manifest::new(
+        &player_refs,
+        &config,
+        &report,
+        &book_bytes,
+        builder_commit(),
+    );
     let manifest_path = manifest_path_for(&output);
     std::fs::write(&manifest_path, manifest.to_json())
         .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
@@ -168,14 +174,29 @@ fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String
 }
 
 /// The manifest path for a given `.book` output path: the same path
-/// with `.json` appended (e.g. `experience-v1.book` ->
-/// `experience-v1.book.json`), matching the design's
-/// `experience-v1.book`/`experience-v1.json` pairing in spirit while
-/// keeping the two files unambiguously associated by name.
+/// with its extension replaced by `.json` (e.g. `experience-v1.book`
+/// -> `experience-v1.json`), matching the `books/experience-v1.book` +
+/// `books/experience-v1.json` pairing this was designed around.
 fn manifest_path_for(book_path: &Path) -> PathBuf {
-    let mut manifest = book_path.as_os_str().to_owned();
-    manifest.push(".json");
-    PathBuf::from(manifest)
+    book_path.with_extension("json")
+}
+
+/// The full commit hash `HEAD` was at when this book was built, for the
+/// manifest's `builder_commit` field -- best-effort: `None` (rendered
+/// as JSON `null`, never a fabricated placeholder) if `git` isn't
+/// available or this isn't a git checkout at all, since a manifest must
+/// never claim a provenance it couldn't actually determine.
+fn builder_commit() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?;
+    Some(commit.trim().to_string())
 }
 
 fn print_usage() {

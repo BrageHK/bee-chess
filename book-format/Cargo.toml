@@ -1,0 +1,10 @@
+[package]
+name = "bee-book-format"
+version = "0.1.0"
+edition = "2021"
+description = "The .book binary artifact format and position-key scheme for Bee's experience books: read/write plus the position-identity hash, shared by the offline builder (bee-game-catalog) and the engine's runtime ExperienceBook reader. Deliberately zero-dependency beyond bee-chess-core, so the competition engine binary can read a book without gaining any of bee-game-catalog's HTTP/SQLite dependencies."
+license = "MIT"
+
+[dependencies]
+bee-chess-core = { path = "../chess" }
+thiserror = "1"

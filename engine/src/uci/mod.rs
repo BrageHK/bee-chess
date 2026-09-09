@@ -731,10 +731,13 @@ fn run_event_loop<W: Write>(
                         writeln!(output, "option name UseKingSafety type check default true")?;
                         // See `crate::book`'s module docs -- `None` is the
                         // default (a book is an opt-in experiment), `Cow` is
-                        // the first, deliberately small opening book.
+                        // the first, deliberately small opening book, and
+                        // `Experience` is a real, data-backed book built
+                        // offline from Bee's own game history (see
+                        // `crate::book::experience`'s docs).
                         writeln!(
                             output,
-                            "option name OpeningBook type combo default None var None var Cow"
+                            "option name OpeningBook type combo default None var None var Cow var Experience"
                         )?;
                         // See `crate::search::TimeManagerConfig::move_overhead`'s
                         // docs -- milliseconds reserved every move for
@@ -1624,6 +1627,79 @@ mod tests {
         // A book hit has no real search depth -- no "info depth ..."
         // line should have been written for it.
         assert!(!text.contains("info depth"));
+    }
+
+    #[test]
+    fn setoption_enables_the_experience_opening_book() {
+        let input = b"setoption name OpeningBook value Experience\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        assert_eq!(engine.opening_book_kind(), OpeningBookKind::Experience);
+    }
+
+    #[test]
+    fn experience_opening_book_plays_a_book_move_instantly_from_startpos() {
+        // The shipped books/experience-v1.book has an entry for the
+        // start position (built from Bee's real Lichess games -- see
+        // the book's own manifest) whose top candidate is Nb1-c3.
+        // Regenerating the artifact with different data could change
+        // which move this is; the important invariant this test
+        // guards is "a real book hit plays instantly", not that Nb1c3
+        // specifically stays the top move forever.
+        let input = b"setoption name OpeningBook value Experience\ngo depth 4\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("bestmove b1c3"));
+        assert!(!text.contains("info depth"));
+    }
+
+    #[test]
+    fn experience_opening_book_hit_reports_source_and_stats_once_drained() {
+        // The book-hit diagnostic (`book source=... move=... games=...
+        // score_permille=...`) is emitted onto the engine that ran
+        // inside `go`'s search worker -- like every other diagnostic
+        // from a `go` command, it only becomes visible once a
+        // *subsequent* command drains it (see `run_event_loop`'s
+        // `Event::Search(SearchEvent::Done(_))` arm, which does not
+        // itself drain diagnostics), so this asserts it shows up after
+        // an `isready` following the `go`, not immediately alongside
+        // `bestmove`. That ordering gap is pre-existing (it applies
+        // identically to `CowOpeningBook`'s plain "book hit (Cow): ..."
+        // message) and out of scope for this change; what this test
+        // guards is that `ExperienceBook`'s richer diagnostic content
+        // is correct once it does surface.
+        let input =
+            b"debug on\nsetoption name OpeningBook value Experience\ngo depth 4\nisready\nquit\n"
+                .as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains("book source=experience move=b1c3 games=17 score_permille=425"));
+    }
+
+    #[test]
+    fn opening_book_still_defaults_to_none_with_experience_available() {
+        // Adding the Experience variant must not change what a fresh
+        // engine does with no options set -- see `OpeningBookKind`'s
+        // docs on why this matters for a clean A/B comparison.
+        let engine = Engine::default();
+        assert_eq!(engine.opening_book_kind(), OpeningBookKind::None);
+    }
+
+    #[test]
+    fn uci_advertises_experience_as_an_opening_book_option() {
+        let input = b"uci\nquit\n".as_slice();
+        let mut output = Vec::new();
+        let mut engine = Engine::default();
+        run(input, &mut output, &mut engine).expect("run should succeed");
+        let text = String::from_utf8(output).expect("output should be valid utf8");
+        assert!(text.contains(
+            "option name OpeningBook type combo default None var None var Cow var Experience"
+        ));
     }
 
     #[test]

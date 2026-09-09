@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["chess", "engine", "lab", "game-catalog", "tools/bee-games"]
+members = ["chess", "engine", "lab", "book-format", "game-catalog", "tools/bee-games"]
 
 # `bee` (in engine/) stays the competition binary with zero web/orchestration
 # dependencies -- see #67's architecture issue. `lab` is a separate crate for
@@ -19,3 +19,10 @@ members = ["chess", "engine", "lab", "game-catalog", "tools/bee-games"]
 # reqwest/rusqlite/an HTTP Lichess client, none of which the competition
 # engine binary should ever depend on. It is offline data tooling, not part
 # of the engine's search hot path.
+#
+# `book-format` (bee-book-format) is the .book binary artifact format and
+# position-key scheme, split out from game-catalog specifically so engine/
+# can read a book (via its ExperienceBook OpeningBook impl) without gaining
+# game-catalog's HTTP/SQLite dependencies -- it depends on nothing but
+# `chess`. game-catalog's offline builder and engine's runtime reader are
+# the format's only two consumers, sharing this one contract between them.

@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "book_key_version": 1,
+  "source_accounts": ["beechessjohan", "beechessmagnus"],
+  "games_considered": 100,
+  "usable_games": 100,
+  "positions": 15,
+  "max_ply": 20,
+  "min_games": 5,
+  "prior_games": 10,
+  "prior_score_per_mille": 500,
+  "builder_commit": "69a6e2ec8a59daad23468656b74f03c5b155255a",
+  "sha256": "d227748f9408002418e7c65add540da56598b74a413c440dd3efb3f907a48d8c"
+}
