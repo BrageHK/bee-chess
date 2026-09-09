@@ -22,10 +22,14 @@
 //! needs per-position data derives it from [`GameRecord::plies`] rather
 //! than the catalog pre-exploding it. [`book`] is exactly that consumer:
 //! it replays a player's games and builds a deterministic `ExperienceBook`
-//! artifact from them. Any Lab HTTP surface over this catalog is still
-//! out of scope for this crate; see `tools/bee-games` for the CLI that
-//! exercises both the catalog and the book builder today.
+//! artifact from them. [`analysis`] is the persistence layer for a
+//! separate, later consumer -- a post-game Stockfish analyzer -- storing
+//! per-move and per-game analysis results; this crate itself runs no
+//! analysis (see its module docs). Any Lab HTTP surface over this catalog
+//! is still out of scope for this crate; see `tools/bee-games` for the
+//! CLI that exercises the catalog and the book builder today.
 
+pub mod analysis;
 pub mod book;
 mod catalog;
 mod error;
