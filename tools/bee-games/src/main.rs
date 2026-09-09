@@ -6,8 +6,8 @@
 //!   bee-games sync lichess <username>
 //!   bee-games count
 //!   bee-games list --limit 20
-//!   bee-games book build-experience --player <name> [--max-ply 20]
-//!       [--min-games 5] --output <path.book>
+//!   bee-games book build-experience --player <name> [--player <name> ...]
+//!       [--max-ply 20] [--min-games 5] --output <path.book>
 //!
 //! The database path defaults to `data/games/catalog.sqlite3` under the
 //! repo root (resolved the same way `lab/src/main.rs` resolves its own
@@ -96,14 +96,16 @@ fn parse_limit(args: &[String]) -> Result<usize, String> {
     }
 }
 
-/// Builds an `ExperienceBook` artifact from `player`'s games and writes
-/// both the `.book` binary and its `.book.json` manifest (same path,
-/// with `.json` appended) -- see `bee_game_catalog::book`'s docs for the
-/// pipeline this drives. `--player` and `--output` are required; `run`
-/// twice with the same catalog/flags is expected to produce a
-/// byte-identical `.book` (see `book::builder`'s determinism tests).
+/// Builds an `ExperienceBook` artifact from one or more players' games
+/// (pooled into one learning identity -- see `book::build`'s docs; pass
+/// `--player` more than once for e.g. Bee's games played under
+/// multiple Lichess accounts) and writes both the `.book` binary and
+/// its `.book.json` manifest (same path, with `.json` appended). At
+/// least one `--player` and `--output` are required; `run` twice with
+/// the same catalog/flags is expected to produce a byte-identical
+/// `.book` (see `book::builder`'s determinism tests).
 fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
-    let mut player: Option<String> = None;
+    let mut players: Vec<String> = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut config = BuildConfig::default();
 
@@ -114,7 +116,7 @@ fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String
                 .ok_or_else(|| format!("{flag} requires a value"))
         };
         match flag.as_str() {
-            "--player" => player = Some(value()?.clone()),
+            "--player" => players.push(value()?.clone()),
             "--output" => output = Some(PathBuf::from(value()?)),
             "--max-ply" => {
                 config.max_ply = value()?
@@ -130,10 +132,14 @@ fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String
         }
     }
 
-    let player = player.ok_or("--player is required")?;
+    if players.is_empty() {
+        return Err("at least one --player is required".to_string());
+    }
     let output = output.ok_or("--output is required")?;
+    let player_refs: Vec<&str> = players.iter().map(String::as_str).collect();
 
-    let (entries, report) = book::build(catalog, &player, &config).map_err(|e| e.to_string())?;
+    let (entries, report) =
+        book::build(catalog, &player_refs, &config).map_err(|e| e.to_string())?;
 
     let mut book_bytes = Vec::new();
     book::write(&entries, &mut book_bytes).map_err(|e| e.to_string())?;
@@ -143,16 +149,17 @@ fn build_experience(catalog: &GameCatalog, args: &[String]) -> Result<(), String
     std::fs::write(&output, &book_bytes)
         .map_err(|e| format!("writing {}: {e}", output.display()))?;
 
-    let manifest = book::Manifest::new(&player, &config, &report, &book_bytes);
+    let manifest = book::Manifest::new(&player_refs, &config, &report, &book_bytes);
     let manifest_path = manifest_path_for(&output);
     std::fs::write(&manifest_path, manifest.to_json())
         .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
 
     println!(
-        "built {} ({} positions) from {} game(s) for {player} ({} skipped as unresolvable)",
+        "built {} ({} positions) from {} game(s) for {} ({} skipped as unresolvable)",
         output.display(),
         report.positions,
         report.games_considered,
+        players.join(", "),
         report.games_skipped_unresolvable,
     );
     println!("manifest: {}", manifest_path.display());
@@ -173,7 +180,7 @@ fn manifest_path_for(book_path: &Path) -> PathBuf {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--max-ply 20] [--min-games 5] --output <path.book>"
+        "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--player <name> ...] [--max-ply 20] [--min-games 5] --output <path.book>"
     );
 }
 
