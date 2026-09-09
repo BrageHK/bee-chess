@@ -19,12 +19,14 @@
 //!
 //! The schema deliberately stores one row per game (see
 //! `migrations/0001_init.sql`'s docs), not one row per ply; a consumer that
-//! needs per-position data (an experience-book builder, say) derives it
-//! from [`GameRecord::plies`] rather than the catalog pre-exploding it.
-//! That consumer -- and any Lab HTTP surface over this catalog -- is
-//! intentionally out of scope for this crate; see `tools/bee-games` for the
-//! CLI that exercises it today.
+//! needs per-position data derives it from [`GameRecord::plies`] rather
+//! than the catalog pre-exploding it. [`book`] is exactly that consumer:
+//! it replays a player's games and builds a deterministic `ExperienceBook`
+//! artifact from them. Any Lab HTTP surface over this catalog is still
+//! out of scope for this crate; see `tools/bee-games` for the CLI that
+//! exercises both the catalog and the book builder today.
 
+pub mod book;
 mod catalog;
 mod error;
 mod filter;
