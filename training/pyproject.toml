@@ -46,8 +46,10 @@ url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-rocm" }]
-torchvision = [{ index = "pytorch-rocm" }]
+# ROCm wheels only exist for Linux; on other platforms (e.g. macOS, where
+# torch uses CPU/MPS) fall back to the default PyPI wheels.
+torch = [{ index = "pytorch-rocm", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-rocm", marker = "sys_platform == 'linux'" }]
 triton-rocm = [{ index = "pytorch-rocm" }]
 # See ../mamba_mcts_native/README.md -- PyO3 doesn't officially support
 # Python 3.14 yet, so building this on a 3.14 interpreter (this project's
