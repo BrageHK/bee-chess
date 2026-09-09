@@ -1,0 +1,28 @@
+[package]
+name = "mamba_mcts_native"
+version = "0.1.0"
+edition = "2021"
+description = "lc0-style PUCT MCTS (tree/PUCT/FPU/virtual-loss/NN-eval cache) for Bee-Mamba, exposed to Python via PyO3. NN inference stays in Python (PyTorch) so it can use whatever backend (CPU/MPS/CUDA) is fastest on the host; only the tree search and chess move generation are native."
+
+# Deliberately its own workspace, not a member of the root one (see
+# /Cargo.toml, shared by engine/ and lab/): this crate's dependency tree
+# (pyo3, numpy) is unrelated to that workspace's (burn, chess-domain
+# crates), and it uses the external `chess` crate rather than this repo's
+# own `chess/` (bee-chess-core) -- a pragmatic choice for a training-side
+# tool built and iterated on independently of the competition engine, not
+# a statement that bee-chess-core wouldn't be the more idiomatic long-term
+# choice. Folding it into bee-chess-core (dropping the external `chess`
+# dependency here) would be a reasonable follow-up.
+[workspace]
+
+[lib]
+name = "mamba_mcts_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+chess = "3.2.0"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+
+[profile.release]
+lto = true

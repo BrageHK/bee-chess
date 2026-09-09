@@ -2,6 +2,9 @@
 # One shared target/ at the repo root, not /engine/target/, since
 # engine/ and lab/ are both members of the root Cargo workspace.
 /target/
+# mamba_mcts_native is deliberately its own workspace (see its Cargo.toml),
+# so it builds into its own target/ instead of the shared one above.
+/mamba_mcts_native/target/
 
 # Bee Lab
 # Persisted finished-game history (#123) -- runtime data, not source.
