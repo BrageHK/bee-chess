@@ -12,10 +12,17 @@ dependencies = [
     "mambapy>=1.2.0",
     "triton-rocm>=3.8.0,<3.9 ; sys_platform == 'linux'",
     "matplotlib>=3.9.0",
+    "numpy>=1.26.0",
+    "mamba-mcts-native",
 ]
 
 [project.scripts]
 bee-training = "bee_training.cli:main"
+# UCI engine entry point -- point any UCI harness (a GUI, cutechess-cli,
+# lichess-bot's `homemade`/`uci` engine config) at this. See
+# ../mamba_mcts_native/README.md for the underlying search and
+# bee_training/chess_mamba/play_mcts.py for the engine itself.
+bee-mamba-mcts-uci = "bee_training.chess_mamba.play_mcts:main"
 
 [dependency-groups]
 dev = [
@@ -42,3 +49,8 @@ explicit = true
 torch = [{ index = "pytorch-rocm" }]
 torchvision = [{ index = "pytorch-rocm" }]
 triton-rocm = [{ index = "pytorch-rocm" }]
+# See ../mamba_mcts_native/README.md -- PyO3 doesn't officially support
+# Python 3.14 yet, so building this on a 3.14 interpreter (this project's
+# own requires-python) needs PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 set
+# before `uv sync`.
+mamba-mcts-native = { path = "../mamba_mcts_native", editable = true }
