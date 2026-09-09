@@ -277,6 +277,52 @@ mod tests {
     }
 
     #[test]
+    fn disambiguates_by_rank_when_two_pieces_share_a_file() {
+        // Knights on c1 and c5 -- same file, different ranks -- both
+        // reach b3, which SAN's file-first disambiguation rule can't
+        // resolve (both origins are on file c), forcing a rank
+        // disambiguator instead.
+        let position = Position::from_fen("4k3/8/8/2N5/8/8/8/2N1K3 w - - 0 1").unwrap();
+        let mv = resolve(&position, "N1b3").unwrap();
+        assert_eq!(mv.from(), "c1".parse().unwrap());
+        let mv2 = resolve(&position, "N5b3").unwrap();
+        assert_eq!(mv2.from(), "c5".parse().unwrap());
+    }
+
+    #[test]
+    fn disambiguates_by_full_square_when_file_and_rank_both_repeat() {
+        // Three queens able to reach d4, where file-only and rank-only
+        // disambiguators are each still ambiguous between two of them,
+        // forcing full-square notation for at least one pair.
+        let position = Position::from_fen("4k3/8/8/3Q4/8/8/3Q4/4K2Q w - - 0 1").unwrap();
+        let mv = resolve(&position, "Qd2d4").unwrap();
+        assert_eq!(mv.from(), "d2".parse().unwrap());
+    }
+
+    #[test]
+    fn resolves_a_piece_capture_with_disambiguator() {
+        // Same shape as `Nbd2`/`Nfd2` but with an explicit capture
+        // marker before the destination, e.g. "Nbxd2".
+        let position = Position::from_fen("4k3/8/8/8/8/8/3p4/1N2KN2 w - - 0 1").unwrap();
+        let mv = resolve(&position, "Nbxd2").unwrap();
+        assert_eq!(mv.from(), "b1".parse().unwrap());
+        assert_eq!(mv.to(), "d2".parse().unwrap());
+    }
+
+    #[test]
+    fn ambiguous_san_without_a_disambiguator_is_rejected() {
+        // Real SAN would never omit the disambiguator here, but this
+        // resolver must not silently guess if it's ever handed a
+        // malformed/ambiguous token instead of panicking or picking
+        // arbitrarily.
+        let position = Position::from_fen("4k3/8/8/8/8/8/8/1N2KN2 w - - 0 1").unwrap();
+        assert!(matches!(
+            resolve(&position, "Nd2"),
+            Err(SanError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
     fn unknown_token_is_malformed_not_a_panic() {
         let position = Position::startpos();
         assert!(matches!(

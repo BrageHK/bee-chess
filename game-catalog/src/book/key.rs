@@ -197,12 +197,124 @@ mod tests {
     }
 
     #[test]
-    fn this_key_space_is_independent_of_the_engine_s_zobrist_hash() {
-        // Different seeds by construction (see this module's docs) --
-        // confirm they don't happen to collide on the start position.
+    fn side_to_move_affects_the_key() {
+        use bee_chess_core::Color;
+
+        let mut white_to_move = Position::startpos();
+        white_to_move.set_side_to_move(Color::White);
+        let mut black_to_move = Position::startpos();
+        black_to_move.set_side_to_move(Color::Black);
+
         assert_ne!(
-            book_position_key(&Position::startpos()),
-            Position::startpos().zobrist_hash()
+            book_position_key(&white_to_move),
+            book_position_key(&black_to_move)
         );
+    }
+
+    #[test]
+    fn each_castling_right_independently_affects_the_key() {
+        use bee_chess_core::CastlingRights;
+
+        let base = {
+            let mut p = Position::startpos();
+            p.set_castling_rights(CastlingRights::none());
+            p
+        };
+        let base_key = book_position_key(&base);
+
+        let with_right = |rights: CastlingRights| {
+            let mut p = base.clone();
+            p.set_castling_rights(rights);
+            book_position_key(&p)
+        };
+
+        let white_kingside = with_right(CastlingRights {
+            white_kingside: true,
+            ..CastlingRights::none()
+        });
+        let white_queenside = with_right(CastlingRights {
+            white_queenside: true,
+            ..CastlingRights::none()
+        });
+        let black_kingside = with_right(CastlingRights {
+            black_kingside: true,
+            ..CastlingRights::none()
+        });
+        let black_queenside = with_right(CastlingRights {
+            black_queenside: true,
+            ..CastlingRights::none()
+        });
+
+        // Every right, on its own, must differ from having none...
+        assert_ne!(base_key, white_kingside);
+        assert_ne!(base_key, white_queenside);
+        assert_ne!(base_key, black_kingside);
+        assert_ne!(base_key, black_queenside);
+        // ...and from each other -- otherwise two of these would be
+        // indistinguishable positions for a book that cares about
+        // castling rights (e.g. "kingside still possible" vs.
+        // "queenside still possible" genuinely change what's sound).
+        let all = [
+            white_kingside,
+            white_queenside,
+            black_kingside,
+            black_queenside,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "rights {i} and {j} collided");
+            }
+        }
+
+        assert_eq!(
+            with_right(CastlingRights::all()),
+            with_right(CastlingRights::all()),
+            "the same combination of rights must still key identically"
+        );
+    }
+
+    #[test]
+    fn a_usable_en_passant_square_affects_the_key() {
+        // White has just played d2-d4; e5 pawn can capture en passant
+        // on d3. Same board otherwise, with and without the ep square
+        // recorded, must key differently.
+        let mut with_ep = Position::from_fen("4k3/8/8/4p3/3P4/8/8/4K3 b - d3 0 1").unwrap();
+        let mut without_ep = with_ep.clone();
+        with_ep.set_en_passant_square(Some(Square::from_file_rank(3, 2)));
+        without_ep.set_en_passant_square(None);
+
+        assert_ne!(book_position_key(&with_ep), book_position_key(&without_ep));
+    }
+
+    #[test]
+    fn a_different_en_passant_file_affects_the_key() {
+        let mut on_d_file = Position::empty();
+        on_d_file.set_en_passant_square(Some(Square::from_file_rank(3, 2)));
+        let mut on_e_file = Position::empty();
+        on_e_file.set_en_passant_square(Some(Square::from_file_rank(4, 2)));
+
+        assert_ne!(book_position_key(&on_d_file), book_position_key(&on_e_file));
+    }
+
+    #[test]
+    fn moving_any_single_piece_changes_the_key() {
+        // A cheap proxy for "every occupied square actually
+        // contributes to the hash": displacing each of White's back-
+        // rank pieces one at a time must change the key each time,
+        // relative to the unmodified start position.
+        let base_key = book_position_key(&Position::startpos());
+        for file in 0..8u8 {
+            let mut moved = Position::startpos();
+            let piece = moved
+                .piece_at(Square::from_file_rank(file, 0))
+                .expect("back rank is fully occupied at the start position");
+            moved.set_piece(Square::from_file_rank(file, 0), None);
+            moved.set_piece(Square::from_file_rank(file, 3), Some(piece));
+            assert_ne!(
+                book_position_key(&moved),
+                base_key,
+                "moving the piece on file {file} should change the key"
+            );
+        }
     }
 }
