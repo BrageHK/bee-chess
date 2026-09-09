@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 bee-chess-core = { path = "../chess" }
+bee-book-format = { path = "../book-format" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 litchee = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -1,4 +1,4 @@
-//! Builds an [`ExperienceBook`](super::format) artifact from a
+//! Builds an `ExperienceBook` artifact from a
 //! [`GameCatalog`]: replays a player's own games move by move, records
 //! what they played (and how it turned out) at every position where it
 //! was their move within the first `max_ply` plies, and reduces that
@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use bee_book_format::{book_position_key, BookCandidate, BookEntry};
 use bee_chess_core::{Color, Move, Position};
 
 use crate::error::Result;
@@ -22,8 +23,6 @@ use crate::filter::GameFilter;
 use crate::game::GameRecord;
 use crate::GameCatalog;
 
-use super::format::{BookCandidate, BookEntry};
-use super::key::book_position_key;
 use super::san;
 
 /// Tunable knobs for one build run -- see `BuildReport` for what a given
@@ -488,8 +487,8 @@ mod tests {
 
         let mut bytes_a = Vec::new();
         let mut bytes_b = Vec::new();
-        super::super::format::write(&entries_a, &mut bytes_a).unwrap();
-        super::super::format::write(&entries_b, &mut bytes_b).unwrap();
+        bee_book_format::write(&entries_a, &mut bytes_a).unwrap();
+        bee_book_format::write(&entries_b, &mut bytes_b).unwrap();
         assert_eq!(bytes_a, bytes_b);
     }
 

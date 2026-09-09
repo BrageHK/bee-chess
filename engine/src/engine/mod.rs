@@ -1,5 +1,5 @@
 /// Engine
-use crate::book::{CowOpeningBook, NoBook, OpeningBook, OpeningContext};
+use crate::book::{CowOpeningBook, ExperienceBook, NoBook, OpeningBook, OpeningContext};
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{Evaluator, ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
@@ -116,16 +116,30 @@ impl EvaluatorKind {
     }
 }
 
+/// The experience book built offline from Bee's own game history (see
+/// `bee-game-catalog`'s `book` module and `tools/bee-games`' `book
+/// build-experience` subcommand) -- baked into the binary at compile
+/// time rather than loaded from disk, so a UCI opponent or tournament
+/// harness never needs to ship a book file alongside `bee`. Regenerate
+/// `books/experience-v1.book` (and rebuild) to update what's shipped;
+/// nothing here needs to change to pick up a freshly rebuilt artifact.
+static EXPERIENCE_BOOK_BYTES: &[u8] = include_bytes!("../../../books/experience-v1.book");
+
 /// Which `OpeningBook` (see `crate::book`) `Engine::search`/
 /// `search_for_time` consult before falling back to a real search.
 /// `None` -- not searching at all -- is the default: an opening book
 /// is an opt-in experiment, not something that should silently change
-/// a fresh engine's behavior.
+/// a fresh engine's behavior. Adding `Experience` does not change this
+/// default -- a UCI-driven A/B comparison (`OpeningBook=None` vs.
+/// `OpeningBook=Experience`, every other option left at its default)
+/// depends on a fresh engine's baseline behavior staying exactly what
+/// it was before this book existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpeningBookKind {
     #[default]
     None,
     Cow,
+    Experience,
 }
 
 impl OpeningBookKind {
@@ -133,6 +147,7 @@ impl OpeningBookKind {
         match self {
             Self::None => "None",
             Self::Cow => "Cow",
+            Self::Experience => "Experience",
         }
     }
 
@@ -140,14 +155,30 @@ impl OpeningBookKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "none" => Some(Self::None),
             "cow" => Some(Self::Cow),
+            "experience" => Some(Self::Experience),
             _ => None,
         }
     }
 
+    /// Builds the live `OpeningBook` for this kind. `Experience` parses
+    /// the baked-in `.book` bytes fresh on every call rather than
+    /// caching a parsed `ExperienceBook` somewhere -- `set_opening_book`
+    /// is a rare, user-driven UCI event (not a hot path), and this
+    /// keeps `book()` simple and infallible-looking. A parse failure
+    /// here would mean the checked-in artifact itself is corrupt or
+    /// was built under an incompatible format/key-scheme version --
+    /// not something a running engine can recover from -- so it falls
+    /// back to `NoBook` rather than panicking a competition binary; see
+    /// `tests` for why this should never actually happen with the
+    /// shipped artifact.
     fn book(self) -> Box<dyn OpeningBook> {
         match self {
             Self::None => Box::new(NoBook),
             Self::Cow => Box::new(CowOpeningBook),
+            Self::Experience => match ExperienceBook::from_bytes(EXPERIENCE_BOOK_BYTES) {
+                Ok(book) => Box::new(book),
+                Err(_) => Box::new(NoBook),
+            },
         }
     }
 }
@@ -389,7 +420,8 @@ impl Engine {
             position: &self.position,
             moves: &self.move_history,
         };
-        let mv = self.opening_book.probe(&context)?;
+        let probe = self.opening_book.probe(&context)?;
+        let mv = probe.mv;
         if !self
             .position
             .generate_legal_moves()
@@ -417,13 +449,7 @@ impl Engine {
             );
             return None;
         }
-        self.emit_diagnostic(
-            DiagnosticLevel::Info,
-            format!(
-                "book hit ({}): playing without search",
-                self.opening_book_kind.uci_name()
-            ),
-        );
+        self.emit_diagnostic(DiagnosticLevel::Info, self.book_hit_message(&probe));
         Some(SearchResult {
             best_move: Some(mv),
             score: 0,
@@ -435,6 +461,27 @@ impl Engine {
             delta_pruning: Default::default(),
             see_pruning: Default::default(),
         })
+    }
+
+    /// The "book hit" diagnostic for `probe`, generic across every
+    /// `OpeningBook` implementation. When `probe` carries stats (an
+    /// `ExperienceBook` hit, say), they're included --
+    /// `book source=experience move=e2e4 games=37 score_permille=581`
+    /// -- so it's possible to tell from a UCI transcript alone whether
+    /// a game move was searched or came from learned experience, and
+    /// how much evidence backed it. A book with no stats (`Cow`)
+    /// degrades to the plain message it always had.
+    fn book_hit_message(&self, probe: &crate::book::BookProbe) -> String {
+        let source = self.opening_book_kind.uci_name();
+        match (probe.games, probe.score_per_mille) {
+            (Some(games), Some(score_per_mille)) => format!(
+                "book source={} move={}{} games={games} score_permille={score_per_mille}",
+                source.to_ascii_lowercase(),
+                probe.mv.from(),
+                probe.mv.to(),
+            ),
+            _ => format!("book hit ({source}): playing without search"),
+        }
     }
 
     /// Returns `Some(deficit)` (in centipawns, always positive) if the

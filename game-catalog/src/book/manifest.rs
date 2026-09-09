@@ -1,14 +1,15 @@
-//! The `.book.json` manifest written alongside a `.book` artifact:
-//! answers "what exactly did we bake into this Bee?" without needing to
-//! parse the binary artifact itself. Not consumed by any runtime
+//! The `.json` manifest written alongside a `.book` artifact (e.g.
+//! `books/experience-v1.book` + `books/experience-v1.json`): answers
+//! "what exactly did we bake into this Bee?" without needing to parse
+//! the binary artifact itself. Not consumed by any runtime
 //! `ExperienceBook` -- purely for reproducibility/debugging, per the
 //! design this followed.
 
 use sha2::{Digest, Sha256};
 
+use bee_book_format::{FORMAT_VERSION, KEY_SCHEME_VERSION};
+
 use super::builder::{BuildConfig, BuildReport};
-use super::format::FORMAT_VERSION;
-use super::key::KEY_SCHEME_VERSION;
 
 /// One build run's manifest, serialized as small hand-rolled JSON (no
 /// `serde_json` dependency here -- see `to_json`) -- this is a handful
@@ -16,44 +17,60 @@ use super::key::KEY_SCHEME_VERSION;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub format_version: u16,
-    pub key_scheme_version: u16,
-    /// Every player identity pooled into this book -- see
+    pub book_key_version: u16,
+    /// Every account identity pooled into this book -- see
     /// `book::build`'s docs on treating multiple names (e.g. Bee's
     /// games played under more than one Lichess account) as one
     /// learning identity. A single-account book still stores a
     /// one-element list, so a manifest reader never needs to special-
-    /// case "how many players".
-    pub players: Vec<String>,
+    /// case "how many accounts".
+    pub source_accounts: Vec<String>,
     pub games_considered: u64,
-    pub games_skipped_unresolvable: u64,
+    /// Games actually usable for learning: `games_considered` minus
+    /// those skipped because their move list couldn't be fully
+    /// SAN-resolved (see `book::builder::record_game`'s docs).
+    pub usable_games: u64,
     pub positions: u64,
     pub max_ply: u32,
     pub min_games: u32,
     pub prior_games: u32,
     pub prior_score_per_mille: u32,
-    pub book_sha256: String,
+    /// The `bee-chess` commit this artifact was built from, if known --
+    /// `None` when built from a working tree `git` can't identify (a
+    /// shallow/detached clone, or no `git` available at all), so a
+    /// manifest never lies about provenance it couldn't determine.
+    pub builder_commit: Option<String>,
+    pub sha256: String,
 }
 
 impl Manifest {
     #[must_use]
     pub fn new(
-        players: &[&str],
+        source_accounts: &[&str],
         config: &BuildConfig,
         report: &BuildReport,
         book_bytes: &[u8],
+        builder_commit: Option<String>,
     ) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            key_scheme_version: KEY_SCHEME_VERSION,
-            players: players.iter().map(|p| p.to_string()).collect(),
-            games_considered: report.games_considered,
-            games_skipped_unresolvable: report.games_skipped_unresolvable,
+            book_key_version: KEY_SCHEME_VERSION,
+            source_accounts: source_accounts.iter().map(|p| p.to_string()).collect(),
+            // `report.games_considered` (the builder's own field) counts
+            // only *successfully replayed* games; the manifest's
+            // `games_considered` means "every game fetched as a
+            // candidate" (usable or not), so it adds back the ones
+            // skipped as unresolvable -- see `usable_games` for the
+            // successfully-replayed count alone.
+            games_considered: report.games_considered + report.games_skipped_unresolvable,
+            usable_games: report.games_considered,
             positions: report.positions,
             max_ply: config.max_ply,
             min_games: config.min_games,
             prior_games: config.prior_games,
             prior_score_per_mille: config.prior_score_per_mille,
-            book_sha256: sha256_hex(book_bytes),
+            builder_commit,
+            sha256: sha256_hex(book_bytes),
         }
     }
 
@@ -61,25 +78,30 @@ impl Manifest {
     /// declaration order, deterministically, on every call.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let players = self
-            .players
+        let source_accounts = self
+            .source_accounts
             .iter()
             .map(|p| json_string(p))
             .collect::<Vec<_>>()
             .join(", ");
+        let builder_commit = match &self.builder_commit {
+            Some(commit) => json_string(commit),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\n  \"format_version\": {},\n  \"key_scheme_version\": {},\n  \"players\": [{}],\n  \"games_considered\": {},\n  \"games_skipped_unresolvable\": {},\n  \"positions\": {},\n  \"max_ply\": {},\n  \"min_games\": {},\n  \"prior_games\": {},\n  \"prior_score_per_mille\": {},\n  \"book_sha256\": {}\n}}\n",
+            "{{\n  \"format_version\": {},\n  \"book_key_version\": {},\n  \"source_accounts\": [{}],\n  \"games_considered\": {},\n  \"usable_games\": {},\n  \"positions\": {},\n  \"max_ply\": {},\n  \"min_games\": {},\n  \"prior_games\": {},\n  \"prior_score_per_mille\": {},\n  \"builder_commit\": {},\n  \"sha256\": {}\n}}\n",
             self.format_version,
-            self.key_scheme_version,
-            players,
+            self.book_key_version,
+            source_accounts,
             self.games_considered,
-            self.games_skipped_unresolvable,
+            self.usable_games,
             self.positions,
             self.max_ply,
             self.min_games,
             self.prior_games,
             self.prior_score_per_mille,
-            json_string(&self.book_sha256),
+            builder_commit,
+            json_string(&self.sha256),
         )
     }
 }
@@ -116,34 +138,61 @@ mod tests {
     fn json_round_trips_visually_sane_output() {
         let config = BuildConfig::default();
         let report = super::super::builder::BuildReport {
-            games_considered: 42,
+            games_considered: 41,
             games_skipped_unresolvable: 1,
             positions: 7,
         };
-        let manifest = Manifest::new(&["Bee\"Account"], &config, &report, b"hello");
+        let manifest = Manifest::new(
+            &["Bee\"Account"],
+            &config,
+            &report,
+            b"hello",
+            Some("abc1234".to_string()),
+        );
         let json = manifest.to_json();
 
         assert!(json.contains("\"format_version\": 1"));
+        // 41 usable + 1 skipped = 42 total fetched as candidates.
         assert!(json.contains("\"games_considered\": 42"));
-        assert!(json.contains("\"players\": [\"Bee\\\"Account\"]"));
+        assert!(json.contains("\"usable_games\": 41"));
+        assert!(json.contains("\"source_accounts\": [\"Bee\\\"Account\"]"));
+        assert!(json.contains("\"builder_commit\": \"abc1234\""));
         // sha256("hello")
         assert!(json.contains(
-            "\"book_sha256\": \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\""
+            "\"sha256\": \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\""
         ));
     }
 
     #[test]
-    fn multiple_players_render_as_a_json_array() {
+    fn multiple_accounts_render_as_a_json_array() {
         let config = BuildConfig::default();
         let report = super::super::builder::BuildReport {
             games_considered: 99,
             games_skipped_unresolvable: 0,
             positions: 12,
         };
-        let manifest = Manifest::new(&["beechessjohan", "beechessmagnus"], &config, &report, b"x");
+        let manifest = Manifest::new(
+            &["beechessjohan", "beechessmagnus"],
+            &config,
+            &report,
+            b"x",
+            None,
+        );
         assert!(manifest
             .to_json()
-            .contains("\"players\": [\"beechessjohan\", \"beechessmagnus\"]"));
+            .contains("\"source_accounts\": [\"beechessjohan\", \"beechessmagnus\"]"));
+    }
+
+    #[test]
+    fn an_unknown_builder_commit_renders_as_json_null() {
+        let config = BuildConfig::default();
+        let report = super::super::builder::BuildReport {
+            games_considered: 1,
+            games_skipped_unresolvable: 0,
+            positions: 1,
+        };
+        let manifest = Manifest::new(&["Bee"], &config, &report, b"x", None);
+        assert!(manifest.to_json().contains("\"builder_commit\": null"));
     }
 
     #[test]
@@ -154,8 +203,22 @@ mod tests {
             games_skipped_unresolvable: 0,
             positions: 1,
         };
-        let a = Manifest::new(&["Bee"], &config, &report, b"x").to_json();
-        let b = Manifest::new(&["Bee"], &config, &report, b"x").to_json();
+        let a = Manifest::new(
+            &["Bee"],
+            &config,
+            &report,
+            b"x",
+            Some("deadbee".to_string()),
+        )
+        .to_json();
+        let b = Manifest::new(
+            &["Bee"],
+            &config,
+            &report,
+            b"x",
+            Some("deadbee".to_string()),
+        )
+        .to_json();
         assert_eq!(a, b);
     }
 }

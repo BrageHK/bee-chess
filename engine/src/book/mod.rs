@@ -18,10 +18,14 @@
 //! This first slice deliberately implements only the smallest useful
 //! vertical slice through the whole architecture: the trait, a `NoBook`
 //! null implementation, and `CowOpeningBook`, a joke-but-real opening
-//! (see its own docs). No `BookSelector` (multiple weighted
-//! candidates), no Polyglot/file-backed book, no statistics -- those
-//! are real follow-ups once this seam has proven itself, not
-//! prerequisites for it.
+//! (see its own docs). `experience` (see its docs) is the first real,
+//! data-backed book: a position-keyed lookup read from a `.book`
+//! artifact built offline from Bee's own game history, rather than a
+//! hardcoded setup sequence.
+
+pub mod experience;
+
+pub use experience::ExperienceBook;
 
 use crate::chess::{Color, Move, MoveFlag, Position, Square};
 
@@ -39,6 +43,38 @@ pub struct OpeningContext<'a> {
     pub moves: &'a [Move],
 }
 
+/// One `OpeningBook` hit: the proposed move, plus whatever supporting
+/// stats (if any) that implementation can offer about it. `Engine::
+/// book_move` includes `games`/`score_per_mille` in its diagnostic when
+/// present (see its docs) -- a book with no notion of either (`NoBook`,
+/// `CowOpeningBook`) simply leaves them `None` rather than fabricating
+/// values, and the diagnostic degrades gracefully to just the move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookProbe {
+    pub mv: Move,
+    /// How many historical games this move's stats are based on, if
+    /// the book tracks that (an `ExperienceBook` does; `CowOpeningBook`
+    /// has no games to count).
+    pub games: Option<u32>,
+    /// The move's win-rate-derived score in per-mille (0..=1000), if
+    /// the book tracks one.
+    pub score_per_mille: Option<u16>,
+}
+
+impl BookProbe {
+    /// A hit with no supporting stats -- the common case for a book
+    /// (like `CowOpeningBook`) that has nothing to report beyond "play
+    /// this move".
+    #[must_use]
+    pub const fn just(mv: Move) -> Self {
+        Self {
+            mv,
+            games: None,
+            score_per_mille: None,
+        }
+    }
+}
+
 /// Looks up a known-good move for `context`'s position, if any.
 /// Implementations must return a currently *legal* move or `None` --
 /// the caller (`Engine::search`/`search_for_time`) still doesn't
@@ -51,7 +87,7 @@ pub struct OpeningContext<'a> {
 /// A book miss (`None`) is always a completely ordinary outcome, not
 /// an error -- see `NoBook`.
 pub trait OpeningBook: Send + Sync {
-    fn probe(&self, context: &OpeningContext<'_>) -> Option<Move>;
+    fn probe(&self, context: &OpeningContext<'_>) -> Option<BookProbe>;
 }
 
 /// The null opening book: always a miss. Used whenever `OwnBook`/
@@ -62,7 +98,7 @@ pub trait OpeningBook: Send + Sync {
 pub struct NoBook;
 
 impl OpeningBook for NoBook {
-    fn probe(&self, _context: &OpeningContext<'_>) -> Option<Move> {
+    fn probe(&self, _context: &OpeningContext<'_>) -> Option<BookProbe> {
         None
     }
 }
@@ -113,7 +149,7 @@ impl OpeningBook for NoBook {
 pub struct CowOpeningBook;
 
 impl OpeningBook for CowOpeningBook {
-    fn probe(&self, context: &OpeningContext<'_>) -> Option<Move> {
+    fn probe(&self, context: &OpeningContext<'_>) -> Option<BookProbe> {
         let position = context.position;
         let side = position.side_to_move();
         let legal_moves = position.generate_legal_moves();
@@ -128,7 +164,7 @@ impl OpeningBook for CowOpeningBook {
             }
             let mv = Move::new(step.from, step.to, MoveFlag::Quiet);
             if legal_moves.contains(&mv) {
-                return Some(mv);
+                return Some(BookProbe::just(mv));
             }
             // The next never-completed step isn't legal right now
             // (blocked, or it's not this side's move at all). Rather
@@ -268,11 +304,18 @@ mod tests {
             self.push(mv);
         }
 
+        /// The rest of this module's tests only care about *which move*
+        /// the Cow offers, not `BookProbe`'s stats fields (`CowOpeningBook`
+        /// never sets them -- see `BookProbe::just`), so this narrows
+        /// down to `Option<Move>` for readability at every call site
+        /// below rather than matching on `BookProbe` everywhere.
         fn probe(&self) -> Option<Move> {
-            CowOpeningBook.probe(&OpeningContext {
-                position: &self.position,
-                moves: &self.moves,
-            })
+            CowOpeningBook
+                .probe(&OpeningContext {
+                    position: &self.position,
+                    moves: &self.moves,
+                })
+                .map(|probe| probe.mv)
         }
     }
 

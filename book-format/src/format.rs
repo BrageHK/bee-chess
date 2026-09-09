@@ -1,6 +1,6 @@
-//! The `.book` binary artifact format (v1): what `ExperienceBookBuilder`
-//! writes and what `ExperienceBook` (the engine-side `OpeningBook`
-//! consumer, added in a follow-up PR) reads.
+//! The `.book` binary artifact format (v1): what `bee-game-catalog`'s
+//! offline builder writes and what the engine's `ExperienceBook`
+//! (an `OpeningBook` implementation) reads.
 //!
 //! Deliberately boring, per the design this followed: a fixed header,
 //! then positions sorted by key, each carrying its candidate moves
@@ -18,7 +18,7 @@
 //!   entry_count       u32
 //!
 //! POSITION × entry_count, sorted by key ascending
-//!   key               u64  (see book::key::book_position_key)
+//!   key               u64  (see crate::key::book_position_key)
 //!   candidate_count   u16
 //!   MOVE × candidate_count, sorted by weight descending
 //!     encoded_move      u16  (bee_chess_core::Move's own packed bits --
@@ -56,9 +56,9 @@ pub const MAGIC: &[u8; 7] = b"BEEBOOK";
 pub const FORMAT_VERSION: u16 = 1;
 
 /// One position's aggregated candidate moves, ready to write. Distinct
-/// from the builder's own richer `PositionExperience` (see
-/// `book::builder`) -- this is exactly the runtime shape, already
-/// filtered and scored.
+/// from `bee-game-catalog`'s own richer builder-side aggregate (its
+/// `book::builder::PositionExperience`) -- this is exactly the runtime
+/// shape, already filtered and scored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookEntry {
     pub key: u64,
@@ -89,8 +89,8 @@ pub enum FormatError {
 }
 
 /// Writes `entries` (must already be sorted by `key` ascending, with no
-/// duplicate keys -- see `book::builder`, which is responsible for that
-/// invariant) as a `.book` artifact.
+/// duplicate keys -- `bee-game-catalog`'s `book::builder` is responsible
+/// for that invariant) as a `.book` artifact.
 pub fn write(entries: &[BookEntry], out: &mut impl Write) -> Result<(), FormatError> {
     for window in entries.windows(2) {
         if window[0].key >= window[1].key {
