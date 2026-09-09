@@ -1,0 +1,15 @@
+[package]
+name = "bee-games"
+version = "0.1.0"
+edition = "2021"
+description = "CLI over bee-game-catalog: sync a Lichess user's games into the local catalog and inspect/count them. See game-catalog/'s crate docs for the library this drives."
+license = "MIT"
+
+[[bin]]
+name = "bee-games"
+path = "src/main.rs"
+
+[dependencies]
+bee-game-catalog = { path = "../../game-catalog" }
+litchee = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

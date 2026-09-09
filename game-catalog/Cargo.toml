@@ -1,0 +1,16 @@
+[package]
+name = "bee-game-catalog"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent SQLite-backed catalog of imported games (Lichess, for now). Offline data tooling for building experience books and mining regression positions from Bee's own game history -- deliberately kept out of engine/ so the competition engine binary never gains HTTP/SQLite dependencies."
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+litchee = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures-util = "0.3"
+thiserror = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

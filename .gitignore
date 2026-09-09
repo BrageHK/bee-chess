@@ -7,6 +7,11 @@
 # Persisted finished-game history (#123) -- runtime data, not source.
 /data/lab/
 
+# bee-games / game-catalog
+# The local SQLite catalog `bee-games` syncs into by default -- runtime
+# data, not source.
+/data/games/
+
 # Python
 /training/.venv/
 /training/.pytest_cache/

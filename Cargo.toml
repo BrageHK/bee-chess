@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["chess", "engine", "lab"]
+members = ["chess", "engine", "lab", "game-catalog", "tools/bee-games"]
 
 # `bee` (in engine/) stays the competition binary with zero web/orchestration
 # dependencies -- see #67's architecture issue. `lab` is a separate crate for
@@ -12,3 +12,10 @@ members = ["chess", "engine", "lab"]
 # Zobrist types, extracted out of engine/ so lab/ can share one authoritative
 # interpretation of chess rules with the competition engine instead of
 # validating moves against a second implementation -- see #69's design notes.
+#
+# `game-catalog` (bee-game-catalog) is a persistent SQLite-backed store of
+# imported games (Lichess, for now), consumed by the `bee-games` CLI in
+# tools/. Kept as its own crate for the same reason as `lab`: it pulls in
+# reqwest/rusqlite/an HTTP Lichess client, none of which the competition
+# engine binary should ever depend on. It is offline data tooling, not part
+# of the engine's search hot path.
