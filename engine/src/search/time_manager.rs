@@ -572,7 +572,10 @@ mod tests {
 
     #[test]
     fn nodes_per_second_divides_nodes_by_elapsed_seconds() {
-        assert_eq!(nodes_per_second(2_000_000, Duration::from_secs(2)), 1_000_000);
+        assert_eq!(
+            nodes_per_second(2_000_000, Duration::from_secs(2)),
+            1_000_000
+        );
     }
 
     #[test]
@@ -584,7 +587,10 @@ mod tests {
 
     #[test]
     fn nodes_per_second_handles_sub_second_elapsed_time() {
-        assert_eq!(nodes_per_second(500_000, Duration::from_millis(500)), 1_000_000);
+        assert_eq!(
+            nodes_per_second(500_000, Duration::from_millis(500)),
+            1_000_000
+        );
     }
 
     #[test]
