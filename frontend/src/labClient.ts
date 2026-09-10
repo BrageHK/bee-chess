@@ -115,18 +115,22 @@ export type EngineOption =
   | { type: "string"; name: string; default: string };
 
 /** One side of an experiment being requested -- mirrors `api::
- * ExperimentVariantRequest`'s JSON shape. No `engine` field here
- * (unlike `ParticipantRequest`): v1 experiments are Bee-vs-Bee only
- * (see `lab::experiment`'s module docs), so `CreateExperimentRequest`
- * names the engine once for the whole experiment, not per variant. */
+ * ExperimentVariantRequest`'s JSON shape. `engine`/`debug` are
+ * per-variant (any two engines can be pitted against each other, e.g.
+ * Bee vs Stockfish), each falling back server-side to
+ * `CreateExperimentRequest.engine`/`debug` when omitted. */
 export interface ExperimentVariantRequest {
   label: string;
+  engine?: string;
   options?: Record<string, string | number | boolean>;
+  debug?: boolean;
 }
 
 export interface CreateExperimentRequest {
-  /** Defaults to `"bee"` server-side if omitted -- see `api::
-   * CreateExperimentRequest`'s docs. */
+  /** Fallback engine for either variant that doesn't name its own --
+   * see `ExperimentVariantRequest.engine`. Defaults to `"bee"`
+   * server-side if omitted -- see `api::CreateExperimentRequest`'s
+   * docs. */
   engine?: string;
   variantA: ExperimentVariantRequest;
   variantB: ExperimentVariantRequest;
@@ -140,6 +144,8 @@ export interface CreateExperimentRequest {
   /** Deprecated alias for `timeControl: {type: "move_time",
    * move_time_ms: ...}`. */
   moveTimeMs?: number;
+  /** Fallback `debug` for either variant that doesn't set its own --
+   * see `ExperimentVariantRequest.debug`. */
   debug?: boolean;
 }
 

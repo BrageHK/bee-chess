@@ -53,9 +53,13 @@ export function defaultParticipant(kind: ParticipantKind): Participant {
       // fields don't have real values before their schema loads.
       return { kind: "bee", moveTimeMs: 100, debug: false, options: {} };
     case "bee-mamba":
-      // Same reasoning as "bee" above: Simulations/BatchSize come from
-      // GET /api/engines/bee-mamba/options, not a hardcoded default here.
-      return { kind: "bee-mamba", moveTimeMs: 500, options: {} };
+      // Unlike "bee" above, Simulations/BatchSize are hardcoded here
+      // rather than discovered via GET /api/engines/bee-mamba/options:
+      // that endpoint spawns the engine fresh (loads the Torch model)
+      // just to read back its option list, which is slow enough to
+      // stall GameSetup. Values must match mamba_mcts_batched_uci's
+      // own DEFAULT_SIMULATIONS/DEFAULT_BATCH_SIZE (main.rs).
+      return { kind: "bee-mamba", moveTimeMs: 500, options: { Simulations: 800, BatchSize: 64 } };
   }
 }
 

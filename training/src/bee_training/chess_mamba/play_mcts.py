@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import chess
@@ -49,6 +50,22 @@ ENGINE_AUTHOR = "bee-chess"
 
 DEFAULT_SIMULATIONS = 800
 DEFAULT_BATCH_SIZE = 32  # see mamba_mcts_native's README for why this is the measured sweet spot
+
+# Time management (used whenever a `go` carries clock info -- wtime/btime or
+# movetime -- instead of the fixed Simulations option; see `sims_for_go`).
+# Same shape as most UCI engines' simple time managers: budget one move as a
+# slice of the remaining clock plus most of the increment, capped so no
+# single move can eat too much of the clock, with an extra clamp once time
+# gets critically short so the engine doesn't flag.
+ASSUMED_TOTAL_MOVES = 40  # moves-left estimate when the GUI doesn't send movestogo
+MIN_MOVES_LEFT = 10  # floor for that estimate late in the game
+INCREMENT_WEIGHT = 0.8  # how much of the increment to bank on top of the slice
+MAX_CLOCK_FRACTION = 0.5  # never plan to spend more than half the remaining clock on one move
+LOW_TIME_THRESHOLD_MS = 1000  # below this, throttle further to avoid flagging
+LOW_TIME_FRACTION = 0.3
+MIN_BUDGET_MS = 50.0
+MIN_SIMULATIONS = 16
+MAX_SIMULATIONS = 100_000  # matches the Simulations UCI option's own declared "max" bound
 
 
 def default_device() -> str:
@@ -95,6 +112,79 @@ def choose_move(
     return chess.Move.from_uci(best_uci) if best_uci else None
 
 
+def warmup(evaluator: BatchedEvaluator, simulations: int, batch_size: int) -> float:
+    """Run one throwaway search on the starting position before the engine
+    answers its first UCI command. CUDA/ROCm kernel selection (cuDNN
+    autotune, first-launch kernel compilation) is a one-time cost paid by
+    whichever search hits it first -- ~80x slower than steady state,
+    measured directly (see the conversation this was added from). Doing it
+    here means a lichess-bot game (which spawns a fresh engine process per
+    game, see lib/engine_wrapper.py's create_engine) pays that cost during
+    engine startup instead of on the clock for the first real move.
+
+    Returns the measured steady-state nodes/sec, so time management (see
+    `sims_for_go`) can convert a time budget into a simulation count without
+    a hardcoded, hardware-specific guess."""
+    print("[bee-mamba] warming up engine...", file=sys.stderr, flush=True)
+    start = time.monotonic()
+    choose_move(evaluator, chess.Board(), simulations, batch_size)
+    elapsed = time.monotonic() - start
+    nps = simulations / elapsed if elapsed > 0 else float(simulations)
+    print(f"[bee-mamba] engine warmed up ({nps:.0f} nodes/s)", file=sys.stderr, flush=True)
+    return nps
+
+
+def _parse_go_clock(tokens: list[str]) -> dict[str, int]:
+    """Pull the clock-related fields out of a `go` command's tokens, e.g.
+    `wtime 60000 btime 60000 winc 0 binc 0` or `movetime 10000`. Unknown or
+    malformed tokens are ignored -- this engine doesn't support depth/nodes
+    limits, so those are left for the fallback (static Simulations) path."""
+    fields = {"wtime", "btime", "winc", "binc", "movetime", "movestogo"}
+    parsed: dict[str, int] = {}
+    i = 0
+    while i < len(tokens) - 1:
+        if tokens[i] in fields:
+            try:
+                parsed[tokens[i]] = int(tokens[i + 1])
+            except ValueError:
+                pass
+        i += 1
+    return parsed
+
+
+def _time_budget_ms(my_time_ms: int, inc_ms: int, fullmove_number: int, movestogo: int | None) -> float:
+    moves_left = movestogo if movestogo else max(MIN_MOVES_LEFT, ASSUMED_TOTAL_MOVES - fullmove_number)
+    budget = my_time_ms / moves_left + inc_ms * INCREMENT_WEIGHT
+    budget = min(budget, my_time_ms * MAX_CLOCK_FRACTION)
+    if my_time_ms < LOW_TIME_THRESHOLD_MS:
+        budget = min(budget, my_time_ms * LOW_TIME_FRACTION)
+    return max(MIN_BUDGET_MS, budget)
+
+
+def sims_for_go(tokens: list[str], board: chess.Board, fallback_simulations: int, nps: float) -> int:
+    """Decide how many simulations to spend on this move. Uses the `go`
+    command's clock info when present (like any competitive UCI engine's
+    own time management -- lichess-bot already forwards wtime/btime/winc/binc
+    with move_overhead pre-subtracted, see lib/engine_wrapper.py's
+    game_clock_time); falls back to the static Simulations option for a
+    plain `go`/`go infinite` with no clock (e.g. a GUI with no time control)."""
+    clock = _parse_go_clock(tokens)
+
+    if "movetime" in clock:
+        budget_ms = max(MIN_BUDGET_MS, clock["movetime"] - 50)
+    else:
+        time_key = "wtime" if board.turn == chess.WHITE else "btime"
+        inc_key = "winc" if board.turn == chess.WHITE else "binc"
+        if time_key not in clock:
+            return fallback_simulations
+        budget_ms = _time_budget_ms(
+            clock[time_key], clock.get(inc_key, 0), board.fullmove_number, clock.get("movestogo")
+        )
+
+    sims = int((budget_ms / 1000.0) * nps)
+    return max(MIN_SIMULATIONS, min(MAX_SIMULATIONS, sims))
+
+
 def _apply_position_command(board: chess.Board, tokens: list[str]) -> None:
     """Handles a UCI `position` command's tokens (after the leading
     `position` itself), e.g. `startpos moves e2e4 e7e5` or
@@ -122,6 +212,7 @@ def run(
 ) -> None:
     model = load_model(checkpoint_path, device, scan_backend)
     evaluator = BatchedEvaluator(model, device)
+    nps = warmup(evaluator, simulations, batch_size)
     board = chess.Board()
 
     def send(line: str) -> None:
@@ -162,7 +253,9 @@ def run(
         elif command == "position":
             _apply_position_command(board, tokens[1:])
         elif command == "go":
-            move = choose_move(evaluator, board, simulations, batch_size)
+            move_sims = sims_for_go(tokens[1:], board, simulations, nps)
+            print(f"[bee-mamba] {move_sims} simulations for this move", file=sys.stderr, flush=True)
+            move = choose_move(evaluator, board, move_sims, batch_size)
             send(f"bestmove {move.uci() if move else '(none)'}")
         elif command == "quit":
             return

@@ -11,6 +11,7 @@ import {
   type ParticipantKind,
 } from "./participant";
 import { EngineOptionsFields } from "./EngineOptionsFields";
+import { MambaOptionsFields } from "./MambaOptionsFields";
 import { Button } from "./components/ui/Button";
 import { Checkbox } from "./components/ui/Checkbox";
 import { Field } from "./components/ui/Field";
@@ -163,9 +164,15 @@ function ParticipantFields({
           onChange={(e) => onChange({ ...participant, debug: e.target.checked })}
         />
       )}
-      {(participant.kind === "bee" || participant.kind === "bee-mamba") && (
+      {participant.kind === "bee" && (
         <EngineOptionsFields
           engineName={participant.kind}
+          values={participant.options}
+          onChange={(options) => onChange({ ...participant, options })}
+        />
+      )}
+      {participant.kind === "bee-mamba" && (
+        <MambaOptionsFields
           values={participant.options}
           onChange={(options) => onChange({ ...participant, options })}
         />
