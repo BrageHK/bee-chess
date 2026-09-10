@@ -3,7 +3,9 @@ use crate::book::{CowOpeningBook, ExperienceBook, NoBook, OpeningBook, OpeningCo
 use crate::chess::{Move, PieceKind, Position, Square};
 use crate::diagnostics::{Diagnostic, DiagnosticBuffer, DiagnosticLevel, Diagnostics};
 use crate::eval::{Evaluator, ExperimentalEvaluator, MaterialEvaluator, PositionalEvaluator};
-use crate::search::{self, ClockTimeControl, SearchOptions, SearchResult, TimeManagerConfig};
+use crate::search::{
+    self, ClockTimeControl, SearchOptions, SearchResult, TimeManagerConfig, TtReuse,
+};
 
 /// How much worse (in centipawns) the forced book move is allowed to
 /// score than the best move a shallow search finds from the same
@@ -46,6 +48,12 @@ pub struct Engine {
     /// than about performance.
     opening_book: Box<dyn OpeningBook>,
     search_options: SearchOptions,
+    /// Travels with Engine into and back out of the UCI search worker. Only
+    /// the TT survives searches; killers, history heuristics and stats reset.
+    search_context: search::SearchContext,
+    /// Last searched game prefix, compared after a UCI position's entire move
+    /// list has been replayed so ordinary position updates preserve the TT.
+    last_search_history: Vec<u64>,
     /// Toggles for `PositionalEvaluator`'s optional terms (e.g.
     /// mobility) -- see `crate::eval::EvalOptions`'s docs. Unused by
     /// `MaterialEvaluator`/`ExperimentalEvaluator`, which take no
@@ -85,7 +93,6 @@ pub struct Engine {
     // later:
     // evaluator: Box<dyn Evaluator>,
     // searcher: Searcher,
-    // transposition_table: TranspositionTable,
     // options: EngineOptions,
 }
 
@@ -187,12 +194,16 @@ impl Engine {
     pub fn new() -> Self {
         let position = Position::startpos();
         let position_history = vec![position.zobrist_hash()];
+        let mut search_context = search::SearchContext::default();
+        search_context.set_tt_reuse(TtReuse::default());
         Self {
             debug: false,
             evaluator: EvaluatorKind::default(),
             opening_book_kind: OpeningBookKind::default(),
             opening_book: OpeningBookKind::default().book(),
             search_options: SearchOptions::default(),
+            search_context,
+            last_search_history: Vec::new(),
             eval_options: crate::eval::EvalOptions::default(),
             position,
             diagnostics: DiagnosticBuffer::new(),
@@ -266,6 +277,9 @@ impl Engine {
     }
 
     pub fn set_evaluator(&mut self, evaluator: EvaluatorKind) {
+        if self.evaluator != evaluator {
+            self.search_context.clear_table();
+        }
         self.evaluator = evaluator;
     }
 
@@ -274,6 +288,9 @@ impl Engine {
     }
 
     pub fn set_opening_book(&mut self, kind: OpeningBookKind) {
+        if self.opening_book_kind != kind {
+            self.search_context.clear_table();
+        }
         self.opening_book_kind = kind;
         self.opening_book = kind.book();
     }
@@ -283,34 +300,58 @@ impl Engine {
     }
 
     pub fn set_use_tt(&mut self, use_tt: bool) {
+        if self.search_options.use_tt != use_tt {
+            self.search_context.clear_table();
+        }
         self.search_options.use_tt = use_tt;
     }
 
     pub fn set_use_quiescence(&mut self, use_quiescence: bool) {
+        if self.search_options.use_quiescence != use_quiescence {
+            self.search_context.clear_table();
+        }
         self.search_options.use_quiescence = use_quiescence;
     }
 
     pub fn set_use_enhanced_quiescence(&mut self, use_enhanced_quiescence: bool) {
+        if self.search_options.use_enhanced_quiescence != use_enhanced_quiescence {
+            self.search_context.clear_table();
+        }
         self.search_options.use_enhanced_quiescence = use_enhanced_quiescence;
     }
 
     pub fn set_use_lmr(&mut self, use_lmr: bool) {
+        if self.search_options.use_lmr != use_lmr {
+            self.search_context.clear_table();
+        }
         self.search_options.use_lmr = use_lmr;
     }
 
     pub fn set_use_null_move(&mut self, enabled: bool) {
+        if self.search_options.use_null_move != enabled {
+            self.search_context.clear_table();
+        }
         self.search_options.use_null_move = enabled;
     }
 
     pub fn set_use_adaptive_null_move(&mut self, enabled: bool) {
+        if self.search_options.use_adaptive_null_move != enabled {
+            self.search_context.clear_table();
+        }
         self.search_options.use_adaptive_null_move = enabled;
     }
 
     pub fn set_use_delta_pruning(&mut self, enabled: bool) {
+        if self.search_options.use_delta_pruning != enabled {
+            self.search_context.clear_table();
+        }
         self.search_options.use_delta_pruning = enabled;
     }
 
     pub fn set_use_see(&mut self, enabled: bool) {
+        if self.search_options.use_see != enabled {
+            self.search_context.clear_table();
+        }
         self.search_options.use_see = enabled;
     }
 
@@ -319,10 +360,16 @@ impl Engine {
     }
 
     pub fn set_use_mobility(&mut self, enabled: bool) {
+        if self.eval_options.use_mobility != enabled {
+            self.search_context.clear_table();
+        }
         self.eval_options.use_mobility = enabled;
     }
 
     pub fn set_use_king_safety(&mut self, enabled: bool) {
+        if self.eval_options.use_king_safety != enabled {
+            self.search_context.clear_table();
+        }
         self.eval_options.use_king_safety = enabled;
     }
 
@@ -339,16 +386,31 @@ impl Engine {
         self.time_manager_config.move_overhead = move_overhead;
     }
 
-    /// Resets game/search-specific engine state (TT generation and
-    /// similar, once that exists) for a new game. This does **not**
-    /// reset `position_history` or set the board to the starting
-    /// position -- UCI's `ucinewgame` is always followed by a
-    /// `position` command that establishes the actual position (and,
-    /// via `set_position`, resets history to just that position), so
-    /// doing either here too would just be redundant with (and
-    /// potentially race) that follow-up command. For now, with no other
-    /// such state yet to reset, this is a deliberate no-op.
-    pub fn new_game(&mut self) {}
+    pub fn tt_reuse(&self) -> TtReuse {
+        self.search_context.tt_reuse()
+    }
+
+    pub fn set_tt_reuse(&mut self, policy: TtReuse) {
+        self.search_context.set_tt_reuse(policy);
+    }
+
+    /// Clears search caches without replacing the board or game history; the
+    /// following UCI position command establishes the new game's position.
+    pub fn new_game(&mut self) {
+        self.search_context.clear_table();
+        self.last_search_history.clear();
+    }
+
+    fn prepare_search(&mut self) {
+        if self.tt_reuse() == TtReuse::PerGame {
+            // A rewind, different game prefix or standalone unrelated FEN is
+            // a fresh session even when the client omits ucinewgame.
+            if !self.position_history.starts_with(&self.last_search_history) {
+                self.search_context.clear_table();
+            }
+            self.last_search_history.clone_from(&self.position_history);
+        }
+    }
 
     /// Applies a single move to the current position, given as UCI-style
     /// `(from, to, promotion)` coordinates (e.g. `e2e4` is
@@ -547,6 +609,7 @@ impl Engine {
     /// deepening instead of a fixed depth.
     #[must_use]
     pub fn search(&mut self, depth: u32) -> SearchResult {
+        self.prepare_search();
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
@@ -558,21 +621,23 @@ impl Engine {
             return result;
         }
         match self.evaluator {
-            EvaluatorKind::Experimental => search::search_with_options(
+            EvaluatorKind::Experimental => search::search_with_context(
                 &mut self.position,
                 depth,
                 &ExperimentalEvaluator,
                 &self.position_history,
                 self.search_options,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Material => search::search_with_options(
+            EvaluatorKind::Material => search::search_with_context(
                 &mut self.position,
                 depth,
                 &MaterialEvaluator,
                 &self.position_history,
                 self.search_options,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Positional => search::search_with_options(
+            EvaluatorKind::Positional => search::search_with_context(
                 &mut self.position,
                 depth,
                 &PositionalEvaluator {
@@ -580,6 +645,7 @@ impl Engine {
                 },
                 &self.position_history,
                 self.search_options,
+                &mut self.search_context,
             ),
         }
     }
@@ -613,6 +679,7 @@ impl Engine {
         stop: search::StopSignal,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> SearchResult {
+        self.prepare_search();
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
@@ -626,7 +693,7 @@ impl Engine {
 
         let fallback = self.position.generate_legal_moves().into_iter().next();
         let searched = match self.evaluator {
-            EvaluatorKind::Experimental => search::search_iterative_with_stop(
+            EvaluatorKind::Experimental => search::search_iterative_with_context(
                 &mut self.position,
                 budget,
                 &ExperimentalEvaluator,
@@ -634,8 +701,9 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Material => search::search_iterative_with_stop(
+            EvaluatorKind::Material => search::search_iterative_with_context(
                 &mut self.position,
                 budget,
                 &MaterialEvaluator,
@@ -643,8 +711,9 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Positional => search::search_iterative_with_stop(
+            EvaluatorKind::Positional => search::search_iterative_with_context(
                 &mut self.position,
                 budget,
                 &PositionalEvaluator {
@@ -654,6 +723,7 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
         };
 
@@ -722,6 +792,7 @@ impl Engine {
         stop: search::StopSignal,
         on_depth_complete: impl FnMut(&SearchResult),
     ) -> (SearchResult, Option<search::TimeManagementTelemetry>) {
+        self.prepare_search();
         let book_result = match self.evaluator {
             EvaluatorKind::Experimental => self.book_move(&ExperimentalEvaluator),
             EvaluatorKind::Material => self.book_move(&MaterialEvaluator),
@@ -737,7 +808,7 @@ impl Engine {
         let budget = search::allocate_time(control, &self.time_manager_config);
 
         let searched = match self.evaluator {
-            EvaluatorKind::Experimental => search::search_iterative_with_budget(
+            EvaluatorKind::Experimental => search::search_iterative_with_budget_context(
                 &mut self.position,
                 budget,
                 &ExperimentalEvaluator,
@@ -745,8 +816,9 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Material => search::search_iterative_with_budget(
+            EvaluatorKind::Material => search::search_iterative_with_budget_context(
                 &mut self.position,
                 budget,
                 &MaterialEvaluator,
@@ -754,8 +826,9 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
-            EvaluatorKind::Positional => search::search_iterative_with_budget(
+            EvaluatorKind::Positional => search::search_iterative_with_budget_context(
                 &mut self.position,
                 budget,
                 &PositionalEvaluator {
@@ -765,6 +838,7 @@ impl Engine {
                 self.search_options,
                 stop,
                 on_depth_complete,
+                &mut self.search_context,
             ),
         };
 
@@ -804,6 +878,187 @@ impl Default for Engine {
 mod tests {
     use super::*;
     use crate::chess::Color;
+
+    fn persistent_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine.set_evaluator(EvaluatorKind::Material);
+        engine.set_tt_reuse(TtReuse::PerGame);
+        engine
+    }
+
+    fn assert_same_search(actual: &SearchResult, expected: &SearchResult) {
+        assert_eq!(actual.best_move, expected.best_move);
+        assert_eq!(actual.score, expected.score);
+        assert_eq!(actual.nodes, expected.nodes);
+    }
+
+    #[test]
+    fn tt_reuse_defaults_to_per_game_and_reuses_completed_work() {
+        let mut engine = Engine::new();
+        assert_eq!(TtReuse::default(), TtReuse::PerGame);
+        assert_eq!(engine.tt_reuse(), TtReuse::PerGame);
+        let first = engine.search(3);
+        let second = engine.search(3);
+        assert_eq!(second.best_move, first.best_move);
+        assert_eq!(second.score, first.score);
+        assert!(second.nodes < first.nodes);
+    }
+
+    #[test]
+    fn per_search_preserves_the_existing_baseline_behavior() {
+        let mut engine = Engine::new();
+        engine.set_tt_reuse(TtReuse::PerSearch);
+        assert_eq!(engine.tt_reuse(), TtReuse::PerSearch);
+        let first = engine.search(3);
+        assert_same_search(&engine.search(3), &first);
+        let baseline = search::search(
+            &mut Position::startpos(),
+            3,
+            &PositionalEvaluator::default(),
+        );
+        assert_same_search(&first, &baseline);
+    }
+
+    #[test]
+    fn per_game_reuses_work_and_new_game_clears_it() {
+        let mut engine = persistent_engine();
+        let first = engine.search(3);
+        let second = engine.search(3);
+        assert_eq!(second.score, first.score);
+        assert!(second.nodes < first.nodes);
+        engine.new_game();
+        assert_eq!(engine.tt_reuse(), TtReuse::PerGame);
+        assert_same_search(&engine.search(3), &first);
+    }
+
+    #[test]
+    fn per_game_reuses_descendants_after_the_played_moves_are_replayed() {
+        let mut engine = persistent_engine();
+        let first = engine.search(4);
+        assert!(first.pv.len() >= 2);
+        let mut cold = persistent_engine();
+        // UCI rebuilds history from the base position before each go.
+        engine.set_position(Position::startpos());
+        for mv in &first.pv[..2] {
+            engine
+                .apply_move(mv.from(), mv.to(), mv.flag().promotion_kind())
+                .unwrap();
+            cold.apply_move(mv.from(), mv.to(), mv.flag().promotion_kind())
+                .unwrap();
+        }
+        let warm_result = engine.search(2);
+        let cold_result = cold.search(2);
+        assert_eq!(warm_result.score, cold_result.score);
+        assert!(
+            warm_result.nodes < cold_result.nodes,
+            "warm={} cold={}",
+            warm_result.nodes,
+            cold_result.nodes
+        );
+        assert!(engine
+            .position
+            .generate_legal_moves()
+            .contains(&warm_result.best_move.unwrap()));
+    }
+
+    #[test]
+    fn changed_options_and_policy_invalidate_persistent_scores() {
+        let changes: &[fn(&mut Engine)] = &[
+            |e| e.set_evaluator(EvaluatorKind::Positional),
+            |e| e.set_use_tt(false),
+            |e| e.set_use_quiescence(false),
+            |e| e.set_use_enhanced_quiescence(false),
+            |e| e.set_use_lmr(false),
+            |e| e.set_use_null_move(false),
+            |e| e.set_use_adaptive_null_move(false),
+            |e| e.set_use_delta_pruning(false),
+            |e| e.set_use_see(false),
+            |e| e.set_use_mobility(false),
+            |e| e.set_use_king_safety(false),
+            |e| e.set_tt_reuse(TtReuse::PerSearch),
+        ];
+        for change in changes {
+            let mut warm = persistent_engine();
+            let _ = warm.search(2);
+            change(&mut warm);
+            let mut cold = persistent_engine();
+            change(&mut cold);
+            assert_same_search(&warm.search(2), &cold.search(2));
+        }
+    }
+
+    #[test]
+    fn unchanged_options_and_clock_overhead_preserve_the_cache() {
+        let mut engine = persistent_engine();
+        let first = engine.search(2);
+        engine.set_evaluator(EvaluatorKind::Material);
+        engine.set_use_tt(true);
+        engine.set_use_mobility(true);
+        engine.set_tt_reuse(TtReuse::PerGame);
+        engine.set_move_overhead(std::time::Duration::from_millis(50));
+        assert!(engine.search(2).nodes < first.nodes);
+    }
+
+    #[test]
+    fn rewinding_a_game_starts_with_a_cold_cache() {
+        let mut engine = persistent_engine();
+        let first = engine.search(3);
+        engine
+            .apply_move("e2".parse().unwrap(), "e4".parse().unwrap(), None)
+            .unwrap();
+        let _ = engine.search(2);
+        engine.set_position(Position::startpos());
+        assert_same_search(&engine.search(3), &first);
+    }
+
+    #[test]
+    fn disabled_tt_overrides_per_game_reuse() {
+        let mut engine = persistent_engine();
+        engine.set_use_tt(false);
+        let first = engine.search(3);
+        assert_same_search(&engine.search(3), &first);
+    }
+
+    #[test]
+    fn timed_search_keeps_completed_work_after_stop() {
+        let mut engine = persistent_engine();
+        let stop = search::StopSignal::new();
+        let result =
+            engine.search_for_time(std::time::Duration::from_secs(60), stop.clone(), |result| {
+                if result.depth == 3 {
+                    stop.request_stop();
+                }
+            });
+        assert_eq!(result.depth, 3);
+        let warm = engine.search(3);
+        let cold = persistent_engine().search(3);
+        assert_eq!(warm.score, cold.score);
+        assert!(warm.nodes < cold.nodes);
+        assert_eq!(engine.position(), &Position::startpos());
+    }
+
+    #[test]
+    fn clock_search_deepens_past_equal_node_counts_from_cached_iterations() {
+        let mut engine = persistent_engine();
+        let _ = engine.search(4);
+        let stop = search::StopSignal::new();
+        let (result, telemetry) = engine.search_with_clock(
+            ClockTimeControl {
+                time_left: std::time::Duration::from_secs(600),
+                increment: std::time::Duration::ZERO,
+                moves_to_go: Some(10),
+            },
+            stop.clone(),
+            |result| {
+                if result.depth == 4 {
+                    stop.request_stop();
+                }
+            },
+        );
+        assert_eq!(result.depth, 4);
+        assert_eq!(telemetry.unwrap().completed_depth, 4);
+        assert_eq!(engine.position(), &Position::startpos());
+    }
 
     #[test]
     fn new_engine_starts_at_startpos() {

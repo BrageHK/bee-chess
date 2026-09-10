@@ -11,6 +11,13 @@ use crate::chess::{Move, Position};
 mod alpha_beta;
 mod deadline;
 mod time_manager;
+mod tt;
+
+pub(crate) use alpha_beta::{
+    search_iterative_with_budget_context, search_iterative_with_context, search_with_context,
+    SearchState as SearchContext,
+};
+pub use tt::TtReuse;
 
 pub use alpha_beta::{
     search, search_iterative, search_iterative_with_budget, search_iterative_with_history,

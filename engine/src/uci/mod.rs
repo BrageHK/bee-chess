@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::chess::{Color, FenError, Move, PieceKind, Position, Square};
 use crate::diagnostics::DiagnosticLevel;
 use crate::engine::{Engine, EvaluatorKind, IllegalMoveError, OpeningBookKind};
+use crate::search::TtReuse;
 use crate::search::{
     mate_in_plies, ClockTimeControl, SearchResult, StopSignal, DEFAULT_MOVE_OVERHEAD_MS,
 };
@@ -708,6 +709,7 @@ fn run_event_loop<W: Write>(
                         // experiment runner is the intended way to turn one off,
                         // not a permanent engine configuration.
                         writeln!(output, "option name UseTT type check default true")?;
+                        writeln!(output, "option name TTReuse type combo default PerGame var PerSearch var PerGame")?;
                         writeln!(output, "option name UseQuiescence type check default true")?;
                         writeln!(output, "option name UseLMR type check default true")?;
                         writeln!(output, "option name UseNullMove type check default true")?;
@@ -766,6 +768,15 @@ fn run_event_loop<W: Write>(
                                 engine.emit_diagnostic(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid Evaluator value: {value}"),
+                                );
+                            }
+                        } else if name.eq_ignore_ascii_case("TTReuse") {
+                            if let Some(policy) = TtReuse::parse(&value) {
+                                engine.set_tt_reuse(policy);
+                            } else {
+                                engine.emit_diagnostic(
+                                    DiagnosticLevel::Warn,
+                                    format!("ignored invalid TTReuse value: {value}"),
                                 );
                             }
                         } else if name.eq_ignore_ascii_case("UseTT") {
@@ -1470,6 +1481,79 @@ mod tests {
         let mut engine = Engine::default();
         run(input, &mut output, &mut engine).expect("run should succeed");
         assert!(!engine.search_options().use_tt);
+    }
+
+    #[test]
+    fn tt_reuse_is_discoverable_and_parses_case_insensitively() {
+        let mut engine = Engine::new();
+        let mut output = Vec::new();
+        run(
+            b"uci\nsetoption name ttreuse value pergame\nquit\n".as_slice(),
+            &mut output,
+            &mut engine,
+        )
+        .unwrap();
+        assert_eq!(engine.tt_reuse(), TtReuse::PerGame);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("option name TTReuse type combo default PerGame var PerSearch var PerGame"));
+        run(
+            b"setoption name TTReuse value PerSearch\nquit\n".as_slice(),
+            Vec::new(),
+            &mut engine,
+        )
+        .unwrap();
+        assert_eq!(engine.tt_reuse(), TtReuse::PerSearch);
+    }
+
+    #[test]
+    fn invalid_tt_reuse_keeps_the_selected_policy() {
+        let mut engine = Engine::new();
+        let mut output = Vec::new();
+        run(b"debug on\nsetoption name TTReuse value PerGame\nsetoption name TTReuse value invalid\nquit\n".as_slice(), &mut output, &mut engine).unwrap();
+        assert_eq!(engine.tt_reuse(), TtReuse::PerGame);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("ignored invalid TTReuse value: invalid"));
+    }
+
+    #[test]
+    fn tt_survives_worker_handoffs_and_resets_on_ucinewgame() {
+        for policy in ["PerSearch", "PerGame"] {
+            let input = format!(
+                "setoption name Evaluator value Material\nsetoption name TTReuse value {policy}\nposition startpos\ngo depth 3\nposition startpos\ngo depth 3\nucinewgame\nposition startpos\ngo depth 3\nquit\n"
+            );
+            let mut engine = Engine::new();
+            let mut output = Vec::new();
+            run(input.as_bytes(), &mut output, &mut engine).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            let nodes: Vec<u64> = output
+                .lines()
+                .filter(|line| line.starts_with("info depth "))
+                .map(|line| {
+                    line.split_whitespace()
+                        .skip_while(|&word| word != "nodes")
+                        .nth(1)
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(nodes.len(), 3);
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|line| line.starts_with("bestmove "))
+                    .count(),
+                3
+            );
+            assert_eq!(nodes[0], nodes[2]);
+            if policy == "PerGame" {
+                assert!(nodes[1] < nodes[0]);
+            } else {
+                assert_eq!(nodes[1], nodes[0]);
+            }
+        }
     }
 
     #[test]

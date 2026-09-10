@@ -94,3 +94,8 @@ This builds Stockfish, Bee, and Bee Lab (first run only takes a few
 minutes for Stockfish), starts Lab, and opens the frontend dev server --
 pick Stockfish vs Bee on the setup screen and Lab plays them against
 each other, driving both engine processes itself.
+
+To A/B reuse of cached search work across moves, choose `TTReuse=PerSearch`
+versus `TTReuse=PerGame` (the default) in Bee Lab's experiment options.
+See [the TT reuse guide](docs/tt-reuse.md) for UCI commands, reset behavior,
+and local measurements.
