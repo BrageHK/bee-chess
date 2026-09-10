@@ -57,6 +57,17 @@ const CPUCT_FACTOR: f32 = 3.894;
 const FPU_REDUCTION: f32 = 0.33;
 const VIRTUAL_LOSS: f32 = 1.0;
 
+// Leaf value (from the perspective of the side to move at the leaf) assigned
+// to a stalemate. Kept slightly positive -- rather than the flat 0.0 every
+// other non-mate terminal gets -- because `unstake_and_backup` negates value
+// on every step up the tree: a positive value here for the stalemated side
+// becomes a small *negative* one for whichever side just moved into it, so
+// the search mildly steers away from stalemating an opponent (e.g. sloppy
+// king-and-pawn technique turning a win into a draw) without forbidding it
+// outright -- a side with no better option (already lost) can still walk
+// into one, since every other line scores far below this.
+const STALEMATE_BIAS: f32 = 0.1;
+
 // Must match bee-chess's encode.py / MuZero-rs's chess_mamba_bot.rs exactly.
 const N_PIECE_TYPES: usize = 12;
 const N_AUX: usize = 8;
@@ -386,10 +397,10 @@ fn search_impl(
         let mut leaf_values = vec![0.0f32; wave];
         for i in 0..wave {
             if boards[i].status() != BoardStatus::Ongoing {
-                leaf_values[i] = if boards[i].status() == BoardStatus::Checkmate {
-                    -1.0
-                } else {
-                    0.0
+                leaf_values[i] = match boards[i].status() {
+                    BoardStatus::Checkmate => -1.0,
+                    BoardStatus::Stalemate => STALEMATE_BIAS,
+                    BoardStatus::Ongoing => unreachable!(),
                 };
                 continue;
             }
