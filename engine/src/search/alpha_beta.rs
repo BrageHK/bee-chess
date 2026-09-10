@@ -7,50 +7,32 @@
 //! root, while a full root window avoids deadline-expensive fail-high/low
 //! re-searches when the score changes sharply between depths.
 //!
-//! There is also no threading/cancellation infrastructure yet (that's
-//! #7's territory) -- time-bounded search instead polls a `Deadline`
-//! periodically from inside negamax and unwinds early when it's
-//! passed. A partially-searched depth is discarded rather than
+//! Time-bounded search polls a `Deadline` and an optional external stop
+//! signal periodically from inside negamax and unwinds early when either
+//! requests cancellation. A partially-searched depth is discarded rather than
 //! reported: alpha-beta's cutoffs assume a subtree was fully explored,
 //! so a score produced after bailing out partway through one is not
 //! trustworthy the way a fully-completed depth's score is.
-
-use std::collections::HashMap;
 
 use crate::chess::{Color, Move, MoveFlag, Piece, PieceKind, Position, Square};
 use crate::eval::Evaluator;
 
 use super::deadline::{Deadline, StopSignal};
+use super::tt::{Bound, TranspositionTable, TtEntry, TtReuse};
 use super::{
     DeltaPruningStats, LmrStats, NullMoveStats, Score, SearchOptions, SearchResult, SeeStats,
     SCORE_INF, SCORE_MATE,
 };
 
-const MAX_TT_ENTRIES: usize = 1 << 20;
 /// A practical ceiling for iterative deepening. Positions where every move
 /// immediately reaches a rule draw can otherwise complete arbitrarily large
 /// nominal depths in constant time, producing meaningless values in UCI
 /// telemetry and experiment aggregates.
 const MAX_ITERATIVE_DEPTH: u32 = 128;
 
-#[derive(Clone, Copy)]
-enum Bound {
-    Exact,
-    Lower,
-    Upper,
-}
-
-#[derive(Clone, Copy)]
-struct TtEntry {
-    depth: u32,
-    score: Score,
-    bound: Bound,
-    best_move: Option<Move>,
-}
-
-struct SearchState {
+pub(crate) struct SearchState {
     options: SearchOptions,
-    table: HashMap<(u64, u32, u8), TtEntry>,
+    table: TranspositionTable,
     killers: Vec<[Option<Move>; 2]>,
     history: [i32; 64 * 64],
     root_best: Option<Move>,
@@ -61,10 +43,33 @@ struct SearchState {
 }
 
 impl SearchState {
+    pub(crate) fn tt_reuse(&self) -> TtReuse {
+        self.table.policy
+    }
+
+    pub(crate) fn set_tt_reuse(&mut self, policy: TtReuse) {
+        if self.table.policy != policy {
+            self.table.policy = policy;
+            self.clear_table();
+        }
+    }
+
+    pub(crate) fn clear_table(&mut self) {
+        self.table.clear();
+    }
+
+    fn begin_search(&mut self, options: SearchOptions) {
+        self.options = options;
+        self.table.begin_search();
+        self.killers.clear();
+        self.history.fill(0);
+        self.root_best = None;
+    }
+
     fn new(options: SearchOptions) -> Self {
         Self {
             options,
-            table: HashMap::new(),
+            table: TranspositionTable::default(),
             killers: Vec::new(),
             history: [0; 64 * 64],
             root_best: None,
@@ -153,7 +158,25 @@ pub fn search_with_options(
     history: &[u64],
     options: SearchOptions,
 ) -> SearchResult {
-    let mut state = SearchState::new(options);
+    search_with_context(
+        position,
+        depth,
+        evaluator,
+        history,
+        options,
+        &mut SearchState::new(options),
+    )
+}
+
+pub(crate) fn search_with_context(
+    position: &mut Position,
+    depth: u32,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+    state: &mut SearchState,
+) -> SearchResult {
+    state.begin_search(options);
     let mut path = normalized_history(position, history);
     // A fixed-depth search never times out: same code path as
     // search_iterative's per-depth search, just with an unlimited
@@ -163,7 +186,7 @@ pub fn search_with_options(
         depth,
         evaluator,
         &Deadline::none(),
-        &mut state,
+        state,
         &mut path,
     )
     .expect("Deadline::none() never expires, so this can't be an incomplete search")
@@ -291,15 +314,38 @@ pub fn search_iterative_with_stop(
     history: &[u64],
     options: SearchOptions,
     stop: StopSignal,
+    on_depth_complete: impl FnMut(&SearchResult),
+) -> Option<SearchResult> {
+    search_iterative_with_context(
+        position,
+        budget,
+        evaluator,
+        history,
+        options,
+        stop,
+        on_depth_complete,
+        &mut SearchState::new(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_iterative_with_context(
+    position: &mut Position,
+    budget: std::time::Duration,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+    stop: StopSignal,
     mut on_depth_complete: impl FnMut(&SearchResult),
+    state: &mut SearchState,
 ) -> Option<SearchResult> {
     let deadline = Deadline::from_now(budget).with_stop_signal(stop);
-    let mut state = SearchState::new(options);
+    state.begin_search(options);
     let mut path = normalized_history(position, history);
 
     let mut depth = 1;
     let mut last_completed =
-        search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path)?;
+        search_to_depth(position, depth, evaluator, &deadline, state, &mut path)?;
     on_depth_complete(&last_completed);
 
     if super::mate_in_plies(last_completed.score).is_some() {
@@ -308,7 +354,7 @@ pub fn search_iterative_with_stop(
 
     loop {
         depth += 1;
-        match search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path) {
+        match search_to_depth(position, depth, evaluator, &deadline, state, &mut path) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
                 last_completed = result;
@@ -385,12 +431,35 @@ pub fn search_iterative_with_budget(
     history: &[u64],
     options: SearchOptions,
     stop: StopSignal,
+    on_depth_complete: impl FnMut(&SearchResult),
+) -> Option<(SearchResult, super::TimeManagementTelemetry)> {
+    search_iterative_with_budget_context(
+        position,
+        budget,
+        evaluator,
+        history,
+        options,
+        stop,
+        on_depth_complete,
+        &mut SearchState::new(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_iterative_with_budget_context(
+    position: &mut Position,
+    budget: super::TimeBudget,
+    evaluator: &impl Evaluator,
+    history: &[u64],
+    options: SearchOptions,
+    stop: StopSignal,
     mut on_depth_complete: impl FnMut(&SearchResult),
+    state: &mut SearchState,
 ) -> Option<(SearchResult, super::TimeManagementTelemetry)> {
     let search_start = std::time::Instant::now();
     let soft_deadline = Deadline::from_now(budget.soft).with_stop_signal(stop.clone());
     let hard_deadline = Deadline::from_now(budget.hard).with_stop_signal(stop);
-    let mut state = SearchState::new(options);
+    state.begin_search(options);
     let mut path = normalized_history(position, history);
 
     let mut best_move_changes = 0u32;
@@ -413,14 +482,8 @@ pub fn search_iterative_with_budget(
 
     let mut depth = 1;
     let depth_1_start = std::time::Instant::now();
-    let mut last_completed = search_to_depth(
-        position,
-        depth,
-        evaluator,
-        &hard_deadline,
-        &mut state,
-        &mut path,
-    )?;
+    let mut last_completed =
+        search_to_depth(position, depth, evaluator, &hard_deadline, state, &mut path)?;
     last_depth_duration = depth_1_start.elapsed();
     // Depth 1 itself being cut off (`?` returns `None` above) means no
     // `SearchResult` was ever produced, so there's no `SearchResult`
@@ -452,17 +515,14 @@ pub fn search_iterative_with_budget(
         }
         depth += 1;
         let depth_start = std::time::Instant::now();
-        match search_to_depth(
-            position,
-            depth,
-            evaluator,
-            &hard_deadline,
-            &mut state,
-            &mut path,
-        ) {
+        match search_to_depth(position, depth, evaluator, &hard_deadline, state, &mut path) {
             Some(result) => {
                 let found_mate = super::mate_in_plies(result.score).is_some();
-                let search_saturated = result.nodes == last_completed.nodes
+                // Equal shallow node counts can just be hits in a warm TT.
+                let search_saturated = (state.tt_reuse() == TtReuse::PerSearch
+                    || !state.options.use_tt
+                    || result.nodes == 1)
+                    && result.nodes == last_completed.nodes
                     && result.score == last_completed.score
                     && result.best_move == last_completed.best_move;
                 last_score_delta = previous_score.map(|previous| result.score - previous);
@@ -728,18 +788,16 @@ fn negamax(
     // `tt_move` simply stays `None`, so move ordering falls back to
     // MVV-LVA/killers/history alone, exactly as if no entry had ever
     // been found.
-    let tt_move = if state.options.use_tt {
-        state.table.get(&tt_key).and_then(|entry| entry.best_move)
+    let tt_entry = if state.options.use_tt {
+        state.table.probe(&tt_key)
     } else {
         None
     };
+    let tt_move = tt_entry.and_then(|entry| entry.best_move);
     if state.options.use_tt {
-        if let Some(entry) = state
-            .table
-            .get(&tt_key)
-            .copied()
-            .filter(|entry| entry.depth >= depth)
-        {
+        if let Some(entry) = tt_entry.filter(|entry| {
+            entry.depth >= depth && entry.history == state.table.history_key(position, path)
+        }) {
             let score = score_from_tt(entry.score, ply);
             match entry.bound {
                 Bound::Exact => return Some((score, entry.best_move.into_iter().collect())),
@@ -922,24 +980,11 @@ fn negamax(
         } else {
             Bound::Exact
         };
-        let should_replace = state
-            .table
-            .get(&tt_key)
-            .is_none_or(|entry| depth >= entry.depth);
-        if should_replace {
-            if state.table.len() >= MAX_TT_ENTRIES {
-                state.table.clear();
-            }
-            state.table.insert(
-                tt_key,
-                TtEntry {
-                    depth,
-                    score: score_to_tt(best, ply),
-                    bound,
-                    best_move,
-                },
-            );
-        }
+        let history = state.table.history_key(position, path);
+        state.table.store(
+            tt_key,
+            TtEntry::new(depth, score_to_tt(best, ply), bound, best_move, history),
+        );
     }
 
     Some((best, best_pv))
@@ -2163,6 +2208,99 @@ mod tests {
             1,
             "the second search should hit the TT at its root"
         );
+    }
+
+    #[test]
+    fn persistent_tt_checks_depth_bounds_and_draw_context_before_cutoffs() {
+        let position =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 3").unwrap();
+        let hash = position.zobrist_hash();
+        // Only an exact entry with sufficient depth and identical draw
+        // context may return the sentinel score in one node.
+        for (depth, bound, score, halfmove, repetitions, earlier, cutoff) in [
+            (3, Bound::Exact, 777, 4, 1, 11, true),
+            (1, Bound::Exact, 777, 4, 1, 11, false),
+            (3, Bound::Lower, -100, 4, 1, 11, false),
+            (3, Bound::Upper, 100, 4, 1, 11, false),
+            (3, Bound::Exact, 777, 5, 1, 11, false),
+            (3, Bound::Exact, 777, 4, 2, 11, false),
+            (3, Bound::Exact, 777, 4, 1, 22, false),
+        ] {
+            let mut position = position.clone();
+            let mut state = SearchState::default();
+            state.set_tt_reuse(TtReuse::PerGame);
+            let context = state.table.history_key(&position, &[earlier, hash]);
+            state.table.store(
+                (hash, halfmove, repetitions),
+                TtEntry::new(depth, score, bound, None, context),
+            );
+            state.begin_search(SearchOptions::default());
+            let mut nodes = 0;
+            let result = negamax(
+                &mut position,
+                2,
+                -SCORE_INF,
+                SCORE_INF,
+                0,
+                &MaterialEvaluator,
+                &mut nodes,
+                &Deadline::none(),
+                &mut state,
+                &mut vec![11, hash],
+                true,
+            )
+            .unwrap();
+            if cutoff {
+                assert_eq!(nodes, 1);
+                assert_eq!(result.0, 777);
+            } else {
+                assert!(nodes > 1);
+                assert_eq!(result.0, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_tt_adjusts_mate_distance_when_a_descendant_becomes_root() {
+        let mut position = Position::from_fen("6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let mut path = vec![position.zobrist_hash()];
+        let mut state = SearchState::default();
+        state.set_tt_reuse(TtReuse::PerGame);
+        let mut nodes = 0;
+        let first = negamax(
+            &mut position,
+            1,
+            -SCORE_INF,
+            SCORE_INF,
+            4,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+            true,
+        )
+        .unwrap();
+        assert_eq!(first.0, SCORE_MATE - 5);
+        state.begin_search(SearchOptions::default());
+        nodes = 0;
+        let second = negamax(
+            &mut position,
+            1,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut state,
+            &mut path,
+            true,
+        )
+        .unwrap();
+        assert_eq!(nodes, 1);
+        assert_eq!(second.0, SCORE_MATE - 1);
+        assert_eq!(second.1, first.1);
     }
 
     #[test]
