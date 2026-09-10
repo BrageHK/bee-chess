@@ -430,6 +430,11 @@ pub fn search_iterative_with_budget(
     // nothing.
     let mut previous_score = Some(last_completed.score);
     let mut previous_best_move = last_completed.best_move;
+    // Total nodes visited across every *completed* depth so far this
+    // search -- see `TimeManagementTelemetry::avg_nps`'s docs. An
+    // aborted iteration contributes nothing here, same as it never
+    // becomes a `SearchResult` at all.
+    let mut total_nodes = last_completed.nodes;
     on_depth_complete(&last_completed);
 
     // If depth 1 already found a forced mate, searching deeper cannot
@@ -439,7 +444,14 @@ pub fn search_iterative_with_budget(
     if super::mate_in_plies(last_completed.score).is_some() {
         return Some((
             last_completed,
-            telemetry(budget, depth, aborted, best_move_changes, None),
+            telemetry(
+                budget,
+                depth,
+                aborted,
+                best_move_changes,
+                None,
+                super::nodes_per_second(total_nodes, search_start.elapsed()),
+            ),
         ));
     }
 
@@ -447,7 +459,14 @@ pub fn search_iterative_with_budget(
         if depth >= MAX_ITERATIVE_DEPTH {
             return Some((
                 last_completed,
-                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                telemetry(
+                    budget,
+                    depth,
+                    aborted,
+                    best_move_changes,
+                    last_score_delta,
+                    super::nodes_per_second(total_nodes, search_start.elapsed()),
+                ),
             ));
         }
         depth += 1;
@@ -471,6 +490,7 @@ pub fn search_iterative_with_budget(
                 }
                 previous_score = Some(result.score);
                 previous_best_move = result.best_move;
+                total_nodes += result.nodes;
                 last_completed = result;
                 previous_depth_duration = Some(last_depth_duration);
                 last_depth_duration = depth_start.elapsed();
@@ -478,7 +498,14 @@ pub fn search_iterative_with_budget(
                 if found_mate || search_saturated {
                     return Some((
                         last_completed,
-                        telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                        telemetry(
+                            budget,
+                            depth,
+                            aborted,
+                            best_move_changes,
+                            last_score_delta,
+                            super::nodes_per_second(total_nodes, search_start.elapsed()),
+                        ),
                     ));
                 }
             }
@@ -503,6 +530,7 @@ pub fn search_iterative_with_budget(
                         aborted,
                         best_move_changes,
                         last_score_delta,
+                        super::nodes_per_second(total_nodes, search_start.elapsed()),
                     ),
                 ));
             }
@@ -516,7 +544,14 @@ pub fn search_iterative_with_budget(
             // another depth," not "abort the one that just finished."
             return Some((
                 last_completed,
-                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                telemetry(
+                    budget,
+                    depth,
+                    aborted,
+                    best_move_changes,
+                    last_score_delta,
+                    super::nodes_per_second(total_nodes, search_start.elapsed()),
+                ),
             ));
         }
 
@@ -540,7 +575,14 @@ pub fn search_iterative_with_budget(
             // remains the backstop for every depth that *is* started.
             return Some((
                 last_completed,
-                telemetry(budget, depth, aborted, best_move_changes, last_score_delta),
+                telemetry(
+                    budget,
+                    depth,
+                    aborted,
+                    best_move_changes,
+                    last_score_delta,
+                    super::nodes_per_second(total_nodes, search_start.elapsed()),
+                ),
             ));
         }
     }
@@ -557,6 +599,7 @@ fn telemetry(
     aborted: std::time::Duration,
     best_move_changes: u32,
     score_delta_cp: Option<Score>,
+    avg_nps: u64,
 ) -> super::TimeManagementTelemetry {
     super::TimeManagementTelemetry {
         soft_ms: budget.soft.as_millis() as u64,
@@ -565,6 +608,7 @@ fn telemetry(
         aborted_ms: aborted.as_millis() as u64,
         best_move_changes,
         score_delta_cp,
+        avg_nps,
     }
 }
 

@@ -19,8 +19,8 @@ pub use alpha_beta::{
 };
 pub use deadline::StopSignal;
 pub use time_manager::{
-    allocate_time, estimate_next_depth_cost, next_depth_is_affordable, ClockTimeControl,
-    TimeBudget, TimeManagementTelemetry, TimeManagerConfig, BEE_TM_VERSION,
+    allocate_time, estimate_next_depth_cost, next_depth_is_affordable, nodes_per_second,
+    ClockTimeControl, TimeBudget, TimeManagementTelemetry, TimeManagerConfig, BEE_TM_VERSION,
     DEFAULT_MOVE_OVERHEAD_MS,
 };
 

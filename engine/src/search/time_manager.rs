@@ -167,6 +167,24 @@ pub fn next_depth_is_affordable(
     elapsed_ms as f64 + padded_estimate <= hard_ms as f64
 }
 
+/// Nodes visited per second, from a total node count and the wall-
+/// clock time it took -- the single number both the live `nps` UCI
+/// field and `TimeManagementTelemetry::avg_nps` are built from, kept
+/// as one pure, unit-tested function so the two call sites (a running
+/// search reporting its current rate, and a finished search reporting
+/// its overall average) can never compute it inconsistently. Returns
+/// `0` for a zero (or, defensively, negative-rounding) elapsed time
+/// rather than dividing by zero -- a search that completes in under a
+/// millisecond has no meaningfully measurable rate.
+#[must_use]
+pub fn nodes_per_second(nodes: u64, elapsed: Duration) -> u64 {
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed_ms == 0 {
+        return 0;
+    }
+    (u128::from(nodes) * 1000 / elapsed_ms) as u64
+}
+
 /// Default `move_overhead`, in milliseconds -- shared with the `uci`
 /// module's advertised `MoveOverhead` UCI option default, so the two
 /// can never drift apart.
@@ -259,6 +277,18 @@ pub struct TimeManagementTelemetry {
     /// suggests the evaluation has settled; a large swing on the final
     /// depth suggests it might not have.
     pub score_delta_cp: Option<i32>,
+    /// Overall nodes-per-second rate for the whole search: total nodes
+    /// visited across every *completed* depth (an aborted, discarded
+    /// iteration contributes no nodes here, same as it contributes no
+    /// nodes to any `SearchResult`) divided by wall-clock time since
+    /// the search began (`search_start.elapsed()`, not any single
+    /// depth's own duration) -- see `nodes_per_second`. This is the
+    /// measurement `estimate_next_depth_cost`'s pure wall-time growth
+    /// model deliberately doesn't need (see that function's docs), but
+    /// it's exactly what a human or tool watching `bee-tm` lines needs
+    /// to sanity-check the engine's actual throughput on a given
+    /// position/machine.
+    pub avg_nps: u64,
 }
 
 impl TimeManagementTelemetry {
@@ -270,12 +300,13 @@ impl TimeManagementTelemetry {
     #[must_use]
     pub fn to_bee_tm_line(self) -> String {
         let mut line = format!(
-            "v={BEE_TM_VERSION} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={}",
+            "v={BEE_TM_VERSION} soft_ms={} hard_ms={} completed_depth={} aborted_ms={} best_move_changes={} avg_nps={}",
             self.soft_ms,
             self.hard_ms,
             self.completed_depth,
             self.aborted_ms,
             self.best_move_changes,
+            self.avg_nps,
         );
         if let Some(delta) = self.score_delta_cp {
             line.push_str(&format!(" score_delta_cp={delta}"));
@@ -346,11 +377,12 @@ mod tests {
             aborted_ms: 201,
             best_move_changes: 3,
             score_delta_cp: Some(-42),
+            avg_nps: 1_500_000,
         };
 
         assert_eq!(
             telemetry.to_bee_tm_line(),
-            "v=1 soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 score_delta_cp=-42"
+            "v=1 soft_ms=220 hard_ms=660 completed_depth=7 aborted_ms=201 best_move_changes=3 avg_nps=1500000 score_delta_cp=-42"
         );
     }
 
@@ -363,6 +395,7 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 0,
             score_delta_cp: None,
+            avg_nps: 0,
         };
 
         let line = telemetry.to_bee_tm_line();
@@ -386,6 +419,7 @@ mod tests {
             aborted_ms: 0,
             best_move_changes: 1,
             score_delta_cp: Some(12),
+            avg_nps: 850_000,
         };
 
         for token in telemetry.to_bee_tm_line().split(' ') {
@@ -534,6 +568,23 @@ mod tests {
         // 200ms elapsed, estimate 100ms (padded to 115ms) -- 200 + 115
         // = 315ms, past a 300ms hard budget.
         assert!(!next_depth_is_affordable(200, 100, 300));
+    }
+
+    #[test]
+    fn nodes_per_second_divides_nodes_by_elapsed_seconds() {
+        assert_eq!(nodes_per_second(2_000_000, Duration::from_secs(2)), 1_000_000);
+    }
+
+    #[test]
+    fn nodes_per_second_is_zero_for_zero_elapsed_time() {
+        // A search finishing in under a millisecond has no
+        // meaningfully measurable rate -- must not divide by zero.
+        assert_eq!(nodes_per_second(1_000, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn nodes_per_second_handles_sub_second_elapsed_time() {
+        assert_eq!(nodes_per_second(500_000, Duration::from_millis(500)), 1_000_000);
     }
 
     #[test]
