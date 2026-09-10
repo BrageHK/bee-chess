@@ -30,11 +30,11 @@ const PARTICIPANT_KINDS: ParticipantKind[] = ["human", "stockfish", "bee", "bee-
  * "is this bot available" reduces to "is Lab itself reachable" --
  * Lab refuses to start without both Stockfish and Bee (see
  * `checkLabAvailable`'s docs), so a single reachability check on
- * mount covers both. Bee-Mamba has no Lab-side engine yet (#66/#70)
- * and is always shown unavailable, regardless of Lab's own
- * reachability -- picking it still isn't blocked here (the same "warn,
- * don't block" philosophy as before Lab existed), but `Game.tsx`
- * refuses to actually start a game with it.
+ * mount covers all of them. Bee-Mamba is registered optionally on
+ * Lab's side (it needs a built `mamba_mcts_batched_uci` binary + model
+ * most clones won't have), so a missing registration there surfaces as
+ * a spawn error once the game starts rather than as a client-side
+ * unavailable flag here.
  */
 export function GameSetup({
   onStart,
@@ -83,7 +83,6 @@ export function GameSetup({
  * responded -- see the component doc comment above. */
 function isUnavailable(kind: ParticipantKind, labUnavailable: boolean): boolean {
   if (kind === "human") return false;
-  if (kind === "bee-mamba") return true;
   return labUnavailable;
 }
 
@@ -117,10 +116,8 @@ function SlotPicker({
         </Select>
         {unavailable && (
           <p className="m-0 text-xs leading-snug text-warning">
-            {participant.kind === "bee-mamba"
-              ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
-              : "Bee Lab doesn't seem to be running (see lab/README.md)."}{" "}
-            You can still try to start the game.
+            Bee Lab doesn&apos;t seem to be running (see lab/README.md). You can still try to
+            start the game.
           </p>
         )}
         <ParticipantFields participant={participant} onChange={onChange} />
@@ -166,9 +163,9 @@ function ParticipantFields({
           onChange={(e) => onChange({ ...participant, debug: e.target.checked })}
         />
       )}
-      {participant.kind === "bee" && (
+      {(participant.kind === "bee" || participant.kind === "bee-mamba") && (
         <EngineOptionsFields
-          engineName="bee"
+          engineName={participant.kind}
           values={participant.options}
           onChange={(options) => onChange({ ...participant, options })}
         />

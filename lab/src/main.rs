@@ -28,11 +28,14 @@
 //! Run as (from the repo root, after `npm --prefix frontend run build`):
 //!   cargo run -p bee-lab
 //!
-//! Bee-Mamba (the Python/PyTorch engine) is intentionally not served
-//! here -- see #68's "out of scope." It stays on the old Python bridge
-//! for now; its fate (ported here too, or left as a standalone process
-//! this server doesn't know about, pending #66's model-integration
-//! design) is a follow-up decision.
+//! Bee-Mamba-MCTS (`mamba/mamba_mcts_batched_uci`, a standalone
+//! UCI binary with the NN inference native in Rust via `tch`) is
+//! registered as `"bee-mamba"` below, same as Stockfish/Bee -- unlike
+//! the old Python bridge's searchless variant, this one needs no
+//! separate Python process. Optional, not required at startup: most
+//! clones won't have `models/chess_mamba_dynamic.pt` built (see that
+//! crate's README), so it's simply left out of the registry with a
+//! warning rather than refusing to start the whole server.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -83,6 +86,23 @@ async fn main() {
     registry
         .insert("stockfish", stockfish_spec)
         .insert("bee", bee_spec);
+
+    let mamba_uci_dir = root.join("mamba/mamba_mcts_batched_uci");
+    let mamba_run_script = mamba_uci_dir.join("run_uci.sh");
+    if mamba_run_script.exists() {
+        registry.insert(
+            "bee-mamba",
+            EngineSpec {
+                argv: vec![mamba_run_script.to_string_lossy().into_owned()],
+                cwd: mamba_uci_dir,
+            },
+        );
+    } else {
+        eprintln!(
+            "bee-mamba unavailable, skipping (missing {}; see mamba/mamba_mcts_batched_uci/README.md)",
+            mamba_run_script.display()
+        );
+    }
 
     // Finished/aborted games survive a restart (#123) -- see
     // `persistence`'s module docs. Kept alongside the engine binaries

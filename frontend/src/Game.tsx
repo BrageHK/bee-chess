@@ -414,14 +414,15 @@ function logSubscribeFor(
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-/** Bee-Mamba has no Lab-side engine yet (#66/#70) -- returns an
- * explanatory message if `participant` picks it, else `null`. Only
- * relevant for a fresh game: a resumed one's participants already went
- * through this check when it was first created. */
-function badParticipant(participant: Participant): string | null {
-  return participant.kind === "bee-mamba"
-    ? "Bee-Mamba isn't available yet during the Bee Lab migration (see #66/#70)."
-    : null;
+/** Placeholder for a participant-level pre-flight check before
+ * starting a fresh game. Nothing currently disqualifies a participant
+ * client-side -- Lab itself is the authority on whether an engine is
+ * actually available (a missing registry entry surfaces as a spawn
+ * error once the game starts). Only relevant for a fresh game: a
+ * resumed one's participants already went through this check when it
+ * was first created. */
+function badParticipant(_participant: Participant): string | null {
+  return null;
 }
 
 /** Maps a frontend `Participant` (the setup screen's configuration) to
@@ -441,9 +442,7 @@ function toParticipantRequest(participant: Participant): ParticipantRequest | un
     case "bee":
       return { engine: "bee", options: participant.options, debug: participant.debug };
     case "bee-mamba":
-      // Unreachable: badParticipant already redirected to the
-      // unavailable-message screen before createGame is ever called.
-      return undefined;
+      return { engine: "bee-mamba", options: participant.options, debug: false };
   }
 }
 
