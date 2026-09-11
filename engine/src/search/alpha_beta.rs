@@ -1569,8 +1569,7 @@ mod tests {
         // time would claim a threefold-repetition draw. Every other
         // legal move keeps the extra knight and stays winning, so the
         // engine must never choose the repeating move.
-        let mut position =
-            Position::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").expect("valid FEN");
+        let mut position = Position::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").expect("valid FEN");
         let hash_a = position.zobrist_hash();
 
         let na1b3 = position
