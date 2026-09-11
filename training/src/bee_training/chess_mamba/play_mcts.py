@@ -65,7 +65,16 @@ LOW_TIME_THRESHOLD_MS = 1000  # below this, throttle further to avoid flagging
 LOW_TIME_FRACTION = 0.3
 MIN_BUDGET_MS = 50.0
 MIN_SIMULATIONS = 16
-MAX_SIMULATIONS = 100_000  # matches the Simulations UCI option's own declared "max" bound
+# Safety ceiling only -- not meant to bind in practice. Measured nps in real
+# games is ~25-40k/s; the worst case this bot will accept (challenge.max_base
+# 1800s + max_increment 20s, early-game moves_left=39) computes a budget of
+# ~60s, i.e. ~2M sims, and the deepest late-game case (moves_left floor of
+# MIN_MOVES_LEFT with a big remaining clock) can reach ~4-5M. This used to be
+# 100_000, which was far below what real per-move budgets computed to (e.g.
+# ~2.4s of actual search per move in a 3+1 blitz game against a ~6-7s
+# budget) -- the bot was flooring out on this cap instead of spending the
+# time it had.
+MAX_SIMULATIONS = 10_000_000
 
 
 def default_device() -> str:
