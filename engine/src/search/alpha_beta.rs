@@ -669,12 +669,22 @@ fn search_to_depth(
     let mut best_move = moves[0];
     let mut best_score = -SCORE_INF;
     let mut best_pv: Vec<Move> = Vec::new();
+    let mut best_is_draw = false;
+    // Highest-scoring move that does *not* immediately claim a
+    // repetition/fifty-move draw, tracked alongside the overall best so
+    // that a winning alternative is never left on the table just
+    // because a drawing move was searched first and tied it. See the
+    // override below.
+    let mut best_nondraw_move: Option<Move> = None;
+    let mut best_nondraw_score = -SCORE_INF;
+    let mut best_nondraw_pv: Vec<Move> = Vec::new();
     let mut alpha = -SCORE_INF;
     let beta = SCORE_INF;
 
     for mv in moves {
         let undo = position.make_move(mv);
         path.push(position.zobrist_hash());
+        let causes_draw = is_rule_draw(position, path);
         let outcome = negamax(
             position,
             depth - 1,
@@ -691,20 +701,41 @@ fn search_to_depth(
         path.pop();
         position.unmake_move(mv, undo);
 
-        let Some((score, mut child_pv)) = outcome.map(|(s, pv)| (-s, pv)) else {
+        let Some((score, child_pv)) = outcome.map(|(s, pv)| (-s, pv)) else {
             return None; // ran out of time partway through the root move loop
         };
 
         if score > best_score {
             best_score = score;
             best_move = mv;
-            child_pv.insert(0, mv);
-            best_pv = child_pv;
+            let mut pv = child_pv.clone();
+            pv.insert(0, mv);
+            best_pv = pv;
+            best_is_draw = causes_draw;
+        }
+        if !causes_draw && score > best_nondraw_score {
+            best_nondraw_score = score;
+            best_nondraw_move = Some(mv);
+            let mut pv = child_pv;
+            pv.insert(0, mv);
+            best_nondraw_pv = pv;
         }
         alpha = alpha.max(score);
         // No beta cutoff at the root: we need to have actually
         // compared every move to know which one is best, not just
         // that some move is "good enough."
+    }
+
+    // A draw is only as good as a losing or dead-equal line -- never as
+    // good as one we're actually winning. If the move we'd otherwise
+    // play claims a repetition/fifty-move draw, but some other legal
+    // move stays on the board with a positive score, play that instead.
+    if best_is_draw {
+        if let (Some(nondraw_move), true) = (best_nondraw_move, best_nondraw_score > 0) {
+            best_move = nondraw_move;
+            best_score = best_nondraw_score;
+            best_pv = best_nondraw_pv;
+        }
     }
 
     state.root_best = Some(best_move);
@@ -1529,6 +1560,47 @@ mod tests {
         let best_move = result.best_move.expect("should find a move");
         assert_eq!(best_move.from(), "a1".parse().unwrap());
         assert_eq!(best_move.to(), "a5".parse().unwrap());
+    }
+
+    #[test]
+    fn refuses_to_repeat_into_a_draw_when_a_winning_alternative_exists() {
+        // White is up a whole knight (bare kings otherwise) and has
+        // shuffled it a1-b3-a1-b3 twice already; playing Na1-b3 a third
+        // time would claim a threefold-repetition draw. Every other
+        // legal move keeps the extra knight and stays winning, so the
+        // engine must never choose the repeating move.
+        let mut position =
+            Position::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").expect("valid FEN");
+        let hash_a = position.zobrist_hash();
+
+        let na1b3 = position
+            .generate_legal_moves()
+            .into_iter()
+            .find(|mv| mv.from() == "a1".parse().unwrap() && mv.to() == "b3".parse().unwrap())
+            .expect("Na1-b3 should be legal");
+        let undo = position.make_move(na1b3);
+        let hash_b = position.zobrist_hash();
+        position.unmake_move(na1b3, undo);
+
+        // Two arbitrary filler hashes stand in for whatever else
+        // happened earlier in the game, so that only B (not A) has
+        // already recurred twice by the time we reach the current
+        // position -- otherwise A itself would already be a triple
+        // repetition before white even gets to move.
+        let history = vec![0xDEAD_BEEFu64, hash_b, 0xFEED_FACEu64, hash_b, hash_a];
+
+        let result = search_with_history(&mut position, 2, &MaterialEvaluator, &history);
+
+        let best_move = result.best_move.expect("should find a move");
+        assert_ne!(
+            best_move, na1b3,
+            "must not repeat into a draw while a winning alternative exists"
+        );
+        assert!(
+            result.score > 0,
+            "expected a positive (winning) score, got {}",
+            result.score
+        );
     }
 
     #[test]
