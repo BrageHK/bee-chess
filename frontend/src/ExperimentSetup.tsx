@@ -1,7 +1,19 @@
 import { useState } from "react";
-import { createExperiment, type CreateExperimentRequest, type TimeControl } from "./labClient";
-import type { EngineOptions } from "./participant";
+import {
+  createExperiment,
+  type CreateExperimentRequest,
+  type ExperimentVariantRequest,
+  type TimeControl,
+} from "./labClient";
+import {
+  MAX_STOCKFISH_ELO,
+  MIN_STOCKFISH_ELO,
+  PARTICIPANT_LABELS,
+  type EngineOptions,
+  type ParticipantKind,
+} from "./participant";
 import { EngineOptionsFields } from "./EngineOptionsFields";
+import { MambaOptionsFields, DEFAULT_MAMBA_BATCH_SIZE, DEFAULT_MAMBA_SIMULATIONS } from "./MambaOptionsFields";
 import { Button } from "./components/ui/Button";
 import { Field } from "./components/ui/Field";
 import { Input } from "./components/ui/Input";
@@ -14,11 +26,52 @@ const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_MOVE_TIME_MS = 100;
 const DEFAULT_FISCHER_INITIAL_S = 60;
 const DEFAULT_FISCHER_INCREMENT_S = 1;
+const DEFAULT_STOCKFISH_ELO = 1600;
 
-type VariantForm = {
-  label: string;
-  options: EngineOptions;
-};
+/** Any bot an experiment variant can be -- every `ParticipantKind`
+ * except "human": a variant needs an engine to run unattended for
+ * however many paired games are requested, not a person at the board. */
+type ExperimentBotKind = Exclude<ParticipantKind, "human">;
+const EXPERIMENT_BOT_KINDS: ExperimentBotKind[] = ["stockfish", "bee", "bee-mamba"];
+
+type VariantForm = { label: string } & (
+  | { kind: "stockfish"; elo: number }
+  | { kind: "bee"; options: EngineOptions }
+  | { kind: "bee-mamba"; options: EngineOptions }
+);
+
+function defaultVariant(label: string, kind: ExperimentBotKind): VariantForm {
+  switch (kind) {
+    case "stockfish":
+      return { label, kind, elo: DEFAULT_STOCKFISH_ELO };
+    case "bee":
+      return { label, kind, options: {} };
+    case "bee-mamba":
+      return {
+        label,
+        kind,
+        options: { Simulations: DEFAULT_MAMBA_SIMULATIONS, BatchSize: DEFAULT_MAMBA_BATCH_SIZE },
+      };
+  }
+}
+
+/** Same wire-shape mapping `Game.tsx`'s `toParticipantRequest` uses for
+ * a regular game's engine side, just producing an experiment variant
+ * (with a `label`) instead of a game participant. */
+function toVariantRequest(variant: VariantForm): ExperimentVariantRequest {
+  switch (variant.kind) {
+    case "stockfish":
+      return {
+        label: variant.label,
+        engine: "stockfish",
+        options: { UCI_LimitStrength: true, UCI_Elo: variant.elo },
+      };
+    case "bee":
+      return { label: variant.label, engine: "bee", options: variant.options };
+    case "bee-mamba":
+      return { label: variant.label, engine: "bee-mamba", options: variant.options };
+  }
+}
 
 /** Local editable form state for the time-control picker below --
  * kept as plain numbers in whichever unit the field displays (minutes/
@@ -41,16 +94,16 @@ function toTimeControl(form: TimeControlForm): TimeControl {
 }
 
 /**
- * Configure and start a Bee-vs-Bee A/B experiment (see `lab::
- * experiment`'s module docs -- v1 is deliberately Bee-only, not a
- * general engine picker): two labeled variants, each with Bee's own
- * discovered UCI options rendered generically (same
- * `EngineOptionsFields` `GameSetup` uses for its Bee slot), plus how
- * many paired games to run and the shared move-time budget.
+ * Configure and start an A/B experiment between two bots (see `lab::
+ * experiment`'s module docs): two labeled variants, each independently
+ * any non-human `ParticipantKind` (Bee, Bee-Mamba, or Stockfish -- so
+ * "which bot is actually best" is answerable, not just "did this Bee
+ * change help"), plus how many paired games to run and the shared
+ * clock.
  */
 export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: string) => void }) {
-  const [variantA, setVariantA] = useState<VariantForm>({ label: "Baseline", options: {} });
-  const [variantB, setVariantB] = useState<VariantForm>({ label: "Candidate", options: {} });
+  const [variantA, setVariantA] = useState<VariantForm>(() => defaultVariant("Baseline", "bee"));
+  const [variantB, setVariantB] = useState<VariantForm>(() => defaultVariant("Candidate", "bee"));
   const [games, setGames] = useState(DEFAULT_GAMES);
   const [concurrency, setConcurrency] = useState(DEFAULT_CONCURRENCY);
   const [timeControl, setTimeControl] = useState<TimeControlForm>({
@@ -90,8 +143,8 @@ export function ExperimentSetup({ onStarted }: { onStarted: (experimentId: strin
         setStarting(true);
         setError(null);
         const request: CreateExperimentRequest = {
-          variantA: { label: variantA.label, options: variantA.options },
-          variantB: { label: variantB.label, options: variantB.options },
+          variantA: toVariantRequest(variantA),
+          variantB: toVariantRequest(variantB),
           games,
           concurrency,
           timeControl: toTimeControl(timeControl),
@@ -211,11 +264,44 @@ function VariantPanel({
             onChange={(e) => onChange({ ...variant, label: e.target.value })}
           />
         </Field>
-        <EngineOptionsFields
-          engineName="bee"
-          values={variant.options}
-          onChange={(options) => onChange({ ...variant, options })}
-        />
+        <Field label="Bot">
+          <Select
+            value={variant.kind}
+            onChange={(e) =>
+              onChange(defaultVariant(variant.label, e.target.value as ExperimentBotKind))
+            }
+          >
+            {EXPERIMENT_BOT_KINDS.map((kind) => (
+              <option key={kind} value={kind}>
+                {PARTICIPANT_LABELS[kind]}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        {variant.kind === "stockfish" && (
+          <Field label="Elo">
+            <NumberInput
+              value={variant.elo}
+              min={MIN_STOCKFISH_ELO}
+              max={MAX_STOCKFISH_ELO}
+              step={1}
+              onChange={(elo) => onChange({ ...variant, elo })}
+            />
+          </Field>
+        )}
+        {variant.kind === "bee" && (
+          <EngineOptionsFields
+            engineName="bee"
+            values={variant.options}
+            onChange={(options) => onChange({ ...variant, options })}
+          />
+        )}
+        {variant.kind === "bee-mamba" && (
+          <MambaOptionsFields
+            values={variant.options}
+            onChange={(options) => onChange({ ...variant, options })}
+          />
+        )}
       </PanelBody>
     </Panel>
   );

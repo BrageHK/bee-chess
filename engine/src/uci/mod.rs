@@ -18,7 +18,8 @@ use crate::diagnostics::DiagnosticLevel;
 use crate::engine::{Engine, EvaluatorKind, IllegalMoveError, OpeningBookKind};
 use crate::search::TtReuse;
 use crate::search::{
-    mate_in_plies, ClockTimeControl, SearchResult, StopSignal, DEFAULT_MOVE_OVERHEAD_MS,
+    mate_in_plies, nodes_per_second, ClockTimeControl, SearchResult, StopSignal,
+    DEFAULT_MOVE_OVERHEAD_MS,
 };
 
 pub const ENGINE_NAME: &str = "bee-chess";
@@ -329,25 +330,38 @@ fn format_uci_move(mv: Move) -> String {
     }
 }
 
-/// Writes one `info depth <n> score cp <n>|mate <n> nodes <n> time
-/// <ms> pv ...` line for a completed search result. Real UCI `info`
-/// fields, not `info string` -- `info string` is reserved for
+/// Writes one `info depth <n> score cp <n>|mate <n> nodes <n> nps <n>
+/// time <ms> pv ...` line for a completed search result. Real UCI
+/// `info` fields, not `info string` -- `info string` is reserved for
 /// diagnostics (see `crate::diagnostics`), and this is exactly the
 /// structured search telemetry those fields exist for.
+///
+/// `nodes_total` is the cumulative node count across every depth
+/// completed so far *this `go`*, not just `result`'s own depth --
+/// `SearchResult::nodes` resets every iteration (each depth re-
+/// searches from the root), so the caller accumulates it across calls
+/// (see `SearchWorker::spawn`). `nps` is derived from that same total
+/// against `elapsed` (wall-clock since the `go` began, not this
+/// depth's own duration), via `search::nodes_per_second` -- the same
+/// function `TimeManagementTelemetry::avg_nps` uses, so the live `nps`
+/// a GUI displays mid-search and the `bee-tm` line's final average
+/// can never disagree about how the rate is computed.
 fn write_search_info<W: Write>(
     output: &mut W,
     result: &SearchResult,
+    nodes_total: u64,
     elapsed: Duration,
 ) -> std::io::Result<()> {
     let score_field = match mate_in_plies(result.score) {
         Some(plies_to_mate) => format!("mate {plies_to_mate}"),
         None => format!("cp {}", result.score),
     };
+    let nps = nodes_per_second(nodes_total, elapsed);
     write!(
         output,
-        "info depth {} score {score_field} nodes {} time {} lmr_attempts {} lmr_fail_lows {} lmr_researches {} nmp_attempts {} nmp_cutoffs {} delta_attempts {} delta_pruned {} see_attempts {} see_pruned {}",
+        "info depth {} score {score_field} nodes {} nps {nps} time {} lmr_attempts {} lmr_fail_lows {} lmr_researches {} nmp_attempts {} nmp_cutoffs {} delta_attempts {} delta_pruned {} see_attempts {} see_pruned {}",
         result.depth,
-        result.nodes,
+        nodes_total,
         elapsed.as_millis(),
         result.lmr.attempts,
         result.lmr.fail_lows(),
@@ -448,15 +462,24 @@ impl SearchWorker {
         let handle = std::thread::spawn(move || {
             let side_to_move = engine.position().side_to_move();
             let start = Instant::now();
-            let on_depth_complete = {
+            let mut on_depth_complete = {
                 let events = events.clone();
+                // Cumulative nodes across every depth completed so far
+                // this `go` -- `SearchResult::nodes` is only the depth
+                // just completed (each iterative-deepening depth
+                // re-searches from the root), so `write_search_info`'s
+                // `nodes`/`nps` fields need this running total, summed
+                // here rather than in `search::alpha_beta` itself (see
+                // `write_search_info`'s docs).
+                let mut nodes_total = 0u64;
                 move |result: &SearchResult| {
+                    nodes_total += result.nodes;
                     let mut line = Vec::new();
                     // A rendering failure into an in-memory `Vec` is not a
                     // realistic failure mode; silently skipping the info
                     // line rather than panicking the worker is the
                     // worst case if it somehow did happen.
-                    if write_search_info(&mut line, result, start.elapsed()).is_ok() {
+                    if write_search_info(&mut line, result, nodes_total, start.elapsed()).is_ok() {
                         if let Ok(text) = String::from_utf8(line) {
                             let _ = events.send(Event::Search(SearchEvent::Info(
                                 text.trim_end().to_string(),
