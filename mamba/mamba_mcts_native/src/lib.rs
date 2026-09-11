@@ -68,6 +68,10 @@ const VIRTUAL_LOSS: f32 = 1.0;
 // into one, since every other line scores far below this.
 const STALEMATE_BIAS: f32 = 0.1;
 
+// Halfmove-clock value (plies since the last pawn move or capture) at which
+// the fifty-move rule makes a position a claimable draw.
+const FIFTY_MOVE_CLOCK_LIMIT: u32 = 100;
+
 // Must match bee-chess's encode.py / MuZero-rs's chess_mamba_bot.rs exactly.
 const N_PIECE_TYPES: usize = 12;
 const N_AUX: usize = 8;
@@ -190,15 +194,29 @@ fn advance_halfmove_clock(board: &Board, mv: ChessMove, prev: u32) -> u32 {
     }
 }
 
+/// Total occurrences of `hash` so far: however many times it already
+/// appeared in the real game before this search started (`root_counts`,
+/// which includes the root position itself) plus however many times
+/// *this simulated line* has already passed through it (`path_counts`,
+/// rebuilt fresh in every `select_path` call). A tree node's path from
+/// the root is fixed once created, so this total is deterministic per
+/// node -- computing it from these two pieces avoids re-hashing the
+/// entire real game history on every single simulation.
+fn occurrences(root_counts: &HashMap<u64, u32>, path_counts: &HashMap<u64, u32>, hash: u64) -> u32 {
+    root_counts.get(&hash).copied().unwrap_or(0) + path_counts.get(&hash).copied().unwrap_or(0)
+}
+
 fn select_path(
     arena: &mut Vec<Node>,
     root_board: &Board,
     root_clock: u32,
-) -> (Vec<usize>, Board, u32) {
+    root_counts: &HashMap<u64, u32>,
+) -> (Vec<usize>, Board, u32, bool) {
     let mut idx = 0usize;
     let mut board = *root_board;
     let mut clock = root_clock;
     let mut path = vec![0usize];
+    let mut path_counts: HashMap<u64, u32> = HashMap::new();
 
     arena[0].vln += 1;
     arena[0].vlw += VIRTUAL_LOSS;
@@ -217,8 +235,16 @@ fn select_path(
         arena[idx].vln += 1;
         arena[idx].vlw += VIRTUAL_LOSS;
         path.push(idx);
+        *path_counts.entry(board.get_hash()).or_insert(0) += 1;
     }
-    (path, board, clock)
+    // A repetition-draw is only possible for the leaf we stopped on: every
+    // ancestor on this path was already established non-draw the first
+    // time it was reached (see `expand` -- a drawn leaf is never expanded,
+    // so the loop above would never have walked through it as an
+    // intermediate node), and the leaf's own path from root is fixed, so
+    // this total is the same every time this exact tree node is visited.
+    let is_repetition_draw = occurrences(root_counts, &path_counts, board.get_hash()) >= 3;
+    (path, board, clock, is_repetition_draw)
 }
 
 fn unstake_and_backup(arena: &mut [Node], path: &[usize], leaf_value: f32) {
@@ -333,12 +359,35 @@ pub struct SearchStats {
     pub cache_misses: u64,
 }
 
+/// Parses each entry in `history` (any FEN fields beyond the first 4 are
+/// ignored, same as the root FEN below) into its Zobrist hash and tallies
+/// occurrences, seeded with the root position itself -- `history` is the
+/// real game's position sequence *before* the root (oldest first; the
+/// root is not included in it), so this map answers "how many times has
+/// this exact position already happened, counting right now" for any
+/// hash a simulated line might return to.
+fn build_root_counts(root_board: &Board, history: &[String]) -> PyResult<HashMap<u64, u32>> {
+    let mut counts = HashMap::new();
+    *counts.entry(root_board.get_hash()).or_insert(0) += 1;
+    for fen in history {
+        let fields: Vec<&str> = fen.split_whitespace().collect();
+        if fields.len() < 4 {
+            return Err(PyValueError::new_err("malformed FEN in history"));
+        }
+        let board = Board::from_str(&fields[..4].join(" "))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        *counts.entry(board.get_hash()).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
 fn search_impl(
     py: Python<'_>,
     fen: &str,
     evaluate_batch: &PyObject,
     simulations: usize,
     batch_size: usize,
+    history: &[String],
 ) -> PyResult<(Option<String>, SearchStats)> {
     let fields: Vec<&str> = fen.split_whitespace().collect();
     if fields.len() < 4 {
@@ -347,6 +396,7 @@ fn search_impl(
     let root_board = Board::from_str(&fields[..4].join(" "))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let root_clock: u32 = fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let root_counts = build_root_counts(&root_board, history)?;
 
     let mut arena = vec![Node {
         prior: 0.0,
@@ -384,11 +434,14 @@ fn search_impl(
         let mut paths: Vec<Vec<usize>> = Vec::with_capacity(wave);
         let mut boards: Vec<Board> = Vec::with_capacity(wave);
         let mut clocks: Vec<u32> = Vec::with_capacity(wave);
+        let mut repetition_draws: Vec<bool> = Vec::with_capacity(wave);
         for _ in 0..wave {
-            let (path, board, clock) = select_path(&mut arena, &root_board, root_clock);
+            let (path, board, clock, is_repetition_draw) =
+                select_path(&mut arena, &root_board, root_clock, &root_counts);
             paths.push(path);
             boards.push(board);
             clocks.push(clock);
+            repetition_draws.push(is_repetition_draw);
         }
 
         let mut pending_indices = Vec::with_capacity(wave);
@@ -402,6 +455,21 @@ fn search_impl(
                     BoardStatus::Stalemate => STALEMATE_BIAS,
                     BoardStatus::Ongoing => unreachable!(),
                 };
+                continue;
+            }
+            // A threefold repetition or the fifty-move rule ends the game
+            // as a draw regardless of what the NN thinks the position is
+            // worth -- without this, a cached "winning" eval from an
+            // earlier visit to the same position would make the search
+            // blind to the fact that *reaching it again* actually just
+            // ends the game, and it would happily shuffle a won position
+            // into a draw. Scored as a flat 0.0 (not
+            // `STALEMATE_BIAS`): unlike stalemate, this isn't something a
+            // side with no better option settles for -- it's a genuine
+            // rules draw available to *either* side, so it shouldn't get
+            // any softening nudge either way.
+            if repetition_draws[i] || clocks[i] >= FIFTY_MOVE_CLOCK_LIMIT {
+                leaf_values[i] = 0.0;
                 continue;
             }
             match cache.get(&boards[i].get_hash()) {
@@ -451,30 +519,32 @@ fn search_impl(
 }
 
 #[pyfunction]
-#[pyo3(signature = (fen, evaluate_batch, simulations=800, batch_size=16))]
+#[pyo3(signature = (fen, evaluate_batch, simulations=800, batch_size=16, history=vec![]))]
 fn search(
     py: Python<'_>,
     fen: &str,
     evaluate_batch: PyObject,
     simulations: usize,
     batch_size: usize,
+    history: Vec<String>,
 ) -> PyResult<Option<String>> {
-    search_impl(py, fen, &evaluate_batch, simulations, batch_size).map(|(mv, _stats)| mv)
+    search_impl(py, fen, &evaluate_batch, simulations, batch_size, &history).map(|(mv, _stats)| mv)
 }
 
 /// Like `search`, plus an NN-cache hit/miss breakdown (see the module
 /// docstring's point 3) so callers can see how much the transposition
 /// cache is actually buying on a given position/simulation budget.
 #[pyfunction]
-#[pyo3(signature = (fen, evaluate_batch, simulations=800, batch_size=16))]
+#[pyo3(signature = (fen, evaluate_batch, simulations=800, batch_size=16, history=vec![]))]
 fn search_with_stats(
     py: Python<'_>,
     fen: &str,
     evaluate_batch: PyObject,
     simulations: usize,
     batch_size: usize,
+    history: Vec<String>,
 ) -> PyResult<(Option<String>, SearchStats)> {
-    search_impl(py, fen, &evaluate_batch, simulations, batch_size)
+    search_impl(py, fen, &evaluate_batch, simulations, batch_size, &history)
 }
 
 #[pymodule]

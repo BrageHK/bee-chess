@@ -112,11 +112,36 @@ class BatchedEvaluator:
         return policy_flat.to("cpu").numpy(), value_logits.to("cpu").numpy()
 
 
+def _game_history_fens(board: chess.Board) -> list[str]:
+    """Every position the real game has passed through so far, oldest
+    first, *not* including `board`'s own current position -- what the
+    native search needs to tell a genuine threefold-repetition/fifty-move
+    draw apart from a position its NN-eval cache has merely seen before
+    (see `mamba_mcts_native`'s README/`lib.rs` for why that distinction
+    matters: without real game history, the search has no way to know
+    that *replaying* a position ends the game as a draw, and will happily
+    walk a won position into one to keep a cached "winning" eval).
+    lichess-bot always resends the full move list from game start on
+    every `position` command (see lib/engine_wrapper.py), so replaying
+    `board`'s own move stack backwards reconstructs the true history."""
+    replay = board.copy(stack=True)
+    fens = []
+    while replay.move_stack:
+        replay.pop()
+        fens.append(replay.fen())
+    fens.reverse()
+    return fens
+
+
 def choose_move(
     evaluator: BatchedEvaluator, board: chess.Board, simulations: int, batch_size: int
 ) -> chess.Move | None:
     best_uci = mamba_mcts_native.search(
-        board.fen(), evaluator, simulations=simulations, batch_size=batch_size
+        board.fen(),
+        evaluator,
+        simulations=simulations,
+        batch_size=batch_size,
+        history=_game_history_fens(board),
     )
     return chess.Move.from_uci(best_uci) if best_uci else None
 

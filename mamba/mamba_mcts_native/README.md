@@ -49,10 +49,19 @@ interpreter is 3.14.
 import mamba_mcts_native
 
 # evaluate_batch: Callable[[np.ndarray (n, 64, 20)], tuple[np.ndarray (n, 4096), np.ndarray (n, 128)]]
-best_move_uci = mamba_mcts_native.search(fen, evaluate_batch, simulations=800, batch_size=32)
+# history: FENs of every position the real game passed through before `fen`,
+# oldest first (not including `fen` itself) -- optional, but without it the
+# search can't tell a genuine threefold-repetition/fifty-move draw apart from
+# a position its own NN-eval cache has simply seen before, and will happily
+# repeat a won position into a draw. See `lib.rs`'s `build_root_counts`.
+best_move_uci = mamba_mcts_native.search(
+    fen, evaluate_batch, simulations=800, batch_size=32, history=history
+)
 
 # ...or with an NN-eval-cache hit/miss breakdown:
-best_move_uci, stats = mamba_mcts_native.search_with_stats(fen, evaluate_batch, simulations=800, batch_size=32)
+best_move_uci, stats = mamba_mcts_native.search_with_stats(
+    fen, evaluate_batch, simulations=800, batch_size=32, history=history
+)
 print(stats.cache_hits, stats.cache_misses)
 ```
 
