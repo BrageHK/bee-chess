@@ -104,3 +104,9 @@ Bee also supports optional local Syzygy tablebases through `SyzygyPath`
 (empty by default) and `SyzygyProbeLimit` (6 by default, up to 7). See
 [the Syzygy guide](docs/syzygy.md) for WDL/DTZ behavior, diagnostics,
 offline regression tests, and Lab A/B setup.
+
+For offline analysis of downloaded catalog games, use `bee-games analyze`
+with a local Stockfish binary and a fixed node budget. It analyzes both sides,
+persists move/game summaries, and resumes completed runs without recomputation.
+See [the game analysis guide](docs/game-analysis.md) for commands, score
+conventions, phase reports, and the worst Bee moves.

@@ -1,0 +1,43 @@
+name: CI / Catalog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'game-catalog/**'
+      - 'tools/bee-games/**'
+      - 'book-format/**'
+      - 'chess/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-catalog.yml'
+  pull_request:
+    paths:
+      - 'game-catalog/**'
+      - 'tools/bee-games/**'
+      - 'book-format/**'
+      - 'chess/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-catalog.yml'
+
+concurrency:
+  group: ci-catalog-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  catalog:
+    name: Catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy -p bee-game-catalog -p bee-games --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p bee-game-catalog -p bee-games

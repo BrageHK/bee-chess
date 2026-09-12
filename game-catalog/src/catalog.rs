@@ -13,7 +13,7 @@ use crate::game::GameRecord;
 /// lives in `migrations/000N_*.sql` and is listed in `MIGRATIONS` below,
 /// in order -- see `init_schema` for how an existing database at an
 /// older version is brought up to date one file at a time.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Every migration this build knows how to apply, indexed by the schema
 /// version it produces (i.e. `MIGRATIONS[0]` turns version 0 into
@@ -25,6 +25,7 @@ const SCHEMA_VERSION: i64 = 2;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_analysis.sql"),
+    include_str!("../migrations/0003_analyzer.sql"),
 ];
 
 /// A persistent, SQLite-backed catalog of imported games.
@@ -78,9 +79,11 @@ impl GameCatalog {
         // even the first of several new migrations applied" or
         // "silently marked fully upgraded when it isn't."
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+            let tx = self.conn.unchecked_transaction()?;
             self.conn.execute_batch(migration)?;
             self.conn
                 .pragma_update(None, "user_version", (index as i64) + 1)?;
+            tx.commit()?;
         }
 
         Ok(())
@@ -253,14 +256,15 @@ impl GameCatalog {
     pub fn record_analysis_run(&self, run: &crate::analysis::NewAnalysisRun) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO analysis_runs (
-                engine, nodes_per_position, multipv, schema_version, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                engine, nodes_per_position, multipv, schema_version, created_at, configuration
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 run.engine,
                 run.nodes_per_position,
                 run.multipv,
                 run.schema_version,
                 run.created_at,
+                run.configuration,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -280,17 +284,36 @@ impl GameCatalog {
         multipv: Option<i64>,
         schema_version: i64,
     ) -> Result<Option<crate::analysis::AnalysisRun>> {
+        self.latest_analysis_run_with_config(
+            engine,
+            nodes_per_position,
+            multipv,
+            schema_version,
+            None,
+        )
+    }
+
+    /// Finds a run with an exact configuration match, including provenance.
+    pub fn latest_analysis_run_with_config(
+        &self,
+        engine: &str,
+        nodes_per_position: Option<i64>,
+        multipv: Option<i64>,
+        schema_version: i64,
+        configuration: Option<&str>,
+    ) -> Result<Option<crate::analysis::AnalysisRun>> {
         self.conn
             .query_row(
-                "SELECT id, engine, nodes_per_position, multipv, schema_version, created_at
+                "SELECT id, engine, nodes_per_position, multipv, schema_version, created_at, configuration
                  FROM analysis_runs
                  WHERE engine = ?1
                    AND nodes_per_position IS ?2
                    AND multipv IS ?3
                    AND schema_version = ?4
+                   AND configuration IS ?5
                  ORDER BY created_at DESC, id DESC
                  LIMIT 1",
-                params![engine, nodes_per_position, multipv, schema_version],
+                params![engine, nodes_per_position, multipv, schema_version, configuration],
                 row_to_analysis_run,
             )
             .optional()
@@ -302,8 +325,9 @@ impl GameCatalog {
         self.conn.execute(
             "INSERT INTO move_analysis (
                 analysis_run_id, game_id, ply, fen_before, played_move, best_move,
-                eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase,
+                mover_color, is_bee, pv
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 analysis.analysis_run_id,
                 analysis.game_id,
@@ -317,6 +341,9 @@ impl GameCatalog {
                 analysis.mate_before,
                 analysis.mate_after,
                 crate::analysis::phase_to_sql(analysis.phase),
+                analysis.mover_color.map(color_to_sql),
+                analysis.is_bee,
+                analysis.pv,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -331,7 +358,8 @@ impl GameCatalog {
     ) -> Result<Vec<crate::analysis::MoveAnalysisRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, analysis_run_id, game_id, ply, fen_before, played_move, best_move,
-                eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase
+                eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase,
+                mover_color, is_bee, pv
              FROM move_analysis
              WHERE analysis_run_id = ?1 AND game_id = ?2
              ORDER BY ply ASC",
@@ -378,6 +406,75 @@ impl GameCatalog {
             ],
         )?;
         Ok(())
+    }
+
+    /// Atomically replaces every ply and the completion marker. An interruption or
+    /// failed insert leaves the previous state intact; retries cannot duplicate plies.
+    pub fn record_complete_game_analysis(
+        &self,
+        moves: &[crate::analysis::NewMoveAnalysis],
+        summary: &crate::analysis::NewGameAnalysis,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let game = self
+            .game(&summary.game_id)?
+            .ok_or_else(|| Error::InvalidAnalysis(format!("unknown game {}", summary.game_id)))?;
+        if moves.is_empty()
+            || moves.len() != game.plies().len()
+            || moves.iter().enumerate().any(|(ply, m)| {
+                m.ply as usize != ply
+                    || m.game_id != summary.game_id
+                    || m.analysis_run_id != summary.analysis_run_id
+            })
+        {
+            return Err(Error::InvalidAnalysis(
+                "expected every ply in order for one game/run".into(),
+            ));
+        }
+        self.conn.execute(
+            "DELETE FROM move_analysis WHERE analysis_run_id = ?1 AND game_id = ?2",
+            params![summary.analysis_run_id, summary.game_id],
+        )?;
+        for m in moves {
+            self.record_move_analysis(m)?;
+        }
+        self.upsert_game_analysis(summary)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn analysis_run(&self, id: i64) -> Result<Option<crate::analysis::AnalysisRun>> {
+        self.conn.query_row(
+            "SELECT id, engine, nodes_per_position, multipv, schema_version, created_at, configuration
+             FROM analysis_runs WHERE id = ?1", [id], row_to_analysis_run,
+        ).optional().map_err(Error::from)
+    }
+
+    /// Complete-game moves only, optionally restricted to Bee and/or a phase.
+    /// Ordering is stable even for ties, for repeatable worst-move reports.
+    pub fn analyzed_moves(
+        &self,
+        run_id: i64,
+        bee_only: bool,
+        phase: Option<crate::analysis::GamePhase>,
+    ) -> Result<Vec<crate::analysis::MoveAnalysisRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.analysis_run_id, m.game_id, m.ply, m.fen_before,
+                m.played_move, m.best_move, m.eval_before_cp, m.eval_after_cp,
+                m.centipawn_loss, m.mate_before, m.mate_after, m.phase,
+                m.mover_color, m.is_bee, m.pv
+             FROM move_analysis m JOIN game_analysis g
+                ON g.analysis_run_id = m.analysis_run_id AND g.game_id = m.game_id
+             WHERE m.analysis_run_id = ?1 AND (?2 = 0 OR m.is_bee = 1)
+                AND (?3 IS NULL OR m.phase = ?3)
+             ORDER BY m.centipawn_loss DESC, m.game_id, m.ply",
+        )?;
+        let rows = stmt.query_map(
+            params![run_id, bee_only, phase.map(crate::analysis::phase_to_sql)],
+            row_to_move_analysis,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
     }
 
     /// `game_id`'s rollup under `analysis_run_id`, if it's been analyzed.
@@ -467,6 +564,7 @@ fn row_to_analysis_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::analy
         multipv: row.get(3)?,
         schema_version: row.get(4)?,
         created_at: row.get(5)?,
+        configuration: row.get(6)?,
     })
 }
 
@@ -495,6 +593,20 @@ fn row_to_move_analysis(
         mate_before: row.get(10)?,
         mate_after: row.get(11)?,
         phase,
+        mover_color: row
+            .get::<_, Option<String>>(13)?
+            .map(|s| {
+                color_from_sql(&s).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        format!("unrecognized color: {s}").into(),
+                    )
+                })
+            })
+            .transpose()?,
+        is_bee: row.get(14)?,
+        pv: row.get(15)?,
     })
 }
 
@@ -752,6 +864,7 @@ mod tests {
             multipv: Some(1),
             schema_version: 1,
             created_at: 0,
+            configuration: None,
         };
         assert!(catalog.record_analysis_run(&run).is_ok());
 
@@ -784,6 +897,7 @@ mod tests {
             multipv: Some(1),
             schema_version: 1,
             created_at: 1_700_000_000_000,
+            configuration: None,
         }
     }
 
@@ -855,6 +969,9 @@ mod tests {
             mate_before: None,
             mate_after: None,
             phase: crate::analysis::GamePhase::Opening,
+            mover_color: None,
+            is_bee: None,
+            pv: None,
         }
     }
 
@@ -1003,5 +1120,106 @@ mod tests {
                 .unwrap(),
             vec!["g1".to_string()]
         );
+    }
+
+    #[test]
+    fn complete_game_replaces_partial_rows_and_rolls_back_failed_inserts() {
+        let catalog = GameCatalog::open_in_memory().unwrap();
+        catalog.upsert_game(&sample_game("g1")).unwrap();
+        let run_id = catalog.record_analysis_run(&sample_run()).unwrap();
+        let moves: Vec<_> = (0..3)
+            .map(|ply| sample_move_analysis(run_id, "g1", ply))
+            .collect();
+        let summary = sample_game_analysis(run_id, "g1");
+        catalog.record_move_analysis(&moves[0]).unwrap();
+        catalog.record_move_analysis(&moves[0]).unwrap(); // Legacy partial duplicate.
+        catalog
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_analysis BEFORE INSERT ON move_analysis
+             WHEN NEW.ply = 1 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        assert!(catalog
+            .record_complete_game_analysis(&moves, &summary)
+            .is_err());
+        assert_eq!(catalog.move_analyses(run_id, "g1").unwrap().len(), 2);
+        assert!(catalog.game_analysis(run_id, "g1").unwrap().is_none());
+        catalog
+            .conn
+            .execute_batch("DROP TRIGGER fail_analysis")
+            .unwrap();
+        catalog
+            .record_complete_game_analysis(&moves, &summary)
+            .unwrap();
+        assert_eq!(catalog.move_analyses(run_id, "g1").unwrap().len(), 3);
+        assert!(catalog.game_analysis(run_id, "g1").unwrap().is_some());
+        assert!(catalog
+            .record_complete_game_analysis(&moves[..2], &summary)
+            .is_err());
+        assert_eq!(catalog.move_analyses(run_id, "g1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn changed_game_invalidates_analysis_but_identical_import_keeps_it() {
+        let catalog = GameCatalog::open_in_memory().unwrap();
+        let mut game = sample_game("g1");
+        catalog.upsert_game(&game).unwrap();
+        let run_id = catalog.record_analysis_run(&sample_run()).unwrap();
+        catalog
+            .record_move_analysis(&sample_move_analysis(run_id, "g1", 0))
+            .unwrap();
+        catalog
+            .upsert_game_analysis(&sample_game_analysis(run_id, "g1"))
+            .unwrap();
+        game.imported_at += 1;
+        catalog.upsert_game(&game).unwrap();
+        assert!(catalog.game_analysis(run_id, "g1").unwrap().is_some());
+        game.moves = Some("d4 d5".into());
+        catalog.upsert_game(&game).unwrap();
+        assert!(catalog.game_analysis(run_id, "g1").unwrap().is_none());
+        assert!(catalog.move_analyses(run_id, "g1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn v2_analysis_survives_migration_and_configuration_matches_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO games (id, source, imported_at) VALUES ('g1', 'test', 0);
+             INSERT INTO analysis_runs (engine, schema_version, created_at) VALUES ('SF', 1, 0);
+             INSERT INTO move_analysis (analysis_run_id, game_id, ply, fen_before, played_move, phase)
+                 VALUES (1, 'g1', 0, 'fen', 'e2e4', 'opening');"
+        ).unwrap();
+        let catalog = GameCatalog::from_connection(conn).unwrap();
+        assert!(catalog
+            .analysis_run(1)
+            .unwrap()
+            .unwrap()
+            .configuration
+            .is_none());
+        let old = catalog.move_analyses(1, "g1").unwrap();
+        assert_eq!(old[0].played_move, "e2e4");
+        assert_eq!((old[0].is_bee, &old[0].pv), (None, &None));
+        let mut run = sample_run();
+        run.configuration = Some("binary-a,players=bee".into());
+        let id = catalog.record_analysis_run(&run).unwrap();
+        let lookup = |config| {
+            catalog
+                .latest_analysis_run_with_config(
+                    &run.engine,
+                    run.nodes_per_position,
+                    run.multipv,
+                    run.schema_version,
+                    config,
+                )
+                .unwrap()
+        };
+        assert_eq!(lookup(run.configuration.as_deref()).unwrap().id, id);
+        assert!(lookup(Some("binary-b,players=bee")).is_none());
+        assert!(lookup(Some("binary-a,players=opponent")).is_none());
+        assert!(lookup(None).is_none());
     }
 }

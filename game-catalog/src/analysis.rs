@@ -3,14 +3,8 @@
 //! This module only defines the data model -- what an analysis run,
 //! move analysis, and game analysis rollup look like, and (via
 //! `GameCatalog`'s methods in `catalog.rs`) how they're stored and
-//! queried. It deliberately runs no analysis itself: nothing here knows
-//! what Stockfish is, how to talk UCI to it, or how to pick a "best
-//! move" for a position. That's a separate, later piece (an analyzer
-//! that reads unanalyzed games via `GameCatalog::games`, evaluates them
-//! somehow, and calls `GameCatalog::record_move_analysis`/
-//! `record_game_analysis` with the results) -- this module is the
-//! storage contract that analyzer will write into and a future Lab API/
-//! problem-miner will read back out of.
+//! queried. [`crate::analyzer`] handles Stockfish and writes this
+//! contract; a future Lab API/problem miner can read it back out.
 //!
 //! # Shape
 //!
@@ -20,7 +14,7 @@
 //! configurations (a different engine, node budget, or schema version)
 //! never get silently mixed together, and re-analyzing under the same
 //! configuration is meant to add to the same run rather than needing a
-//! fresh one every time (see `GameCatalog::latest_analysis_run`, which
+//! fresh one every time (see `GameCatalog::latest_analysis_run_with_config`, which
 //! is what an incremental analyzer uses to find "the run to keep
 //! appending to" instead of always starting a new one).
 
@@ -42,11 +36,10 @@ pub struct MoveAnalysisRecord {
     /// queried/inspected directly (SQL, a future Lab UI) favors a
     /// human-readable move notation over a compact binary one.
     pub played_move: String,
-    /// The analyzer's suggested move, if it found one (a completely
-    /// lost/mate-in-progress position might have no meaningful "best"
-    /// move to suggest, or the analyzer might simply not have recorded
-    /// one).
+    /// The analyzer's suggested move. The offline analyzer always supplies
+    /// one before a played move, including losing positions.
     pub best_move: Option<String>,
+    /// Both CP scores use the mover's perspective in the offline analyzer.
     pub eval_before_cp: Option<i32>,
     pub eval_after_cp: Option<i32>,
     /// How much `played_move` lost relative to the analyzer's own best
@@ -55,12 +48,17 @@ pub struct MoveAnalysisRecord {
     /// for computing this consistently since it depends on how it
     /// reports/negates scores across the move boundary).
     pub centipawn_loss: Option<i32>,
-    /// Plies to mate before `played_move`, if the position was already
-    /// a forced mate (sign convention is the analyzer's to define and
-    /// apply consistently -- this module only stores what it's given).
+    /// Signed plies to mate, positive when the mover wins (offline analysis
+    /// version 2). NULL for non-mate scores. Each distance is measured from
+    /// its respective position; `mate_after = 0` means delivered checkmate.
     pub mate_before: Option<i32>,
     pub mate_after: Option<i32>,
     pub phase: GamePhase,
+    /// NULL for records predating the offline analyzer.
+    pub mover_color: Option<crate::Color>,
+    pub is_bee: Option<bool>,
+    /// Space-separated UCI moves from the search before the played move.
+    pub pv: Option<String>,
 }
 
 /// A [`MoveAnalysisRecord`] not yet written -- everything a caller
@@ -79,6 +77,9 @@ pub struct NewMoveAnalysis {
     pub mate_before: Option<i32>,
     pub mate_after: Option<i32>,
     pub phase: GamePhase,
+    pub mover_color: Option<crate::Color>,
+    pub is_bee: Option<bool>,
+    pub pv: Option<String>,
 }
 
 /// Which phase of the game a position falls into. Deliberately just
@@ -120,9 +121,7 @@ pub struct GameAnalysisRecord {
     pub analysis_run_id: i64,
     pub game_id: String,
     /// Which color Bee played in this game -- a game analysis rollup
-    /// only makes sense from one side's perspective (see this module's
-    /// docs on why per-move records don't need this: they're already
-    /// scoped to whichever side actually played `played_move`).
+    /// represents one side. Per-move records separately identify the mover.
     pub bee_color: crate::filter::Color,
     pub avg_centipawn_loss: Option<f64>,
     pub worst_move_cp_loss: Option<i32>,
@@ -162,6 +161,8 @@ pub struct AnalysisRun {
     pub multipv: Option<i64>,
     pub schema_version: i64,
     pub created_at: i64,
+    /// Canonical analyzer configuration, including engine digest and Bee identities.
+    pub configuration: Option<String>,
 }
 
 /// An [`AnalysisRun`] not yet recorded.
@@ -188,6 +189,7 @@ pub struct NewAnalysisRun {
     /// Unix milliseconds, matching every other timestamp in this crate
     /// (see `GameRecord::played_at`/`imported_at`).
     pub created_at: i64,
+    pub configuration: Option<String>,
 }
 
 pub(crate) fn phase_to_sql(phase: GamePhase) -> &'static str {
