@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'game-catalog/**'
+      - 'regressions/**'
       - 'tools/bee-games/**'
       - 'book-format/**'
       - 'chess/**'
@@ -14,6 +15,7 @@ on:
   pull_request:
     paths:
       - 'game-catalog/**'
+      - 'regressions/**'
       - 'tools/bee-games/**'
       - 'book-format/**'
       - 'chess/**'

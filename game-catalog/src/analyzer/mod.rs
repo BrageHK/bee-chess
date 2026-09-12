@@ -3,6 +3,8 @@
 //! See `docs/game-analysis.md` for the versioned score/phase conventions and CLI.
 
 #[cfg(test)]
+mod regressions;
+#[cfg(test)]
 mod tests;
 mod uci;
 
@@ -19,7 +21,7 @@ use crate::{book::san, Color, GameCatalog, GameFilter, GameRecord};
 use uci::{Score, Stockfish};
 
 /// Version of the analysis semantics, independent of the SQLite schema.
-pub const ANALYSIS_VERSION: i64 = 2;
+pub const ANALYSIS_VERSION: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnalysisError {
@@ -96,6 +98,8 @@ pub fn analyze(
         "chess960": false, "syzygy_probe_limit": 0, "nodestime": 0,
         "history": "startpos-with-all-moves", "reset": "ucinewgame-per-position",
         "score_selection": "last-exact-primary-pv",
+        "move_loss": "same-root-searchmoves", "best_move_loss": "zero",
+        "after_score": "independent-graph-only",
         "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
     .to_string();
@@ -164,6 +168,7 @@ trait SearchEngine {
         history: &[String],
         position: &Position,
         nodes: u64,
+        root_move: Option<&str>,
     ) -> Result<Search, AnalysisError>;
 }
 
@@ -228,24 +233,42 @@ fn analyze_with_engine(
                 continue;
             }
         };
-        // N+1 position searches supply both evaluations for all N plies. The
-        // next position's score is negated across the move boundary exactly once.
-        let mut before = engine.search(&[], &replay.positions[0], config.nodes_per_position)?;
+        // Unrestricted searches are shared across adjacent plies for the graph.
+        // Regret compares two scores at the SAME root, never the graph delta.
+        let mut before =
+            engine.search(&[], &replay.positions[0], config.nodes_per_position, None)?;
         report.searches += 1;
         let mut moves = Vec::with_capacity(replay.moves.len());
         for (ply, played) in replay.moves.iter().enumerate() {
+            let position = &replay.positions[ply];
+            let is_best = before.best_move.as_deref() == Some(played.as_str());
+            let played_search = if is_best {
+                before.clone()
+            } else {
+                report.searches += 1;
+                engine.search(
+                    &replay.moves[..ply],
+                    position,
+                    config.nodes_per_position,
+                    Some(played),
+                )?
+            };
             let after = engine.search(
                 &replay.moves[..=ply],
                 &replay.positions[ply + 1],
                 config.nodes_per_position,
+                None,
             )?;
             report.searches += 1;
-            let position = &replay.positions[ply];
             let color = catalog_color(position.side_to_move());
             let after_score = after.score.negated();
-            let loss = match (before.score.cp(), after_score.cp()) {
-                (Some(b), Some(a)) => Some(b.saturating_sub(a).max(0)),
-                _ => None,
+            let loss = if is_best {
+                Some(0)
+            } else {
+                match (before.score.cp(), played_search.score.cp()) {
+                    (Some(b), Some(a)) => Some(b.saturating_sub(a).max(0)),
+                    _ => None,
+                }
             };
             moves.push(NewMoveAnalysis {
                 analysis_run_id: run_id,
@@ -256,6 +279,9 @@ fn analyze_with_engine(
                 best_move: before.best_move.clone(),
                 eval_before_cp: before.score.cp(),
                 eval_after_cp: after_score.cp(),
+                eval_played_cp: played_search.score.cp(),
+                mate_played: played_search.score.mate(),
+                played_pv: Some(played_search.pv.join(" ")),
                 centipawn_loss: loss,
                 mate_before: before.score.mate(),
                 mate_after: after_score.mate(),
@@ -378,6 +404,7 @@ impl LossStats {
         self.moves += 1;
         if mate_before.is_some() || mate_after.is_some() {
             self.mate_moves += 1;
+            return;
         }
         if let Some(cp) = cp_loss {
             self.cp_moves += 1;
@@ -413,13 +440,13 @@ fn game_summary(
         LossStats::default(),
     ];
     for m in moves.iter().filter(|m| m.is_bee == Some(true)) {
-        all.add(m.centipawn_loss, m.mate_before, m.mate_after);
+        all.add(m.centipawn_loss, m.mate_before, m.mate_played);
         let phase = match m.phase {
             GamePhase::Opening => 0,
             GamePhase::Middlegame => 1,
             GamePhase::Endgame => 2,
         };
-        phases[phase].add(m.centipawn_loss, m.mate_before, m.mate_after);
+        phases[phase].add(m.centipawn_loss, m.mate_before, m.mate_played);
     }
     NewGameAnalysis {
         analysis_run_id: run_id,

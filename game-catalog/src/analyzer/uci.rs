@@ -149,7 +149,18 @@ impl SearchEngine for Stockfish {
         history: &[String],
         position: &Position,
         nodes: u64,
+        root_move: Option<&str>,
     ) -> Result<Search, AnalysisError> {
+        if root_move.is_some_and(|root| {
+            !position
+                .generate_legal_moves()
+                .iter()
+                .any(|m| move_uci(*m) == root)
+        }) {
+            return Err(AnalysisError::Engine(
+                "illegal searchmoves restriction".into(),
+            ));
+        }
         // Resets hash and search heuristics, so prior games and resume order
         // cannot change the analysis. Keep the full history for repetition.
         self.send("ucinewgame")?;
@@ -160,7 +171,10 @@ impl SearchEngine for Stockfish {
             format!("position startpos moves {}", history.join(" "))
         };
         self.send(&command)?;
-        self.send(&format!("go nodes {nodes}"))?;
+        let restriction = root_move
+            .map(|m| format!(" searchmoves {m}"))
+            .unwrap_or_default();
+        self.send(&format!("go nodes {nodes}{restriction}"))?;
         let deadline = Instant::now() + self.timeout;
         let mut latest = None;
         loop {
@@ -191,6 +205,13 @@ impl SearchEngine for Stockfish {
                         "invalid bestmove/PV after {} plies: reported={reported_best:?}, score={score:?}, pv={pv:?}, FEN={}",
                         history.len(), position.to_fen()
                     )));
+                }
+                if root_move.is_some_and(|root| {
+                    best.as_deref() != Some(root) || reported_best.as_deref() != Some(root)
+                }) {
+                    return Err(AnalysisError::Engine(
+                        "Stockfish ignored searchmoves restriction".into(),
+                    ));
                 }
                 // Never persist a corrupt or truncated UCI PV as trustworthy data.
                 let mut cursor = position.clone();
@@ -310,7 +331,8 @@ while IFS= read -r line; do
       done
       echo uciok ;;
     isready) echo readyok ;;
-    'go nodes 100000') {on_go} ;;
+    position*) position="$line" ;;
+    'go nodes 100000'*) {on_go} ;;
   esac
 done
 "#
@@ -326,10 +348,40 @@ done
     #[cfg(unix)]
     fn node_cutoff_keeps_the_last_exact_score_and_its_own_pv_together() {
         let mut process = fake_process("echo 'info depth 11 score cp -85 pv e2e4 e7e5'; echo 'info depth 12 score cp -92 lowerbound pv d2d4'; echo 'bestmove d2d4'");
-        let result = process.search(&[], &Position::startpos(), 100_000).unwrap();
+        let result = process
+            .search(&[], &Position::startpos(), 100_000, None)
+            .unwrap();
         assert_eq!(result.score, Score::Cp(-85));
         assert_eq!(result.best_move.as_deref(), Some("e2e4"));
         assert_eq!(result.pv, ["e2e4", "e7e5"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restricted_search_sends_same_history_and_rejects_ignored_restrictions() {
+        let mut position = Position::startpos();
+        let mv = position
+            .generate_legal_moves()
+            .into_iter()
+            .find(|m| move_uci(*m) == "e2e4")
+            .unwrap();
+        position.make_move(mv);
+        let on_go = r#"if [ "$line" = 'go nodes 100000 searchmoves g8f6' ] && [ "$position" = 'position startpos moves e2e4' ]; then
+          echo 'info score cp -123 pv g8f6 e4e5'; echo 'bestmove g8f6'
+        else echo 'bestmove (none)'; fi"#;
+        let mut process = fake_process(on_go);
+        let search = process
+            .search(&["e2e4".into()], &position, 100_000, Some("g8f6"))
+            .unwrap();
+        assert_eq!(search.score, Score::Cp(-123));
+        assert_eq!(search.best_move.as_deref(), Some("g8f6"));
+        let mut process = fake_process("echo 'info score cp 10 pv e7e5'; echo 'bestmove e7e5'");
+        assert!(process
+            .search(&["e2e4".into()], &position, 100_000, Some("g8f6"))
+            .is_err());
+        assert!(process
+            .search(&[], &Position::startpos(), 100_000, Some("e2e5"))
+            .is_err());
     }
 
     #[test]
@@ -343,7 +395,9 @@ done
         ] {
             let mut process = fake_process(on_go);
             assert!(
-                process.search(&[], &Position::startpos(), 100_000).is_err(),
+                process
+                    .search(&[], &Position::startpos(), 100_000, None)
+                    .is_err(),
                 "{on_go}"
             );
         }
@@ -354,6 +408,8 @@ done
     fn missing_bestmove_times_out_even_when_info_was_received() {
         let mut process = fake_process("echo 'info score cp 0 pv e2e4'");
         process.timeout = Duration::from_millis(50);
-        assert!(process.search(&[], &Position::startpos(), 100_000).is_err());
+        assert!(process
+            .search(&[], &Position::startpos(), 100_000, None)
+            .is_err());
     }
 }

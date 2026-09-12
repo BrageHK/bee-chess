@@ -57,6 +57,8 @@ struct ReportQuery {
     phase: Option<GamePhase>,
     #[serde(default)]
     losses_only: bool,
+    #[serde(default)]
+    unique_games: bool,
     over_cp: Option<u32>,
     #[serde(default)]
     offset: usize,
@@ -82,6 +84,7 @@ async fn report(
             &ReportFilter {
                 phase: query.phase,
                 losses_only: query.losses_only,
+                unique_games: query.unique_games,
                 over_cp: query.over_cp,
                 offset: query.offset,
                 limit,
@@ -161,7 +164,7 @@ mod tests {
         assert_eq!(body[0]["nodes_per_position"], 100_000);
         let (status, body) = request(
             app.clone(),
-            "/api/analysis/runs/1?phase=middlegame&over_cp=200&losses_only=true",
+            "/api/analysis/runs/1?phase=middlegame&over_cp=200&losses_only=true&unique_games=true",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -172,6 +175,7 @@ mod tests {
             "/api/analysis/runs/1?limit=201",
             "/api/analysis/runs/1?phase=invalid",
             "/api/analysis/runs/1?over_cp=-1",
+            "/api/analysis/runs/1?unique_games=invalid",
         ] {
             assert_eq!(
                 request(app.clone(), url).await.0,

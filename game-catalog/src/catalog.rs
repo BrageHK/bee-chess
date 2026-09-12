@@ -13,7 +13,7 @@ use crate::game::GameRecord;
 /// lives in `migrations/000N_*.sql` and is listed in `MIGRATIONS` below,
 /// in order -- see `init_schema` for how an existing database at an
 /// older version is brought up to date one file at a time.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Every migration this build knows how to apply, indexed by the schema
 /// version it produces (i.e. `MIGRATIONS[0]` turns version 0 into
@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_analysis.sql"),
     include_str!("../migrations/0003_analyzer.sql"),
+    include_str!("../migrations/0004_same_root.sql"),
 ];
 
 /// A persistent, SQLite-backed catalog of imported games.
@@ -340,8 +341,8 @@ impl GameCatalog {
             "INSERT INTO move_analysis (
                 analysis_run_id, game_id, ply, fen_before, played_move, best_move,
                 eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase,
-                mover_color, is_bee, pv
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                mover_color, is_bee, pv, eval_played_cp, mate_played, played_pv
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 analysis.analysis_run_id,
                 analysis.game_id,
@@ -358,6 +359,9 @@ impl GameCatalog {
                 analysis.mover_color.map(color_to_sql),
                 analysis.is_bee,
                 analysis.pv,
+                analysis.eval_played_cp,
+                analysis.mate_played,
+                analysis.played_pv,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -373,7 +377,7 @@ impl GameCatalog {
         let mut stmt = self.conn.prepare(
             "SELECT id, analysis_run_id, game_id, ply, fen_before, played_move, best_move,
                 eval_before_cp, eval_after_cp, centipawn_loss, mate_before, mate_after, phase,
-                mover_color, is_bee, pv
+                mover_color, is_bee, pv, eval_played_cp, mate_played, played_pv
              FROM move_analysis
              WHERE analysis_run_id = ?1 AND game_id = ?2
              ORDER BY ply ASC",
@@ -486,7 +490,7 @@ impl GameCatalog {
             "SELECT m.id, m.analysis_run_id, m.game_id, m.ply, m.fen_before,
                 m.played_move, m.best_move, m.eval_before_cp, m.eval_after_cp,
                 m.centipawn_loss, m.mate_before, m.mate_after, m.phase,
-                m.mover_color, m.is_bee, m.pv
+                m.mover_color, m.is_bee, m.pv, m.eval_played_cp, m.mate_played, m.played_pv
              FROM move_analysis m JOIN game_analysis g
                 ON g.analysis_run_id = m.analysis_run_id AND g.game_id = m.game_id
              WHERE m.analysis_run_id = ?1 AND (?2 = 0 OR m.is_bee = 1)
@@ -631,6 +635,9 @@ fn row_to_move_analysis(
             .transpose()?,
         is_bee: row.get(14)?,
         pv: row.get(15)?,
+        eval_played_cp: row.get(16)?,
+        mate_played: row.get(17)?,
+        played_pv: row.get(18)?,
     })
 }
 
@@ -989,6 +996,9 @@ mod tests {
             best_move: Some("e2e4".to_string()),
             eval_before_cp: Some(20),
             eval_after_cp: Some(-15),
+            eval_played_cp: Some(-15),
+            mate_played: None,
+            played_pv: Some("g2g4 d7d5".into()),
             centipawn_loss: Some(35),
             mate_before: None,
             mate_after: None,
@@ -1020,6 +1030,8 @@ mod tests {
         assert_eq!(analyses[0].played_move, "g2g4");
         assert_eq!(analyses[0].best_move.as_deref(), Some("e2e4"));
         assert_eq!(analyses[0].centipawn_loss, Some(35));
+        assert_eq!(analyses[0].eval_played_cp, Some(-15));
+        assert_eq!(analyses[0].played_pv.as_deref(), Some("g2g4 d7d5"));
         assert_eq!(analyses[0].phase, crate::analysis::GamePhase::Opening);
     }
 
@@ -1226,6 +1238,10 @@ mod tests {
             .is_none());
         let old = catalog.move_analyses(1, "g1").unwrap();
         assert_eq!(old[0].played_move, "e2e4");
+        assert_eq!(
+            (old[0].eval_played_cp, old[0].mate_played, &old[0].played_pv),
+            (None, None, &None)
+        );
         assert_eq!((old[0].is_bee, &old[0].pv), (None, &None));
         let mut run = sample_run();
         run.configuration = Some("binary-a,players=bee".into());

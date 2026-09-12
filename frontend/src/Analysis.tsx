@@ -20,11 +20,12 @@ export function Analysis({ runId, moveId, onNavigate }: {
   const [listError, setListError] = useState<string | null>(null);
   const [phase, setPhase] = useState<GamePhase | "">("");
   const [over, setOver] = useState("");
+  const [uniqueGames, setUniqueGames] = useState(false);
   const [lossesOnly, setLossesOnly] = useState(false);
   const [offset, setOffset] = useState(0);
   const [refresh, setRefresh] = useState(0);
   const selectedRun = runId ?? runs?.[0]?.id ?? null;
-  const reportKey = JSON.stringify([selectedRun, phase, over, lossesOnly, offset, refresh]);
+  const reportKey = JSON.stringify([selectedRun, phase, over, lossesOnly, uniqueGames, offset, refresh]);
   const reviewKey = JSON.stringify([selectedRun, moveId, refresh]);
   const report = reportResult?.value?.run.id === selectedRun ? reportResult.value : null;
   const loading = reportResult?.key !== reportKey;
@@ -45,13 +46,13 @@ export function Analysis({ runId, moveId, onNavigate }: {
     let cancelled = false;
     if (selectedRun !== null) {
       getAnalysisReport(selectedRun, { phase: phase || undefined, over_cp: over ? Number(over) : undefined,
-        losses_only: lossesOnly, offset, limit: PAGE_SIZE }).then(
+        losses_only: lossesOnly, unique_games: uniqueGames, offset, limit: PAGE_SIZE }).then(
         (value) => { if (!cancelled) setReportResult({ key: reportKey, value, error: null }); },
         (e: unknown) => { if (!cancelled) setReportResult({ key: reportKey, value: null, error: String(e) }); },
       );
     }
     return () => { cancelled = true; };
-  }, [selectedRun, phase, over, lossesOnly, offset, refresh, reportKey]);
+  }, [selectedRun, phase, over, lossesOnly, uniqueGames, offset, refresh, reportKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,7 +87,7 @@ export function Analysis({ runId, moveId, onNavigate }: {
         <label className="grid min-w-0 max-w-xl grid-cols-1 gap-1 text-sm">Analysis run
           <Select aria-label="Analysis run" value={selectedRun ?? ""} onChange={(e) => { setOffset(0); onNavigate(Number(e.target.value), null); }}>
             {runId !== null && !runs.some((r) => r.id === runId) && <option value={runId}>Run {runId} (unavailable)</option>}
-            {runs.map((run) => <option key={run.id} value={run.id}>Run {run.id} · {run.engine} · {run.nodes_per_position?.toLocaleString() ?? "unspecified"} nodes · {new Date(run.created_at).toLocaleDateString()}</option>)}
+            {runs.map((run) => <option key={run.id} value={run.id}>Run {run.id} · method {run.schema_version} · {run.engine} · {run.nodes_per_position?.toLocaleString() ?? "unspecified"} nodes · {new Date(run.created_at).toLocaleDateString()}</option>)}
           </Select>
         </label>
       )}
@@ -108,11 +109,12 @@ export function Analysis({ runId, moveId, onNavigate }: {
           </div>
           {worstPhase && <p className="m-0 text-sm">Highest average loss: <strong className="capitalize">{worstPhase.phase}</strong> ({average(worstPhase.avg_cpl)}cp).</p>}
           <dl className="grid grid-cols-3 gap-4" aria-label="Large mistakes">
-            <Metric name=">100cp mistakes" value={String(report.summary.over_100)} />
-            <Metric name=">200cp mistakes" value={String(report.summary.over_200)} />
-            <Metric name=">400cp blunders" value={String(report.summary.over_400)} />
+            <Metric name=">100cp mistakes" value={String(report.summary.over_100)} detail={gameCount(report.summary.games_over_100)} />
+            <Metric name=">200cp mistakes" value={String(report.summary.over_200)} detail={gameCount(report.summary.games_over_200)} />
+            <Metric name=">400cp blunders" value={String(report.summary.over_400)} detail={gameCount(report.summary.games_over_400)} />
           </dl>
           <p className="m-0 text-xs text-muted">Averages use {report.summary.cp_moves.toLocaleString()} moves with centipawn scores. Mate transitions are excluded. Counts are cumulative and thresholds are strict.</p>
+          <p className="m-0 text-xs text-muted">{report.run.schema_version >= 3 ? "Move regret compares best and played scores at the same root. Post-move graph evaluations do not affect CPL." : "Legacy analysis: CPL uses independent before/after searches. Select a method 3 run for same-root move regret."}</p>
           {report.summary.score_disagreements > 0 && <p className="m-0 text-xs text-warning">{report.summary.score_disagreements} scored moves match Stockfish’s best move but have a positive score drop between searches. Raw totals include these disagreements; inspect them before classifying errors.</p>}
           {report.summary.games_analyzed === 0 && <p className="m-0 text-sm text-muted">No completed games in this run yet. Refresh after offline analysis completes a game.</p>}
           <details className="text-xs text-muted"><summary className="cursor-pointer">Run configuration</summary>
@@ -131,7 +133,8 @@ export function Analysis({ runId, moveId, onNavigate }: {
               </Select></label>
               <label className="flex h-9 items-center gap-2 text-sm"><input type="checkbox" checked={lossesOnly} onChange={(e) => { setLossesOnly(e.target.checked); setOffset(0); }} />Only lost games</label>
             </div>
-            <p className="m-0 text-xs text-muted">{report.matching_moves.toLocaleString()} matching moves · ply numbers start at 0</p>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={uniqueGames} onChange={(e) => { setUniqueGames(e.target.checked); setOffset(0); }} />Largest mistake per game</label>
+            <p className="m-0 text-xs text-muted">{report.matching_moves.toLocaleString()} matching {uniqueGames ? "games" : "moves"} · ply numbers start at 0</p>
             {loading && <p role="status" className="m-0 text-xs text-muted">Updating moves…</p>}
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm" aria-label="Worst Bee moves">
@@ -175,7 +178,8 @@ export function Analysis({ runId, moveId, onNavigate }: {
   );
 }
 
+function gameCount(count: number) { return `${count} ${count === 1 ? "game" : "games"}`; }
 function average(value: number | null) { return value === null ? "—" : value.toFixed(1); }
-function Metric({ name, value }: { name: string; value: string }) {
-  return <div><dt className="text-xs text-muted">{name}</dt><dd className="m-0 mt-1 text-2xl">{value}</dd></div>;
+function Metric({ name, value, detail }: { name: string; value: string; detail?: string }) {
+  return <div><dt className="text-xs text-muted">{name}</dt><dd className="m-0 mt-1 text-2xl">{value}{detail && <span className="mt-1 block text-xs text-muted">{detail}</span>}</dd></div>;
 }

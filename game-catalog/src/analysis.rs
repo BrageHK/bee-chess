@@ -42,11 +42,18 @@ pub struct MoveAnalysisRecord {
     /// Both CP scores use the mover's perspective in the offline analyzer.
     pub eval_before_cp: Option<i32>,
     pub eval_after_cp: Option<i32>,
+    /// Method 3: score of the played move searched from fen_before with
+    /// searchmoves, or the best score reused when the played move is best.
+    /// eval_after_cp remains an independent, post-move graph evaluation.
+    pub eval_played_cp: Option<i32>,
+    /// Signed mate distance from the same root, in the mover's perspective.
+    pub mate_played: Option<i32>,
+    /// Same-root continuation beginning with played_move (method 3).
+    pub played_pv: Option<String>,
     /// How much `played_move` lost relative to the analyzer's own best
     /// move, in centipawns, from the mover's perspective (always
-    /// non-negative in the ordinary case; the analyzer is responsible
-    /// for computing this consistently since it depends on how it
-    /// reports/negates scores across the move boundary).
+    /// non-negative). Method 3 uses best-minus-played at the same root;
+    /// methods 1/2 used the independent before/after score delta.
     pub centipawn_loss: Option<i32>,
     /// Signed plies to mate, positive when the mover wins (offline analysis
     /// version 2). NULL for non-mate scores. Each distance is measured from
@@ -73,6 +80,9 @@ pub struct NewMoveAnalysis {
     pub best_move: Option<String>,
     pub eval_before_cp: Option<i32>,
     pub eval_after_cp: Option<i32>,
+    pub eval_played_cp: Option<i32>,
+    pub mate_played: Option<i32>,
+    pub played_pv: Option<String>,
     pub centipawn_loss: Option<i32>,
     pub mate_before: Option<i32>,
     pub mate_after: Option<i32>,
@@ -80,6 +90,26 @@ pub struct NewMoveAnalysis {
     pub mover_color: Option<crate::Color>,
     pub is_bee: Option<bool>,
     pub pv: Option<String>,
+}
+
+impl MoveAnalysisRecord {
+    /// Score pair used by the run's loss method. Legacy rows used after-score
+    /// deltas; method 3 rows always contain a CP or mate played-root score.
+    pub fn loss_mate_after(&self) -> Option<i32> {
+        if self.eval_played_cp.is_some() || self.mate_played.is_some() {
+            self.mate_played
+        } else {
+            self.mate_after
+        }
+    }
+
+    pub fn cp_loss(&self) -> Option<i32> {
+        if self.mate_before.is_some() || self.loss_mate_after().is_some() {
+            None
+        } else {
+            self.centipawn_loss
+        }
+    }
 }
 
 /// Which phase of the game a position falls into. Deliberately just

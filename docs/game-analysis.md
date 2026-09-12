@@ -35,14 +35,16 @@ a game's moves, variant, player names, or raw PGN invalidates its prior analysis
 
 ## Reproducibility and score conventions
 
-Analysis data version **2** fixes these conventions:
+Analysis data version **3** measures same-root move regret:
 
 - `go nodes N`, default 100,000, with `Threads=1`, `Hash=16`, `MultiPV=1`,
   full strength, pondering off, and Syzygy probing off. A 60-second deadline
   detects an unresponsive search; it is not a movetime budget.
-- `ucinewgame` before **every position** clears hash/search state. The full
+- `ucinewgame` before **every search** clears hash/search state. The full
   `position startpos moves ...` history preserves repetition and rule clocks.
-  An N-ply game needs N+1 searches; adjacent plies share one position result.
+  An N-ply game needs N+1 unrestricted searches plus one restricted search
+  for each played move that differs from the stored best move. Adjacent plies
+  share unrestricted results; the same policy analyzes both players.
 - The run stores Stockfish's UCI name, executable SHA-256, node budget,
   normalized Bee identities, fixed options, platform, and analysis version.
   Identical configuration resumes the same run; changed configuration gets
@@ -51,22 +53,33 @@ Analysis data version **2** fixes these conventions:
 - `fen_before`, `played_move`, `best_move`, `mover_color`, `is_bee`, and
   `pv` describe the position before each move. Moves and PV use UCI notation;
   `ply` is zero-based. Best move and every PV move are checked for legality.
-- Both evaluations are from the **mover's** perspective: `eval_before_cp`
-  is the root score and `eval_after_cp` is the next root score negated.
-  `centipawn_loss = max(0, before - after)` when both are centipawn scores.
-  These are finite-search estimates, so negative differences are clamped to
-  zero and neighboring searches can disagree. The score, best move and PV
+- All evaluations are from the **mover's** perspective. `eval_before_cp`
+  is the unrestricted root score. If the played move equals `best_move`, its
+  score/PV are reused and CPL is **zero**, including mate-valued positions.
+  Otherwise `go nodes N searchmoves <played_move>` searches the identical
+  root with identical full history and options; its score is `eval_played_cp`,
+  with `played_pv` recording that continuation. CPL is
+  `max(0, eval_before_cp - eval_played_cp)` when both scores are centipawns.
+  Neither same-root score is negated: both already belong to the mover.
+- `eval_after_cp` remains the independent next-position score, negated once
+  for the mover. It is for the evaluation graph and **never contributes to
+  method 3 CPL**. Restricted searches can still discover a higher score than
+  the unrestricted finite search; that yields zero regret, not negative CPL.
+  The score, best move and PV
   come together from the **last exact primary PV**. Stockfish can finish its
   node budget during an unfinished iteration and emit a bound and a different
   `bestmove`; that bounded result is ignored. Upper/lower bounds and secondary
   PVs are never treated as exact scores.
-- Mate scores remain separate. `mate_before` / `mate_after` are signed
+- Mate scores remain separate. `mate_before` / `mate_played` are signed
+  **plies** to mate measured from the same root. `mate_after` is the independent
+  graph score, measured from the next position. All are
   **plies** to mate in their respective positions, positive for the mover
   winning and negative for losing. `mate_after = 0` means the move delivered
   checkmate. UCI mate-in-N full moves converts to `2*N-1` plies when winning
-  and `2*N` when losing, then the after score is negated. If either evaluation
-  is mate, CPL is NULL and the move is excluded from ACPL and CP severity
-  counts. The report counts these moves separately.
+  and `2*N` when losing; only the graph-after score is negated. If either root
+  score is mate, CPL is NULL (except the known-zero best-move shortcut).
+  All mate-valued root pairs are excluded from ACPL and CP severity counts,
+  including best-move zeroes. The report counts them separately.
 - Endgame is total phase material <= 8 across both sides (knight/bishop=1,
   rook=2, queen=4; pawns/kings=0). Otherwise plies 0–19 are opening and
   later plies middlegame. Phase uses the position **before** the move.
@@ -75,8 +88,10 @@ Analysis data version **2** fixes these conventions:
   number of moves with CP scores, not an average of game averages. The
   separate `>200cp` column is strictly greater than 200.
 
-The database migration preserves existing analysis and marks newly added
-provenance/PV fields NULL for legacy rows. Runs remain separate.
+SQLite migration 4 preserves old runs and adds nullable `eval_played_cp`,
+`mate_played`, and `played_pv`. Method 1/2 runs retain their independent-score
+delta semantics and receive a legacy-method label in Lab. A version 3 pass
+creates a new run rather than overwriting their rows or summaries.
 
 ## Inspect stored results
 
@@ -86,6 +101,7 @@ Reports read SQLite without starting Stockfish:
 cargo run -p bee-games -- analysis report --run 1 --top 50
 cargo run -p bee-games -- analysis report --run 1 --phase middlegame --top 50
 cargo run -p bee-games -- analysis report --run 1 --top 50 --json > data/games/full-analysis.json
+cargo run -p bee-games -- analysis report --run 2 --top 30 --unique-games --json > data/games/same-root-worst-30.json
 ```
 
 Each report prints Bee/opponent totals and phase ACPL, large errors, mate
@@ -95,16 +111,19 @@ games from that run are included. Mate transitions can be queried separately:
 ```sql
 -- Moves allowing forced mate or losing a previously forced win.
 SELECT game_id, ply, fen_before, played_move, best_move,
-       mate_before, mate_after, pv
+       mate_before, mate_played, pv, played_pv
 FROM move_analysis
 WHERE analysis_run_id = :run AND is_bee = 1
-  AND ((mate_before IS NULL AND mate_after < 0)
-       OR (mate_before > 0 AND (mate_after IS NULL OR mate_after < 0)));
+  AND ((mate_before IS NULL AND mate_played < 0)
+       OR (mate_before > 0 AND (mate_played IS NULL OR mate_played < 0)));
 ```
 
 The JSON export and Lab share one reporting implementation. It includes run-wide
 overall/phase ACPL, strict cumulative >100cp/>200cp/>400cp counts, all requested
-move fields, and one largest mistake per lost game. Positive drops where the
+move fields, counts of distinct games containing mistakes at each threshold,
+and one largest mistake per lost game. `--unique-games` selects the largest
+matching CPL per game before pagination, using stable game/ply tie breaks.
+Summary counts always cover the full run. Positive drops in legacy runs where the
 played move equals Stockfish's best move are counted as `score_disagreements`;
 raw statistics retain them and the reviewer flags them for further inspection.
 
@@ -116,8 +135,10 @@ connections are read-only: missing catalogs produce an empty state, and imports,
 migrations, and Stockfish analysis remain offline commands.
 
 Select a run to compare phases, filter the worst-move table, or select a lost
-game's largest score drop. Click a move to inspect the existing board, before/
-after scores, the played move, or successive positions in Stockfish's PV. Move
+game's largest score drop. **Largest mistake per game** limits the filtered
+table to one position per game. Click a move to inspect the existing board,
+best/played root scores, the separate graph-after score, the played move, or
+successive positions in either Stockfish PV. Move
 labels use SAN. **Open original game** links to the Lichess game at that ply.
 Run/move URLs such as `?analysis=1&run=1&move=4183` survive refresh and browser
 back/forward. Summary statistics always cover the whole run; table filters do
@@ -127,7 +148,7 @@ CP loss, excluding mates, and is not a causal attribution of the game result.
 Read-only endpoints:
 
 - `GET /api/analysis/runs`
-- `GET /api/analysis/runs/:run?phase=middlegame&over_cp=200&losses_only=true&offset=0&limit=50`
+- `GET /api/analysis/runs/:run?phase=middlegame&over_cp=200&unique_games=true&losses_only=true&offset=0&limit=50`
 - `GET /api/analysis/runs/:run/moves/:move`
 
 Pages default to 50 rows, with a maximum of 200. Move lookups require the
@@ -135,8 +156,9 @@ selected run and a completed game. Blocking SQLite reads run outside Lab's
 async request executor. The initial implementation eagerly reads one run's
 moves, consistent with the catalog's small local dataset API.
 
-The first [105-game analysis and preliminary manual review](analysis/2026-09-12.md)
-documents the measured distribution and candidate failure classes.
+The [same-root 105-game rerun and 30-game review](analysis/2026-09-12-same-root.md)
+records the corrected measurements and links to the versioned regression corpus.
+The [original method 2 report](analysis/2026-09-12.md) remains for comparison.
 
 Pattern mining and ExperienceBook v2 remain subsequent work. Comparing Bee's own evaluation
 with Stockfish also requires importing Bee's search telemetry: catalog game

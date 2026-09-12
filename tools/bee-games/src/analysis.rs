@@ -58,7 +58,7 @@ pub fn analyze(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
     println!("run {}: analyzed {} games / {} plies; skipped {} already-analyzed games; {} searches; {} rejected games",
         result.run_id, result.games_analyzed, result.plies_analyzed, result.games_already_analyzed,
         result.searches, result.rejected.len());
-    print_report(catalog, result.run_id, top, None)?;
+    print_report(catalog, result.run_id, top, None, false)?;
     if !result.rejected.is_empty() {
         return Err(format!(
             "{} games could not be analyzed; see rejection reasons above",
@@ -73,8 +73,13 @@ pub fn report(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
     let mut top = 20;
     let mut phase = None;
     let mut json = false;
+    let mut unique_games = false;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
+        if flag == "--unique-games" {
+            unique_games = true;
+            continue;
+        }
         if flag == "--json" {
             json = true;
             continue;
@@ -104,6 +109,7 @@ pub fn report(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
             &bee_game_catalog::reporting::ReportFilter {
                 limit: top,
                 phase,
+                unique_games,
                 ..Default::default()
             },
         )
@@ -115,7 +121,7 @@ pub fn report(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
         );
         Ok(())
     } else {
-        print_report(catalog, run, top, phase)
+        print_report(catalog, run, top, phase, unique_games)
     }
 }
 
@@ -124,6 +130,7 @@ fn print_report(
     run_id: i64,
     top: usize,
     phase: Option<GamePhase>,
+    unique_games: bool,
 ) -> Result<(), String> {
     let run = catalog
         .analysis_run(run_id)
@@ -166,7 +173,7 @@ fn print_report(
                 .iter()
                 .filter(|m| m.is_bee == Some(bee) && phase.is_none_or(|p| m.phase == p))
             {
-                stats.add(m.centipawn_loss, m.mate_before, m.mate_after);
+                stats.add(m.centipawn_loss, m.mate_before, m.loss_mate_after());
             }
             println!(
                 "{name:9} {:12} {:5} {:9} {:>7} {:7} {:11}",
@@ -182,13 +189,26 @@ fn print_report(
             );
         }
     }
-    println!("Highest-CPL Bee moves (mate scores excluded):");
-    println!("game         ply phase       played best     before   after     CPL");
-    for m in moves
-        .iter()
-        .filter(|m| m.is_bee == Some(true) && m.centipawn_loss.is_some())
-        .take(top)
-    {
+    let shared = bee_game_catalog::reporting::report(
+        catalog,
+        run_id,
+        &bee_game_catalog::reporting::ReportFilter {
+            phase,
+            unique_games,
+            limit: top,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or("analysis run not found")?;
+    println!(
+        "Bee >200cp mistakes: {}; games containing >200cp: {} (whole run)",
+        shared.summary.stats.over_200, shared.summary.stats.games_over_200
+    );
+    println!("Highest-CPL Bee moves (mate scores excluded; unique games: {unique_games}):");
+    println!("game         ply phase       played best     before  played     CPL");
+    for entry in &shared.moves {
+        let m = &entry.analysis;
         println!(
             "{:<12} {:3} {:11} {:6} {:6} {:>8} {:>7} {:7}",
             m.game_id,
@@ -201,9 +221,12 @@ fn print_report(
             m.centipawn_loss.unwrap()
         );
         println!(
-            "  FEN: {}\n  PV: {}",
+            "  FEN: {}\n  PV: {}\n  Played PV: {}\n  Graph after: cp={:?}, mate={:?}",
             m.fen_before,
-            m.pv.as_deref().unwrap_or("-")
+            m.pv.as_deref().unwrap_or("-"),
+            m.played_pv.as_deref().unwrap_or("-"),
+            m.eval_after_cp,
+            m.mate_after
         );
     }
     Ok(())
@@ -222,7 +245,11 @@ fn eval(m: &MoveAnalysisRecord, before: bool) -> String {
     let (cp, mate) = if before {
         (m.eval_before_cp, m.mate_before)
     } else {
-        (m.eval_after_cp, m.mate_after)
+        (
+            m.eval_played_cp
+                .or(m.eval_after_cp.filter(|_| m.mate_played.is_none())),
+            m.loss_mate_after(),
+        )
     };
     if let Some(cp) = cp {
         format!("{cp:+}")
