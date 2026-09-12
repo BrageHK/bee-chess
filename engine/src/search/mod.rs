@@ -196,6 +196,7 @@ pub struct SearchResult {
     pub null_move: NullMoveStats,
     pub delta_pruning: DeltaPruningStats,
     pub see_pruning: SeeStats,
+    pub tablebase: crate::tablebase::TablebaseStats,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

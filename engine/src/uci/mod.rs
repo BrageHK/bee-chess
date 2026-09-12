@@ -289,8 +289,10 @@ impl UciCommand {
 
 fn parse_setoption(line: &str) -> Option<UciCommand> {
     let rest = line.strip_prefix("setoption name ")?;
-    let (name, value) = rest.split_once(" value ")?;
-    if name.trim().is_empty() || value.trim().is_empty() {
+    let (name, value) = rest
+        .split_once(" value ")
+        .or_else(|| rest.strip_suffix(" value").map(|name| (name, "")))?;
+    if name.trim().is_empty() {
         return None;
     }
     Some(UciCommand::SetOption {
@@ -359,13 +361,44 @@ fn write_search_info<W: Write>(
         result.see_pruning.attempts,
         result.see_pruning.pruned,
     )?;
+    write!(output, " tbhits {}", result.tablebase.hits)?;
     if !result.pv.is_empty() {
         write!(output, " pv")?;
         for mv in &result.pv {
             write!(output, " {}", format_uci_move(*mv))?;
         }
     }
-    writeln!(output)
+    writeln!(output)?;
+    let tb = result.tablebase;
+    if let Some(hit) = tb.root_hit.or(tb.first_hit) {
+        let wdl = match hit.wdl {
+            crate::tablebase::Wdl::Win => "win",
+            crate::tablebase::Wdl::Loss => "loss",
+            crate::tablebase::Wdl::Draw => "draw",
+            crate::tablebase::Wdl::CursedWin => "cursed_win",
+            crate::tablebase::Wdl::BlessedLoss => "blessed_loss",
+        };
+        write!(
+            output,
+            "info string tb hit pieces={} wdl={wdl} exact={} root={} eval_cp={}",
+            hit.pieces,
+            hit.exact,
+            tb.root_hit.is_some(),
+            hit.eval_cp
+        )?;
+        if let Some(dtz) = hit.dtz {
+            write!(output, " dtz={dtz}")?;
+        }
+        writeln!(output)?;
+    }
+    if tb.probes != 0 {
+        writeln!(
+            output,
+            "info string tb probes={} hits={} draw_hits={} root_resolved={}",
+            tb.probes, tb.hits, tb.draw_hits, tb.root_resolved
+        )?;
+    }
+    Ok(())
 }
 
 /// One line of protocol output a search worker thread wants written,
@@ -710,6 +743,11 @@ fn run_event_loop<W: Write>(
                         // not a permanent engine configuration.
                         writeln!(output, "option name UseTT type check default true")?;
                         writeln!(output, "option name TTReuse type combo default PerGame var PerSearch var PerGame")?;
+                        writeln!(output, "option name SyzygyPath type string default <empty>")?;
+                        writeln!(
+                            output,
+                            "option name SyzygyProbeLimit type spin default 6 min 0 max 7"
+                        )?;
                         writeln!(output, "option name UseQuiescence type check default true")?;
                         writeln!(output, "option name UseLMR type check default true")?;
                         writeln!(output, "option name UseNullMove type check default true")?;
@@ -769,6 +807,31 @@ fn run_event_loop<W: Write>(
                                     DiagnosticLevel::Warn,
                                     format!("ignored invalid Evaluator value: {value}"),
                                 );
+                            }
+                        } else if name.eq_ignore_ascii_case("SyzygyPath") {
+                            let path = if value == "<empty>" || value == "\"\"" {
+                                ""
+                            } else {
+                                &value
+                            };
+                            match engine.set_syzygy_path(path) {
+                                Ok(largest) => writeln!(
+                                    output,
+                                    "info string tb configured max_pieces={largest}"
+                                )?,
+                                Err(error) => {
+                                    writeln!(output, "info string tb unavailable: {error}")?
+                                }
+                            }
+                        } else if name.eq_ignore_ascii_case("SyzygyProbeLimit") {
+                            match value.parse::<u32>() {
+                                Ok(limit) if limit <= crate::tablebase::MAX_PROBE_LIMIT => {
+                                    engine.set_syzygy_probe_limit(limit)
+                                }
+                                _ => writeln!(
+                                    output,
+                                    "info string ignored invalid SyzygyProbeLimit value: {value}"
+                                )?,
                             }
                         } else if name.eq_ignore_ascii_case("TTReuse") {
                             if let Some(policy) = TtReuse::parse(&value) {

@@ -12,5 +12,6 @@ path = "src/bin/bee.rs"
 [dependencies]
 bee-chess-core = { path = "../chess" }
 bee-book-format = { path = "../book-format" }
+fathom-syzygy-sys = "0.1.0"
 
 [dev-dependencies]
