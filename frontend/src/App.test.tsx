@@ -3,6 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as labClient from "./labClient";
+import * as analysisClient from "./analysisClient";
+
+vi.mock("./analysisClient", () => ({
+  listAnalysisRuns: vi.fn().mockResolvedValue([]),
+  getAnalysisReport: vi.fn().mockReturnValue(new Promise(() => {})),
+  getAnalysisMove: vi.fn().mockReturnValue(new Promise(() => {})),
+}));
 
 vi.mock("./labClient", async () => {
   const actual = await vi.importActual<typeof labClient>("./labClient");
@@ -44,6 +51,23 @@ afterEach(() => {
 });
 
 describe("App navigation history", () => {
+  it("navigates to analysis and back through browser history", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "Analysis" }));
+    expect(await screen.findByText("No analysis runs yet")).toBeInTheDocument();
+    expect(window.location.search).toBe("?analysis=1");
+    window.history.back();
+    expect(await screen.findByText(/nothing running/i)).toBeInTheDocument();
+  });
+
+  it("restores a bookmarked analysis run and move after refresh", async () => {
+    window.history.replaceState(null, "", "/?analysis=1&run=2&move=7");
+    render(<App />);
+    expect(await screen.findByText("Loading position…")).toBeInTheDocument();
+    expect(analysisClient.getAnalysisMove).toHaveBeenCalledWith(2, 7);
+    expect(window.location.search).toBe("?analysis=1&run=2&move=7");
+  });
   it("starts on the dashboard with no URL params", async () => {
     render(<App />);
     expect(await screen.findByText(/nothing running/i)).toBeInTheDocument();

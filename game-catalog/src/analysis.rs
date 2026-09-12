@@ -22,7 +22,7 @@
 /// See [`NewMoveAnalysis`] for the write side -- this carries the
 /// storage-assigned `id`/`analysis_run_id` in addition to every field a
 /// caller provides when recording it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct MoveAnalysisRecord {
     pub id: i64,
     pub analysis_run_id: i64,
@@ -88,7 +88,8 @@ pub struct NewMoveAnalysis {
 /// exact thresholds before real data exists; whatever boundary an
 /// analyzer chooses, it's the analyzer's decision to make and stamp
 /// onto each record, not something this storage layer enforces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GamePhase {
     Opening,
     Middlegame,
@@ -153,7 +154,7 @@ pub struct NewGameAnalysis {
 /// storage -- see [`NewAnalysisRun`] for the write side and this
 /// module's docs for why every analysis record is scoped to one of
 /// these.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AnalysisRun {
     pub id: i64,
     pub engine: String,

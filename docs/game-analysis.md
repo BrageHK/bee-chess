@@ -85,6 +85,7 @@ Reports read SQLite without starting Stockfish:
 ```sh
 cargo run -p bee-games -- analysis report --run 1 --top 50
 cargo run -p bee-games -- analysis report --run 1 --phase middlegame --top 50
+cargo run -p bee-games -- analysis report --run 1 --top 50 --json > data/games/full-analysis.json
 ```
 
 Each report prints Bee/opponent totals and phase ACPL, large errors, mate
@@ -101,8 +102,43 @@ WHERE analysis_run_id = :run AND is_bee = 1
        OR (mate_before > 0 AND (mate_after IS NULL OR mate_after < 0)));
 ```
 
-This is the offline analyzer slice following the analysis storage PR. The Lab dashboard, pattern mining,
-and ExperienceBook v2 remain subsequent work. Comparing Bee's own evaluation
+The JSON export and Lab share one reporting implementation. It includes run-wide
+overall/phase ACPL, strict cumulative >100cp/>200cp/>400cp counts, all requested
+move fields, and one largest mistake per lost game. Positive drops where the
+played move equals Stockfish's best move are counted as `score_disagreements`;
+raw statistics retain them and the reviewer flags them for further inspection.
+
+## Lab dashboard and reviewer
+
+Start Lab as usual and choose **Analysis** in the toolbar. Lab reads the same
+`BEE_GAMES_DB` path as `bee-games` (default `data/games/catalog.sqlite3`). Its
+connections are read-only: missing catalogs produce an empty state, and imports,
+migrations, and Stockfish analysis remain offline commands.
+
+Select a run to compare phases, filter the worst-move table, or select a lost
+game's largest score drop. Click a move to inspect the existing board, before/
+after scores, the played move, or successive positions in Stockfish's PV. Move
+labels use SAN. **Open original game** links to the Lichess game at that ply.
+Run/move URLs such as `?analysis=1&run=1&move=4183` survive refresh and browser
+back/forward. Summary statistics always cover the whole run; table filters do
+not change their denominators. The loss-game percentage is a share of recorded
+CP loss, excluding mates, and is not a causal attribution of the game result.
+
+Read-only endpoints:
+
+- `GET /api/analysis/runs`
+- `GET /api/analysis/runs/:run?phase=middlegame&over_cp=200&losses_only=true&offset=0&limit=50`
+- `GET /api/analysis/runs/:run/moves/:move`
+
+Pages default to 50 rows, with a maximum of 200. Move lookups require the
+selected run and a completed game. Blocking SQLite reads run outside Lab's
+async request executor. The initial implementation eagerly reads one run's
+moves, consistent with the catalog's small local dataset API.
+
+The first [105-game analysis and preliminary manual review](analysis/2026-09-12.md)
+documents the measured distribution and candidate failure classes.
+
+Pattern mining and ExperienceBook v2 remain subsequent work. Comparing Bee's own evaluation
 with Stockfish also requires importing Bee's search telemetry: catalog game
 results and ordinary PGN do not establish what Bee thought during a move.
 

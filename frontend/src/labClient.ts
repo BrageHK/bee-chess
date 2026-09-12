@@ -19,7 +19,7 @@
  * Must match whatever port Bee Lab was actually started with (its own
  * `PORT` env var) -- the two aren't linked automatically. */
 const LAB_PORT = import.meta.env.VITE_LAB_PORT ?? "8080";
-const LAB_BASE_URL = `http://localhost:${LAB_PORT}`;
+export const LAB_BASE_URL = `http://localhost:${LAB_PORT}`;
 const LAB_WS_BASE_URL = `ws://localhost:${LAB_PORT}`;
 
 export type Color = "white" | "black";

@@ -15,7 +15,7 @@ import type { Config } from "@lichess-org/chessground/config";
  * to a fixed size until that's revisited with real visual tooling. */
 const SIZE_PX = 480;
 
-export function Chessground({ config }: { config: Config }) {
+export function Chessground({ config, responsive = false }: { config: Config; responsive?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const apiRef = useRef<Api | null>(null);
   const lastFenRef = useRef(config.fen);
@@ -62,5 +62,9 @@ export function Chessground({ config }: { config: Config }) {
     lastFenRef.current = config.fen;
   }, [config]);
 
-  return <div ref={ref} style={{ width: SIZE_PX, height: SIZE_PX }} />;
+  // The review screen supplies a definite-width wrapper so this can shrink
+  // safely; live games retain the fixed size that aligns with EvalBar.
+  return <div ref={ref} style={responsive
+    ? { width: "100%", maxWidth: SIZE_PX, aspectRatio: "1" }
+    : { width: SIZE_PX, height: SIZE_PX }} />;
 }

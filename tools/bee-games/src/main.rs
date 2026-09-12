@@ -206,7 +206,7 @@ fn builder_commit() -> Option<String> {
 }
 
 fn print_usage() {
-    eprintln!("  bee-games analyze --player <name> [--player <name> ...] [--stockfish <path>] [--nodes 100000] [--limit N] [--top 20]\n  bee-games analysis report --run <id> [--top 20] [--phase opening|middlegame|endgame]");
+    eprintln!("  bee-games analyze --player <name> [--player <name> ...] [--stockfish <path>] [--nodes 100000] [--limit N] [--top 20]\n  bee-games analysis report --run <id> [--top 20] [--phase opening|middlegame|endgame] [--json]");
     eprintln!(
         "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--player <name> ...] [--max-ply 20] [--min-games 5] --output <path.book>"
     );

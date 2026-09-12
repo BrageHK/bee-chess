@@ -35,6 +35,7 @@ mod error;
 mod filter;
 mod game;
 pub mod import;
+pub mod reporting;
 
 pub use catalog::GameCatalog;
 pub use error::{Error, Result};

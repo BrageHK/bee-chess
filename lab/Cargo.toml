@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 bee-chess-core = { path = "../chess" }
+bee-game-catalog = { path = "../game-catalog" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "sync"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }

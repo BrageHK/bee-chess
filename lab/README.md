@@ -1,5 +1,11 @@
 # Bee Lab
 
+The **Analysis** toolbar opens the catalog analysis dashboard and position
+reviewer. Run offline analysis with `bee-games` first; Lab reads
+`BEE_GAMES_DB` or `data/games/catalog.sqlite3`. See the
+[game analysis guide](../docs/game-analysis.md) for reports, filters, PV review,
+and the read-only API.
+
 A Rust server that serves the compiled frontend and is authoritative
 for game state: position, move list, clocks, turn, legality, and
 result. It owns and supervises the Stockfish/Bee subprocesses for

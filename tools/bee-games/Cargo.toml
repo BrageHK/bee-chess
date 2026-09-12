@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 bee-game-catalog = { path = "../../game-catalog" }
+serde_json = "1"
 litchee = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
