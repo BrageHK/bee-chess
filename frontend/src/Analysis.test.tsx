@@ -19,6 +19,9 @@ describe("Analysis dashboard", () => {
     render(<Analysis runId={1} moveId={null} onNavigate={() => {}} />);
     expect(await screen.findByText("Highest average loss:", { exact: false })).toHaveTextContent("middlegame (78.0cp)");
     expect(screen.getByText(">400cp blunders")).toBeInTheDocument();
+    const mistakes = screen.getByLabelText("Large mistakes");
+    expect(within(mistakes).getByText("2 games")).toBeInTheDocument();
+    expect(within(mistakes).getAllByText("1 game")).toHaveLength(2);
     const table = screen.getByRole("table", { name: "Worst Bee moves" });
     expect(within(table).getByText("g4")).toBeInTheDocument();
     expect(within(table).getByText("e4")).toBeInTheDocument();
@@ -33,7 +36,8 @@ describe("Analysis dashboard", () => {
     await user.selectOptions(await screen.findByRole("combobox", { name: "Phase" }), "middlegame");
     await user.selectOptions(screen.getByRole("combobox", { name: "Loss threshold" }), "200");
     await user.click(screen.getByRole("checkbox", { name: "Only lost games" }));
-    await waitFor(() => expect(client.getAnalysisReport).toHaveBeenLastCalledWith(1, expect.objectContaining({ phase: "middlegame", over_cp: 200, losses_only: true, offset: 0 })));
+    await user.click(screen.getByRole("checkbox", { name: "Largest mistake per game" }));
+    await waitFor(() => expect(client.getAnalysisReport).toHaveBeenLastCalledWith(1, expect.objectContaining({ phase: "middlegame", over_cp: 200, losses_only: true, unique_games: true, offset: 0 })));
     await user.click(screen.getByRole("button", { name: "Review abc123 ply 0" }));
     expect(navigate).toHaveBeenCalledWith(1, 7);
   });

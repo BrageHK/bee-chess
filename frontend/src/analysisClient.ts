@@ -17,6 +17,9 @@ export interface MoveStats {
   over_100: number;
   over_200: number;
   over_400: number;
+  games_over_100: number;
+  games_over_200: number;
+  games_over_400: number;
   mate_moves: number;
   score_disagreements: number;
 }
@@ -30,6 +33,9 @@ export interface ReviewMove {
   best_move: string | null;
   eval_before_cp: number | null;
   eval_after_cp: number | null;
+  eval_played_cp: number | null;
+  mate_played: number | null;
+  played_pv: string | null;
   centipawn_loss: number | null;
   mate_before: number | null;
   mate_after: number | null;
@@ -52,6 +58,7 @@ export interface AnalysisReport {
 export interface AnalysisFilter {
   phase?: GamePhase;
   losses_only?: boolean;
+  unique_games?: boolean;
   over_cp?: number;
   offset?: number;
   limit?: number;

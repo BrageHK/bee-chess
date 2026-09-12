@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "id": "19dwhfwg-25",
+  "category": "tactical_miss",
+  "fen": "r1bqk2r/1p1nnppp/2p1p3/p1P5/3QP3/2NB1N2/PP3PPP/R4RK1 b kq - 1 13",
+  "history_uci": [
+    "c2c4",
+    "e7e6",
+    "b1c3",
+    "d7d6",
+    "g1f3",
+    "g8e7",
+    "d2d4",
+    "b8d7",
+    "e2e4",
+    "e7g6",
+    "f1d3",
+    "d7b6",
+    "e1g1",
+    "a7a5",
+    "c1g5",
+    "f8e7",
+    "g5e7",
+    "g6e7",
+    "c4c5",
+    "d6c5",
+    "d4c5",
+    "b6d7",
+    "d1a4",
+    "c7c6",
+    "a4d4"
+  ],
+  "bee_move": "d7c5",
+  "stockfish_candidate": "e6e5",
+  "expected_property": "See the Rad1/Qd6 forcing sequence before the Nxc5 and Qxd3 capture operation; use e5 with tempo instead.",
+  "review": {
+    "category": "tactical_miss",
+    "confidence": "medium",
+    "note": "Nxc5/Qxc5/Qxd3 overlooks Rad1 and Qd6 with tempi against the queen; the line ends with exd5 winning the remaining knight and creating a passer. e5 gains a tempo on the queen first.",
+    "expected_property": "See the Rad1/Qd6 forcing sequence before the Nxc5 and Qxd3 capture operation; use e5 with tempo instead.",
+    "author": "Codex; provisional review for human confirmation",
+    "already_below_minus_200cp": false
+  },
+  "source": {
+    "game_id": "19dwhfwg",
+    "ply": 25,
+    "result": "0-1",
+    "original_game_url": "https://lichess.org/19dwhfwg#26",
+    "analysis_run_id": 2,
+    "analysis_method": 3,
+    "nodes_per_position": 100000,
+    "engine": "Stockfish 18",
+    "configuration": {
+      "after_score": "independent-graph-only",
+      "best_move_loss": "zero",
+      "chess960": false,
+      "engine_sha256": "d1a069ae6479b69ec8bcf6c5076b2573042d285eb7b1ebac058e3460b5397e35",
+      "hash_mb": 16,
+      "history": "startpos-with-all-moves",
+      "limit_strength": false,
+      "move_loss": "same-root-searchmoves",
+      "multipv": 1,
+      "nodestime": 0,
+      "platform": "macos-aarch64",
+      "players": [
+        "beechessjohan"
+      ],
+      "ponder": false,
+      "reset": "ucinewgame-per-position",
+      "score_selection": "last-exact-primary-pv",
+      "skill_level": 20,
+      "syzygy_probe_limit": 0,
+      "threads": 1
+    }
+  },
+  "analysis": {
+    "best_cp": -123,
+    "played_cp": -452,
+    "regret_cp": 329,
+    "best_pv": "e6e5 d4e3 e7g6 c3a4 e8g8 h2h3 a8b8 f1d1 d8e7 d3c4 d7f6 b2b3 h7h6 a4b6 f6d7 b6d7 c8d7 e3c3 b8d8 c3a5",
+    "played_pv": "d7c5 d4c5 d8d3 a1d1 d3a6 c5d6 e7d5 f1e1 c6c5 d6a6 a8a6 e4d5 e8g8 d5d6"
+  }
+}

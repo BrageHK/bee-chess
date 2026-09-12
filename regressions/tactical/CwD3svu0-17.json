@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "id": "CwD3svu0-17",
+  "category": "tactical_miss",
+  "fen": "r1bqk2r/2pnbppp/p2pp1n1/1p6/3PP3/1BNQBN2/PPP2PPP/R3K2R b KQkq - 1 9",
+  "history_uci": [
+    "e2e4",
+    "e7e6",
+    "d2d4",
+    "d7d6",
+    "b1c3",
+    "g8e7",
+    "g1f3",
+    "b8d7",
+    "f1b5",
+    "e7g6",
+    "d1d3",
+    "f8e7",
+    "c1e3",
+    "a7a6",
+    "b5a4",
+    "b7b5",
+    "a4b3"
+  ],
+  "bee_move": "d7b6",
+  "stockfish_candidate": "c7c5",
+  "expected_property": "Recognize ...c5 and the ...c4 queen/bishop fork before spending a tempo on ...Nb6.",
+  "review": {
+    "category": "tactical_miss",
+    "confidence": "high",
+    "note": "...c5 followed by ...c4 exploits the queen and bishop alignment on d3/b3. ...Nb6 misses that forcing resource.",
+    "expected_property": "Recognize ...c5 and the ...c4 queen/bishop fork before spending a tempo on ...Nb6.",
+    "author": "Codex; provisional review for human confirmation",
+    "already_below_minus_200cp": false
+  },
+  "source": {
+    "game_id": "CwD3svu0",
+    "ply": 17,
+    "result": "0-1",
+    "original_game_url": "https://lichess.org/CwD3svu0#18",
+    "analysis_run_id": 2,
+    "analysis_method": 3,
+    "nodes_per_position": 100000,
+    "engine": "Stockfish 18",
+    "configuration": {
+      "after_score": "independent-graph-only",
+      "best_move_loss": "zero",
+      "chess960": false,
+      "engine_sha256": "d1a069ae6479b69ec8bcf6c5076b2573042d285eb7b1ebac058e3460b5397e35",
+      "hash_mb": 16,
+      "history": "startpos-with-all-moves",
+      "limit_strength": false,
+      "move_loss": "same-root-searchmoves",
+      "multipv": 1,
+      "nodestime": 0,
+      "platform": "macos-aarch64",
+      "players": [
+        "beechessjohan"
+      ],
+      "ponder": false,
+      "reset": "ucinewgame-per-position",
+      "score_selection": "last-exact-primary-pv",
+      "skill_level": 20,
+      "syzygy_probe_limit": 0,
+      "threads": 1
+    }
+  },
+  "analysis": {
+    "best_cp": 244,
+    "played_cp": -59,
+    "regret_cp": 303,
+    "best_pv": "c7c5 f3d2 c5c4 d2c4 b5c4 d3c4 a6a5 c4c6 a8b8 c3b5 e8g8 b5d6 g6h4 e1c1 h4g2 d6c8 b8c8",
+    "played_pv": "d7b6 h2h4 g6h4 f3h4 e7h4 e1c1 c8b7 c1b1 h4e7 d4d5 e6e5 a2a4 b5a4 c3a4 e7g5 a4b6"
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "id": "Xtg1JApX-5",
+  "category": "king_safety",
+  "fen": "rnbqkbnr/ppp2ppp/3pP3/8/8/8/PPP1PPPP/RNBQKBNR b KQkq - 0 3",
+  "history_uci": [
+    "d2d4",
+    "e7e6",
+    "d4d5",
+    "d7d6",
+    "d5e6"
+  ],
+  "bee_move": "g8e7",
+  "stockfish_candidate": "c8e6",
+  "expected_property": "Remove the advanced e6 pawn with Bxe6 before exf7+ displaces the king and exposes it to Bc4+.",
+  "review": {
+    "category": "king_safety",
+    "confidence": "high",
+    "note": "Ne7 ignores the e6 pawn and allows exf7+, forcing the king to f7 and giving Bc4+ with development. Bxe6 removes the threat immediately.",
+    "expected_property": "Remove the advanced e6 pawn with Bxe6 before exf7+ displaces the king and exposes it to Bc4+.",
+    "author": "Codex; provisional review for human confirmation",
+    "already_below_minus_200cp": false
+  },
+  "source": {
+    "game_id": "Xtg1JApX",
+    "ply": 5,
+    "result": "0-1",
+    "original_game_url": "https://lichess.org/Xtg1JApX#6",
+    "analysis_run_id": 2,
+    "analysis_method": 3,
+    "nodes_per_position": 100000,
+    "engine": "Stockfish 18",
+    "configuration": {
+      "after_score": "independent-graph-only",
+      "best_move_loss": "zero",
+      "chess960": false,
+      "engine_sha256": "d1a069ae6479b69ec8bcf6c5076b2573042d285eb7b1ebac058e3460b5397e35",
+      "hash_mb": 16,
+      "history": "startpos-with-all-moves",
+      "limit_strength": false,
+      "move_loss": "same-root-searchmoves",
+      "multipv": 1,
+      "nodestime": 0,
+      "platform": "macos-aarch64",
+      "players": [
+        "beechessjohan"
+      ],
+      "ponder": false,
+      "reset": "ucinewgame-per-position",
+      "score_selection": "last-exact-primary-pv",
+      "skill_level": 20,
+      "syzygy_probe_limit": 0,
+      "threads": 1
+    }
+  },
+  "analysis": {
+    "best_cp": 18,
+    "played_cp": -256,
+    "regret_cp": 274,
+    "best_pv": "c8e6 e2e4 b8c6 b1c3 g8f6 g1e2 d6d5 e4d5 f6d5 c3d5 d8d5 d1d5 e6d5 e2c3 e8c8 c3d5 d8d5 c2c3 d5e5 e1d1",
+    "played_pv": "g8e7 e6f7 e8f7 e2e4 b8c6 f1c4 f7e8 b1c3 g7g6 c1e3 f8g7 d1d2 c8d7 c4e2 d7e6 e3h6 g7h6 d2h6 d8d7"
+  }
+}

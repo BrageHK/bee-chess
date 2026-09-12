@@ -9,11 +9,13 @@ export function PositionReview({ move, onClose }: { move: ReviewMove; onClose: (
   const reviewRef = useRef<HTMLDivElement>(null);
   useEffect(() => { reviewRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }); }, []);
   const [step, setStep] = useState(0);
-  const [line, setLine] = useState<"pv" | "played">("pv");
+  const [line, setLine] = useState<"pv" | "played" | "played_pv">("pv");
+  const sameRoot = move.eval_played_cp !== null || move.mate_played !== null;
   const [flipped, setFlipped] = useState(false);
   const variation = useMemo(() => {
     try {
-      return { frames: reviewFrames(move.fen_before, line === "played" ? [move.played_move] : (move.pv?.split(/\s+/).filter(Boolean) ?? [])), error: null };
+      const pv = line === "played_pv" ? move.played_pv : move.pv;
+      return { frames: reviewFrames(move.fen_before, line === "played" ? [move.played_move] : (pv?.split(/\s+/).filter(Boolean) ?? [])), error: null };
     } catch (error) {
       return { frames: [{ fen: move.fen_before, uci: "", san: "", label: "Before move" }], error: String(error) };
     }
@@ -21,7 +23,7 @@ export function PositionReview({ move, onClose }: { move: ReviewMove; onClose: (
   const frame = variation.frames[Math.min(step, variation.frames.length - 1)];
   const beeColor = move.mover_color ?? "white";
   const orientation = flipped ? (beeColor === "white" ? "black" : "white") : beeColor;
-  const showLine = (line: "pv" | "played") => { setLine(line); setStep(0); };
+  const showLine = (line: "pv" | "played" | "played_pv") => { setLine(line); setStep(0); };
   return (
     <div ref={reviewRef}><Panel className="w-full text-left select-text" aria-label="Position review">
       <PanelHeader className="flex flex-wrap items-center justify-between gap-2">
@@ -42,14 +44,17 @@ export function PositionReview({ move, onClose }: { move: ReviewMove; onClose: (
             <dl className="grid grid-cols-2 gap-2 text-sm">
               <dt className="text-muted">Bee move</dt><dd className="m-0 font-medium">{moveSan(move.fen_before, move.played_move)}</dd>
               <dt className="text-muted">Stockfish best</dt><dd className="m-0 font-medium">{moveSan(move.fen_before, move.best_move)}</dd>
-              <dt className="text-muted">Before</dt><dd className="m-0">{scoreLabel(move.eval_before_cp, move.mate_before)}</dd>
-              <dt className="text-muted">After</dt><dd className="m-0">{scoreLabel(move.eval_after_cp, move.mate_after)}</dd>
+              <dt className="text-muted">{sameRoot ? "Best at root" : "Before"}</dt><dd className="m-0">{scoreLabel(move.eval_before_cp, move.mate_before)}</dd>
+              <dt className="text-muted">{sameRoot ? "Played at root" : "After"}</dt><dd className="m-0">{scoreLabel(sameRoot ? move.eval_played_cp : move.eval_after_cp, sameRoot ? move.mate_played : move.mate_after)}</dd>
               <dt className="text-muted">Loss</dt><dd className="m-0 font-medium text-danger">{move.centipawn_loss === null ? "Mate transition" : `${move.centipawn_loss}cp`}</dd>
+              {sameRoot && <><dt className="text-muted">Graph after</dt><dd className="m-0">{scoreLabel(move.eval_after_cp, move.mate_after)}</dd></>}
             </dl>
             <p className="m-0 text-xs text-muted">Evaluations are from Bee’s perspective. Ply numbers start at 0.</p>
+            {sameRoot && <p className="m-0 text-xs text-muted">Loss compares the two root scores. Graph after is an independent evaluation and does not contribute to loss.</p>}
             {move.centipawn_loss !== null && move.centipawn_loss > 0 && move.best_move === move.played_move && <p className="m-0 text-sm text-warning">Stockfish recommended the played move. This score drop is a disagreement between the before/after searches, so it needs deeper review before being counted as a move error.</p>}
             <div className="flex flex-wrap gap-2">
               <Button aria-pressed={line === "pv"} onClick={() => showLine("pv")}>Stockfish PV</Button>
+              {move.played_pv && <Button aria-pressed={line === "played_pv"} onClick={() => showLine("played_pv")}>Played continuation</Button>}
               <Button aria-pressed={line === "played"} onClick={() => { showLine("played"); setStep(1); }}>Bee’s played move</Button>
               <Button onClick={() => setFlipped((v) => !v)}>Flip board</Button>
             </div>

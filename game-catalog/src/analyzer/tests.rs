@@ -62,6 +62,148 @@ struct FakeEngine {
     fail_at: Option<usize>,
 }
 
+struct ScriptEngine {
+    // Each expected call records history, root restriction, score, and best move.
+    calls: std::collections::VecDeque<(Vec<String>, Option<String>, Score, String)>,
+}
+
+impl SearchEngine for ScriptEngine {
+    fn search(
+        &mut self,
+        history: &[String],
+        position: &Position,
+        nodes: u64,
+        root_move: Option<&str>,
+    ) -> Result<Search, AnalysisError> {
+        let (expected_history, expected_root, score, best) =
+            self.calls.pop_front().expect("unexpected extra search");
+        assert_eq!(nodes, 100_000);
+        assert_eq!(history, expected_history);
+        assert_eq!(root_move, expected_root.as_deref());
+        let mut expected_position = Position::startpos();
+        for uci in history {
+            let mv = expected_position
+                .generate_legal_moves()
+                .into_iter()
+                .find(|m| move_uci(*m) == *uci)
+                .unwrap();
+            expected_position.make_move(mv);
+        }
+        assert_eq!(position.to_fen(), expected_position.to_fen());
+        Ok(Search {
+            score,
+            best_move: Some(best.clone()),
+            pv: vec![best],
+        })
+    }
+}
+
+#[test]
+fn same_root_regret_ignores_graph_delta_and_reuses_best_move_score() {
+    for bee in [Color::White, Color::Black] {
+        let catalog = GameCatalog::open_in_memory().unwrap();
+        catalog.upsert_game(&game("g", "e4 e5", bee)).unwrap();
+        let run_id = run(&catalog);
+        let mut engine = ScriptEngine {
+            calls: [
+                (vec![], None, Score::Cp(30), "e2e4".into()),
+                (vec!["e2e4".into()], None, Score::Cp(40), "e7e6".into()),
+                (
+                    vec!["e2e4".into()],
+                    Some("e7e5".into()),
+                    Score::Cp(-260),
+                    "e7e5".into(),
+                ),
+                (
+                    vec!["e2e4".into(), "e7e5".into()],
+                    None,
+                    Score::Cp(999),
+                    "g1f3".into(),
+                ),
+            ]
+            .into(),
+        };
+        let result = analyze_with_engine(
+            &catalog,
+            &config(),
+            &["bee".into()],
+            run_id,
+            &mut engine,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.searches, 4);
+        assert!(engine.calls.is_empty());
+        let moves = catalog.move_analyses(run_id, "g").unwrap();
+        assert_eq!(
+            (
+                moves[0].eval_before_cp,
+                moves[0].eval_played_cp,
+                moves[0].eval_after_cp,
+                moves[0].centipawn_loss
+            ),
+            (Some(30), Some(30), Some(-40), Some(0))
+        );
+        assert_eq!(
+            (
+                moves[1].eval_before_cp,
+                moves[1].eval_played_cp,
+                moves[1].eval_after_cp,
+                moves[1].centipawn_loss
+            ),
+            (Some(40), Some(-260), Some(-999), Some(300))
+        );
+        assert_eq!(moves[1].played_pv.as_deref(), Some("e7e5"));
+        assert_eq!(
+            catalog
+                .game_analysis(run_id, "g")
+                .unwrap()
+                .unwrap()
+                .avg_centipawn_loss,
+            Some(if bee == Color::White { 0.0 } else { 300.0 })
+        );
+    }
+}
+
+#[test]
+fn best_mate_move_has_zero_regret_but_is_excluded_from_cp_averages() {
+    let catalog = GameCatalog::open_in_memory().unwrap();
+    catalog.upsert_game(&game("g", "e4", Color::White)).unwrap();
+    let run_id = run(&catalog);
+    // Synthetic scores exercise the storage contract, without claiming that
+    // startpos is a mate. No restricted search may run for the recommended move.
+    let mut engine = ScriptEngine {
+        calls: [
+            (vec![], None, Score::Mate(5), "e2e4".into()),
+            (vec!["e2e4".into()], None, Score::Cp(10), "e7e5".into()),
+        ]
+        .into(),
+    };
+    analyze_with_engine(
+        &catalog,
+        &config(),
+        &["bee".into()],
+        run_id,
+        &mut engine,
+        |_| {},
+    )
+    .unwrap();
+    let m = catalog.move_analyses(run_id, "g").unwrap().remove(0);
+    assert_eq!(
+        (m.mate_before, m.mate_played, m.mate_after, m.centipawn_loss),
+        (Some(5), Some(5), None, Some(0))
+    );
+    assert_eq!(m.cp_loss(), None);
+    assert_eq!(
+        catalog
+            .game_analysis(run_id, "g")
+            .unwrap()
+            .unwrap()
+            .avg_centipawn_loss,
+        None
+    );
+}
+
 impl FakeEngine {
     fn new(scores: Vec<Score>) -> Self {
         Self {
@@ -78,19 +220,26 @@ impl SearchEngine for FakeEngine {
         history: &[String],
         position: &Position,
         nodes: u64,
+        root_move: Option<&str>,
     ) -> Result<Search, AnalysisError> {
         assert_eq!(nodes, 100_000);
         if self.fail_at == Some(history.len()) {
             return Err(AnalysisError::Engine("injected failure".into()));
         }
         self.histories.push(history.to_vec());
-        let best = position
-            .generate_legal_moves()
-            .first()
-            .copied()
-            .map(move_uci);
+        let best = root_move.map(str::to_string).or_else(|| {
+            position
+                .generate_legal_moves()
+                .first()
+                .copied()
+                .map(move_uci)
+        });
         Ok(Search {
-            score: self.scores[history.len()],
+            score: if root_move.is_some() {
+                self.scores[history.len() + 1].negated()
+            } else {
+                self.scores[history.len()]
+            },
             pv: best.iter().cloned().collect(),
             best_move: best,
         })
@@ -124,7 +273,7 @@ fn normalizes_both_colors_and_rolls_up_only_bee() {
                 result.plies_analyzed,
                 result.searches
             ),
-            (1, 3, 4)
+            (1, 3, 7)
         );
         assert_eq!(engine.histories.last().unwrap(), &["e2e4", "e7e5", "g1f3"]);
         let moves = catalog.move_analyses(run_id, "g").unwrap();
@@ -229,7 +378,7 @@ fn restart_skips_all_100_completed_games_without_searching_and_config_is_scoped(
     .unwrap();
     assert_eq!(
         (first.games_analyzed, first.plies_analyzed, first.searches),
-        (100, 200, 300)
+        (100, 200, 500)
     );
     let saved = catalog.analyzed_moves(run_id, false, None).unwrap();
     drop(catalog);
@@ -349,7 +498,7 @@ fn rejects_bad_games_before_searching_and_keeps_processing_valid_games() {
     )
     .unwrap();
     assert_eq!(result.rejected.len(), 4);
-    assert_eq!(result.searches, 3);
+    assert_eq!(result.searches, 5);
     assert_eq!(
         catalog.analyzed_moves(run_id, false, None).unwrap().len(),
         2

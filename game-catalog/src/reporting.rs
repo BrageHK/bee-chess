@@ -16,6 +16,9 @@ pub struct MoveStats {
     pub over_100: usize,
     pub over_200: usize,
     pub over_400: usize,
+    pub games_over_100: usize,
+    pub games_over_200: usize,
+    pub games_over_400: usize,
     pub mate_moves: usize,
     /// Positive CP drop although the stored best move equals the played move.
     /// Keep raw totals but expose this finite-search disagreement for review.
@@ -71,6 +74,7 @@ pub struct StoredAnalysisReport {
 pub struct ReportFilter {
     pub phase: Option<GamePhase>,
     pub losses_only: bool,
+    pub unique_games: bool,
     pub over_cp: Option<u32>,
     pub offset: usize,
     pub limit: usize,
@@ -81,6 +85,7 @@ impl Default for ReportFilter {
         Self {
             phase: None,
             losses_only: false,
+            unique_games: false,
             over_cp: None,
             offset: 0,
             limit: 50,
@@ -131,17 +136,19 @@ pub fn report(
         })
         .collect(),
     };
+    let mut seen_games = HashSet::new();
     let matches: Vec<_> = bee_moves
         .iter()
         .copied()
         .filter(|m| {
-            m.centipawn_loss.is_some_and(|cp| {
+            m.cp_loss().is_some_and(|cp| {
                 filter
                     .over_cp
                     .is_none_or(|min| i64::from(cp) > i64::from(min))
             }) && filter.phase.is_none_or(|phase| m.phase == phase)
                 && (!filter.losses_only || is_loss(m, games.get(&m.game_id)))
         })
+        .filter(|m| !filter.unique_games || seen_games.insert(m.game_id.as_str()))
         .collect();
     let matching_moves = matches.len();
     let moves = matches
@@ -153,7 +160,7 @@ pub fn report(
     let mut loss_totals = HashMap::<&str, i64>::new();
     for m in &bee_moves {
         if is_loss(m, games.get(&m.game_id)) {
-            *loss_totals.entry(&m.game_id).or_default() += i64::from(m.centipawn_loss.unwrap_or(0));
+            *loss_totals.entry(&m.game_id).or_default() += i64::from(m.cp_loss().unwrap_or(0));
         }
     }
     // analyzed_moves is already CPL-descending with stable game/ply tie breaks.
@@ -161,7 +168,7 @@ pub fn report(
     let losses = bee_moves
         .into_iter()
         .filter(|m| {
-            m.centipawn_loss.is_some()
+            m.cp_loss().is_some()
                 && is_loss(m, games.get(&m.game_id))
                 && seen.insert(m.game_id.as_str())
         })
@@ -204,11 +211,12 @@ fn stats(moves: &[&MoveAnalysisRecord]) -> MoveStats {
         ..Default::default()
     };
     let mut total = 0i64;
+    let mut games_over = [HashSet::new(), HashSet::new(), HashSet::new()];
     for m in moves {
-        if m.mate_before.is_some() || m.mate_after.is_some() {
+        if m.mate_before.is_some() || m.loss_mate_after().is_some() {
             stats.mate_moves += 1;
         }
-        if let Some(cp) = m.centipawn_loss {
+        if let Some(cp) = m.cp_loss() {
             stats.score_disagreements +=
                 usize::from(cp > 0 && m.best_move.as_deref() == Some(m.played_move.as_str()));
             stats.cp_moves += 1;
@@ -216,9 +224,17 @@ fn stats(moves: &[&MoveAnalysisRecord]) -> MoveStats {
             stats.over_100 += usize::from(cp > 100);
             stats.over_200 += usize::from(cp > 200);
             stats.over_400 += usize::from(cp > 400);
+            for (index, threshold) in [100, 200, 400].into_iter().enumerate() {
+                if cp > threshold {
+                    games_over[index].insert(&m.game_id);
+                }
+            }
         }
     }
     stats.avg_cpl = (stats.cp_moves > 0).then(|| total as f64 / stats.cp_moves as f64);
+    stats.games_over_100 = games_over[0].len();
+    stats.games_over_200 = games_over[1].len();
+    stats.games_over_400 = games_over[2].len();
     stats
 }
 
@@ -308,6 +324,9 @@ mod tests {
                     best_move: Some("d2d4".into()),
                     eval_before_cp: Some(0),
                     eval_after_cp: cp.map(|c| -c),
+                    eval_played_cp: None,
+                    mate_played: None,
+                    played_pv: None,
                     centipawn_loss: *cp,
                     mate_before: None,
                     mate_after: cp.is_none().then_some(-1),
@@ -480,5 +499,68 @@ mod tests {
         assert_eq!(s.avg_cpl, Some(100.0));
         m.centipawn_loss = Some(0);
         assert_eq!(stats(&[&m]).score_disagreements, 0);
+    }
+
+    #[test]
+    fn repeated_mistakes_count_once_per_game_and_unique_paging_follows_ranking() {
+        let c = fixture();
+        add_game(
+            &c,
+            1,
+            "LongDraw",
+            Color::White,
+            "1/2-1/2",
+            &[Some(500), Some(0), Some(450), Some(0), Some(401)],
+        );
+        let report = report(
+            &c,
+            1,
+            &ReportFilter {
+                unique_games: true,
+                offset: 1,
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                report.summary.stats.over_200,
+                report.summary.stats.games_over_200
+            ),
+            (5, 3)
+        );
+        assert_eq!(
+            (
+                report.summary.stats.over_400,
+                report.summary.stats.games_over_400
+            ),
+            (4, 2)
+        );
+        assert_eq!(report.matching_moves, 4);
+        assert_eq!(
+            report
+                .moves
+                .iter()
+                .map(|m| m.analysis.game_id.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert_eq!(report.summary.stats.bee_moves, 8);
+    }
+
+    #[test]
+    fn same_root_scores_determine_mate_exclusions_instead_of_graph_scores() {
+        let c = fixture();
+        let mut m = c.move_analyses(1, "A").unwrap().remove(0);
+        m.eval_played_cp = Some(-100);
+        m.mate_after = Some(-1); // Independent graph search; not a root mate.
+        assert_eq!((stats(&[&m]).cp_moves, stats(&[&m]).mate_moves), (1, 0));
+        m.eval_played_cp = None;
+        m.mate_played = Some(5);
+        m.mate_before = Some(5);
+        m.centipawn_loss = Some(0);
+        assert_eq!((stats(&[&m]).cp_moves, stats(&[&m]).mate_moves), (0, 1));
     }
 }
