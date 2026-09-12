@@ -31,6 +31,8 @@ use super::{
 const MAX_ITERATIVE_DEPTH: u32 = 128;
 
 pub(crate) struct SearchState {
+    pub(crate) syzygy: crate::tablebase::Syzygy,
+    tablebase: crate::tablebase::TablebaseStats,
     options: SearchOptions,
     table: TranspositionTable,
     killers: Vec<[Option<Move>; 2]>,
@@ -59,6 +61,7 @@ impl SearchState {
     }
 
     fn begin_search(&mut self, options: SearchOptions) {
+        self.tablebase = Default::default();
         self.options = options;
         self.table.begin_search();
         self.killers.clear();
@@ -68,6 +71,8 @@ impl SearchState {
 
     fn new(options: SearchOptions) -> Self {
         Self {
+            syzygy: Default::default(),
+            tablebase: Default::default(),
             options,
             table: TranspositionTable::default(),
             killers: Vec::new(),
@@ -78,6 +83,29 @@ impl SearchState {
             delta_pruning: DeltaPruningStats::default(),
             see_pruning: SeeStats::default(),
         }
+    }
+
+    fn probe(
+        &mut self,
+        position: &Position,
+        evaluator: &impl Evaluator,
+        root: bool,
+    ) -> Option<crate::tablebase::Wdl> {
+        let wdl = self.syzygy.probe_wdl(position, &mut self.tablebase)?;
+        if root || self.tablebase.first_hit.is_none() {
+            let hit = crate::tablebase::TablebaseHit {
+                pieces: crate::tablebase::piece_count(position),
+                wdl,
+                dtz: None,
+                exact: wdl.search_score(position.halfmove_clock()).is_some(),
+                eval_cp: evaluator.evaluate(position),
+            };
+            self.tablebase.first_hit.get_or_insert(hit);
+            if root {
+                self.tablebase.root_hit = Some(hit);
+            }
+        }
+        Some(wdl)
     }
 }
 
@@ -267,7 +295,9 @@ pub fn search_iterative_with_options(
     .expect("depth 1 always completes: Deadline::none() never expires");
     on_depth_complete(&last_completed);
 
-    if super::mate_in_plies(last_completed.score).is_some() {
+    if super::mate_in_plies(last_completed.score).is_some()
+        || last_completed.tablebase.root_resolved
+    {
         return last_completed;
     }
 
@@ -278,7 +308,8 @@ pub fn search_iterative_with_options(
         depth += 1;
         match search_to_depth(position, depth, evaluator, &deadline, &mut state, &mut path) {
             Some(result) => {
-                let found_mate = super::mate_in_plies(result.score).is_some();
+                let found_mate =
+                    super::mate_in_plies(result.score).is_some() || result.tablebase.root_resolved;
                 let search_saturated = result.nodes == last_completed.nodes
                     && result.score == last_completed.score
                     && result.best_move == last_completed.best_move;
@@ -348,7 +379,9 @@ pub(crate) fn search_iterative_with_context(
         search_to_depth(position, depth, evaluator, &deadline, state, &mut path)?;
     on_depth_complete(&last_completed);
 
-    if super::mate_in_plies(last_completed.score).is_some() {
+    if super::mate_in_plies(last_completed.score).is_some()
+        || last_completed.tablebase.root_resolved
+    {
         return Some(last_completed);
     }
 
@@ -356,7 +389,8 @@ pub(crate) fn search_iterative_with_context(
         depth += 1;
         match search_to_depth(position, depth, evaluator, &deadline, state, &mut path) {
             Some(result) => {
-                let found_mate = super::mate_in_plies(result.score).is_some();
+                let found_mate =
+                    super::mate_in_plies(result.score).is_some() || result.tablebase.root_resolved;
                 last_completed = result;
                 on_depth_complete(&last_completed);
                 if found_mate {
@@ -499,7 +533,9 @@ pub(crate) fn search_iterative_with_budget_context(
     // improve on "I have found a way to win," and every ply deeper is
     // meaningfully more expensive -- stop immediately rather than
     // burning the rest of the time budget for no gain.
-    if super::mate_in_plies(last_completed.score).is_some() {
+    if super::mate_in_plies(last_completed.score).is_some()
+        || last_completed.tablebase.root_resolved
+    {
         return Some((
             last_completed,
             telemetry(budget, depth, aborted, best_move_changes, None),
@@ -517,7 +553,8 @@ pub(crate) fn search_iterative_with_budget_context(
         let depth_start = std::time::Instant::now();
         match search_to_depth(position, depth, evaluator, &hard_deadline, state, &mut path) {
             Some(result) => {
-                let found_mate = super::mate_in_plies(result.score).is_some();
+                let found_mate =
+                    super::mate_in_plies(result.score).is_some() || result.tablebase.root_resolved;
                 // Equal shallow node counts can just be hits in a warm TT.
                 let search_saturated = (state.tt_reuse() == TtReuse::PerSearch
                     || !state.options.use_tt
@@ -660,6 +697,7 @@ fn search_to_depth(
             null_move: state.null_move,
             delta_pruning: state.delta_pruning,
             see_pruning: state.see_pruning,
+            tablebase: state.tablebase,
         });
     }
 
@@ -678,9 +716,29 @@ fn search_to_depth(
             null_move: state.null_move,
             delta_pruning: state.delta_pruning,
             see_pruning: state.see_pruning,
+            tablebase: state.tablebase,
         });
     }
 
+    if deadline.is_expired(0) {
+        return None;
+    }
+    if let Some((mv, score)) = tablebase_root(position, &moves, evaluator, state, path, deadline) {
+        state.root_best = Some(mv);
+        state.tablebase.root_resolved = true;
+        return Some(SearchResult {
+            best_move: Some(mv),
+            score,
+            nodes: 1,
+            depth,
+            pv: vec![mv],
+            lmr: state.lmr,
+            null_move: state.null_move,
+            delta_pruning: state.delta_pruning,
+            see_pruning: state.see_pruning,
+            tablebase: state.tablebase,
+        });
+    }
     order_moves(position, &mut moves, state, 0, state.root_best);
     let mut best_move = moves[0];
     let mut best_score = -SCORE_INF;
@@ -734,7 +792,75 @@ fn search_to_depth(
         null_move: state.null_move,
         delta_pruning: state.delta_pruning,
         see_pruning: state.see_pruning,
+        tablebase: state.tablebase,
     })
+}
+
+/// Only return early with an outcome-preserving legal move. A bare root WDL
+/// result cannot select a move, and WDL alone cannot guarantee conversion of
+/// a win before the fifty-move limit. DTZ can; WDL-only draws can be resolved
+/// by finding a child that is also a proven draw.
+fn tablebase_root(
+    position: &mut Position,
+    moves: &[Move],
+    evaluator: &impl Evaluator,
+    state: &mut SearchState,
+    path: &mut Vec<u64>,
+    deadline: &Deadline,
+) -> Option<(Move, Score)> {
+    let wdl = state.probe(position, evaluator, true)?;
+    let reversible_start = path
+        .len()
+        .saturating_sub(position.halfmove_clock() as usize + 1);
+    let reversible = &path[reversible_start..];
+    let repeated = reversible
+        .iter()
+        .enumerate()
+        .any(|(i, hash)| reversible[..i].contains(hash));
+    // Fathom's basic root API has no game history. Let ordinary search handle
+    // positions with a repeated reversible history instead of bypassing it.
+    if !repeated {
+        if let Some((wdl, dtz, mv)) = state
+            .syzygy
+            .probe_root(position, moves, &mut state.tablebase)
+        {
+            if let Some(hit) = &mut state.tablebase.root_hit {
+                hit.wdl = wdl;
+                hit.dtz = Some(dtz);
+                hit.exact = true;
+            }
+            let undo = position.make_move(mv);
+            let mate = position.in_check() && position.generate_legal_moves().is_empty();
+            position.unmake_move(mv, undo);
+            return Some((mv, if mate { SCORE_MATE - 1 } else { wdl.score() }));
+        }
+    }
+    if wdl.score() != 0 {
+        return None;
+    }
+    for &mv in moves {
+        if deadline.is_expired(0) {
+            return None;
+        }
+        let undo = position.make_move(mv);
+        path.push(position.zobrist_hash());
+        let children = position.generate_legal_moves();
+        let draw = if children.is_empty() {
+            !position.in_check()
+        } else if is_rule_draw(position, path) {
+            true
+        } else {
+            state
+                .probe(position, evaluator, false)
+                .is_some_and(|child| child.score() == 0)
+        };
+        path.pop();
+        position.unmake_move(mv, undo);
+        if draw {
+            return Some((mv, 0));
+        }
+    }
+    None
 }
 
 /// The recursive negamax search. `ply` is the distance from the root,
@@ -813,6 +939,13 @@ fn negamax(
     let mut moves = position.generate_legal_moves();
     if moves.is_empty() {
         return Some((terminal_score(position, ply), Vec::new()));
+    }
+
+    if let Some(score) = state
+        .probe(position, evaluator, false)
+        .and_then(|wdl| wdl.search_score(position.halfmove_clock()))
+    {
+        return Some((score, Vec::new()));
     }
 
     if depth == 0 {
@@ -1066,6 +1199,13 @@ fn quiescence(
     let moves = position.generate_legal_moves();
     if moves.is_empty() {
         return Some(terminal_score(position, ply));
+    }
+
+    if let Some(score) = state
+        .probe(position, evaluator, false)
+        .and_then(|wdl| wdl.search_score(position.halfmove_clock()))
+    {
+        return Some(score);
     }
 
     let must_evade_check = state.options.use_enhanced_quiescence && position.in_check();
@@ -1476,6 +1616,38 @@ mod tests {
     use crate::eval::MaterialEvaluator;
     use crate::search::mate_in_plies;
     use std::time::Duration;
+
+    #[test]
+    fn tablebase_draw_overrides_quiescence_stand_pat() {
+        let mut position = Position::from_fen("k7/P7/2K5/8/8/8/8/8 w - - 17 1").unwrap();
+        let before = position.clone();
+        let mut state = SearchState::default();
+        state
+            .syzygy
+            .set_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/syzygy"
+            ))
+            .unwrap();
+        let mut path = vec![position.zobrist_hash()];
+        let mut nodes = 0;
+        let score = quiescence(
+            &mut position,
+            -SCORE_INF,
+            SCORE_INF,
+            0,
+            0,
+            &MaterialEvaluator,
+            &mut nodes,
+            &Deadline::none(),
+            &mut path,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(score, 0);
+        assert_eq!(state.tablebase.hits, 1);
+        assert_eq!(position, before);
+    }
 
     #[test]
     fn finds_mate_in_one() {

@@ -390,6 +390,24 @@ impl Engine {
         self.search_context.tt_reuse()
     }
 
+    pub fn syzygy_path(&self) -> &str {
+        self.search_context.syzygy.path()
+    }
+
+    pub fn syzygy_probe_limit(&self) -> u32 {
+        self.search_context.syzygy.limit()
+    }
+
+    pub fn set_syzygy_path(&mut self, path: &str) -> Result<u32, String> {
+        self.search_context.clear_table();
+        self.search_context.syzygy.set_path(path)
+    }
+
+    pub fn set_syzygy_probe_limit(&mut self, limit: u32) {
+        self.search_context.clear_table();
+        self.search_context.syzygy.set_limit(limit);
+    }
+
     pub fn set_tt_reuse(&mut self, policy: TtReuse) {
         self.search_context.set_tt_reuse(policy);
     }
@@ -522,6 +540,7 @@ impl Engine {
             null_move: Default::default(),
             delta_pruning: Default::default(),
             see_pruning: Default::default(),
+            tablebase: Default::default(),
         })
     }
 
@@ -742,6 +761,7 @@ impl Engine {
                 null_move: Default::default(),
                 delta_pruning: Default::default(),
                 see_pruning: Default::default(),
+                tablebase: Default::default(),
             }
         })
     }
@@ -860,6 +880,7 @@ impl Engine {
                         null_move: Default::default(),
                         delta_pruning: Default::default(),
                         see_pruning: Default::default(),
+                        tablebase: Default::default(),
                     },
                     None,
                 )

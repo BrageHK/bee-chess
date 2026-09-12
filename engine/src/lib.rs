@@ -35,4 +35,5 @@ pub mod diagnostics;
 pub mod engine;
 pub mod eval;
 pub mod search;
+pub mod tablebase;
 pub mod uci;

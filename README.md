@@ -99,3 +99,8 @@ To A/B reuse of cached search work across moves, choose `TTReuse=PerSearch`
 versus `TTReuse=PerGame` (the default) in Bee Lab's experiment options.
 See [the TT reuse guide](docs/tt-reuse.md) for UCI commands, reset behavior,
 and local measurements.
+
+Bee also supports optional local Syzygy tablebases through `SyzygyPath`
+(empty by default) and `SyzygyProbeLimit` (6 by default, up to 7). See
+[the Syzygy guide](docs/syzygy.md) for WDL/DTZ behavior, diagnostics,
+offline regression tests, and Lab A/B setup.

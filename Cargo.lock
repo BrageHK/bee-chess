@@ -165,6 +165,7 @@ version = "0.1.0"
 dependencies = [
  "bee-book-format",
  "bee-chess-core",
+ "fathom-syzygy-sys",
 ]
 
 [[package]]
@@ -444,6 +445,16 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fathom-syzygy-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2609067825fe8ee7352ff6b07d4ddaecc93d8dd0f9cafdb0d3ef27c71e1564f"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
