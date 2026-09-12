@@ -2,6 +2,7 @@
 //!
 //! See `docs/game-analysis.md` for the versioned score/phase conventions and CLI.
 
+pub mod diagnostics;
 #[cfg(test)]
 mod regressions;
 #[cfg(test)]

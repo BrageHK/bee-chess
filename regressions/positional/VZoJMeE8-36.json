@@ -50,7 +50,8 @@
     "note": "c3 permits ...g4 and ...f3; after Nxf3/gxf3 White loses a knight while opening the king. h3 first addresses the pawn storm.",
     "expected_property": "Play h3 to restrain the kingside pawn break before spending a tempo on c3.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "VZoJMeE8",

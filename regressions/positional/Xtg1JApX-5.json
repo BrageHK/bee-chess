@@ -19,7 +19,8 @@
     "note": "Ne7 ignores the e6 pawn and allows exf7+, forcing the king to f7 and giving Bc4+ with development. Bxe6 removes the threat immediately.",
     "expected_property": "Remove the advanced e6 pawn with Bxe6 before exf7+ displaces the king and exposes it to Bc4+.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "Xtg1JApX",

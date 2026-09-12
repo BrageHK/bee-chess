@@ -49,7 +49,8 @@
     "note": "Nd5 permits Rd3, Bxh7+ and Ng6+, breaking through the king defense. Nc6 challenges the e5 attacker and keeps the Bf8 defensive resource.",
     "expected_property": "Account for the Rd3/Bxh7+/Ng6+ attack and prefer the Nc6 defensive coordination over Nd5.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "HDjhNtQm",

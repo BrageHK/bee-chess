@@ -62,7 +62,8 @@
     "note": "Kf2 allows the Nxc4+ discovery/fork and then Qh3+ with a continuing attack. h3 denies that queen entry; both positions are already lost.",
     "expected_property": "Account for the Nxc4+ discovery and Qh3+ entry before exposing the king on f2; create the h3 defensive square.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": true
+    "already_below_minus_200cp": true,
+    "subcategory": "moved_king_into_danger"
   },
   "source": {
     "game_id": "dXWTqyQj",

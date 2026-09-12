@@ -79,7 +79,8 @@
     "note": "Qd8 permits Ne7+ and a continuing queen/rook attack. Qe8 offers a queen exchange to reduce the attack in an already lost position.",
     "expected_property": "Seek queen liquidation with Qe8 to reduce the king attack rather than allowing Ne7+ and Qh2.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": true
+    "already_below_minus_200cp": true,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "lINCKwLM",
