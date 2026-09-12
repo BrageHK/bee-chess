@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 mod analysis;
+mod regressions;
 
 use bee_game_catalog::book::{self, BuildConfig};
 use bee_game_catalog::{import::lichess, GameCatalog, GameFilter};
@@ -30,6 +31,11 @@ async fn main() {
 }
 
 async fn run(args: &[String]) -> Result<(), String> {
+    if let [cmd, sub, rest @ ..] = args {
+        if cmd == "regressions" && sub == "diagnose" {
+            return regressions::diagnose(rest);
+        }
+    }
     let db_path = db_path();
     let catalog = GameCatalog::open(&db_path)
         .map_err(|err| format!("opening {}: {err}", db_path.display()))?;
@@ -206,6 +212,7 @@ fn builder_commit() -> Option<String> {
 }
 
 fn print_usage() {
+    eprintln!("  bee-games regressions diagnose [--bee <path>] [--stockfish <path>] [--fixtures <dir>] [--output <dir>] [--depths 4,6,8,10,12] [--variants baseline,no-lmr,no-null-move,no-see,no-king-safety] [--reference-nodes 1000000] [--acceptable-cp 50] [--timeout-seconds 30] [--jobs 4]");
     eprintln!("  bee-games analyze --player <name> [--player <name> ...] [--stockfish <path>] [--nodes 100000] [--limit N] [--top 20]\n  bee-games analysis report --run <id> [--top 20] [--phase opening|middlegame|endgame] [--json] [--unique-games]");
     eprintln!(
         "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--player <name> ...] [--max-ply 20] [--min-games 5] --output <path.book>"

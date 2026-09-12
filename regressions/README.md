@@ -13,11 +13,16 @@ telemetry. Reproduce with the current Bee build before assigning an engine
 cause. Already-lost positions are identified separately.
 
 Use `position startpos moves <history_uci>` when running a candidate engine;
-FEN alone loses repetition history. Apply a fixed node budget and record the
+FEN alone loses repetition history. Apply a fixed node budget when supported, or
+fixed depths, and record the
 engine commit, options, chosen move and PV. Evaluate the `expected_property`;
 matching the recorded Stockfish move exactly is not required when an equivalent
 move meets that property. Compare with deeper same-root Stockfish searches
 before treating a changed engine choice as a confirmed improvement.
+
+The [diagnostic runner](../docs/regression-diagnostics.md) implements this for
+current Bee using depths 4/6/8/10/12 and feature ablations. It preserves timeout
+and reference uncertainty, records every PV, and resumes completed searches.
 
 Schema version 1:
 
@@ -25,6 +30,7 @@ Schema version 1:
 - `expected_property`: human-readable behavior sought in a future engine.
 - `review`: explanation, confidence, and whether the root was already below
   -200cp. These are review candidates, not claims of an engine fix.
+  King-safety entries also have a provisional manual `subcategory`.
 - `source`: game/ply, result, original-game link, run and method version,
   fixed node budget, Stockfish name and canonical configuration.
 - `analysis`: both root scores, regret, best PV, and played continuation.

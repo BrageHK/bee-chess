@@ -48,7 +48,8 @@
     "note": "Nxc5/Nxc5/Qxa8+ wins a rook but permits ...Nd3+ and a sustained attack on the central king. Bf4 develops before taking material.",
     "expected_property": "Prefer development and king defense to the a8 rook grab when ...Nd3+ exposes the king to a forcing attack.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "DmgIc7b4",

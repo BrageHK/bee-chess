@@ -64,7 +64,8 @@
     "note": "Ke1 permits Qg2, Be7 and Bh4+ with tempo before the f-pawn promotes. Kc2 gets the king away from that checking route; both alternatives are already losing.",
     "expected_property": "Move the king away from the Qg2/Be7/Bh4+ checking route instead of retreating to e1.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": true
+    "already_below_minus_200cp": true,
+    "subcategory": "failed_to_evacuate_king"
   },
   "source": {
     "game_id": "EWF2qJTO",

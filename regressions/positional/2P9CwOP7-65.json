@@ -79,7 +79,8 @@
     "note": "Qb6+ allows Kf3, Rf4+ and Qe6+ followed by the Nf7+ king/rook fork. Qf6 preserves a perpetual-check defense. This exact FEN also occurs in RFRuGOB2.",
     "expected_property": "Preserve the Qf6 drawing defense instead of a check that lets the opposing rook and queen drive the king into Nf7+.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "2P9CwOP7",

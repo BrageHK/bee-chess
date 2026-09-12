@@ -59,7 +59,8 @@
     "note": "Qc3 permits Qh6 and a forcing king attack. Nxe5 preserves the perpetual-check resource Nh6+/Nf5+. Black eventually won despite this mistake.",
     "expected_property": "Recognize the Qh6 attack and preserve the drawing resource with Nxe5 instead of moving the queen to c3.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "6qGPYzK2",

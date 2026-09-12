@@ -79,7 +79,8 @@
     "note": "Same FEN and move as 2P9CwOP7: Qb6+ allows the Rf4+/Qe6+/Nf7+ attack, while Qf6 holds by repetition. Count as another game, not another distinct motif.",
     "expected_property": "Preserve the Qf6 drawing defense instead of a check that lets the opposing rook and queen drive the king into Nf7+.",
     "author": "Codex; provisional review for human confirmation",
-    "already_below_minus_200cp": false
+    "already_below_minus_200cp": false,
+    "subcategory": "ignored_opponent_attack"
   },
   "source": {
     "game_id": "RFRuGOB2",
