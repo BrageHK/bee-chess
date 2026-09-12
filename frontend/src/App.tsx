@@ -4,6 +4,7 @@ import { Game, type GameSource } from "./Game";
 import { ExperimentSetup } from "./ExperimentSetup";
 import { ExperimentView } from "./ExperimentView";
 import { Dashboard } from "./Dashboard";
+import { Analysis } from "./Analysis";
 import { AppShell } from "./components/ui/AppShell";
 import { Button } from "./components/ui/Button";
 import { Toolbar } from "./components/ui/Toolbar";
@@ -12,6 +13,7 @@ import "@lichess-org/chessground/assets/chessground.brown.css";
 import "@lichess-org/chessground/assets/chessground.cburnett.css";
 
 type Screen =
+  | { phase: "analysis"; runId: number | null; moveId: number | null }
   | { phase: "dashboard" }
   | { phase: "game-setup" }
   | { phase: "experiment-setup" }
@@ -24,6 +26,7 @@ type Screen =
  * part of this, since it changes on every new game from the same
  * screen without that being a real navigation. */
 type LocationKey =
+  | { phase: "analysis"; runId: number | null; moveId: number | null }
   | { phase: "dashboard" }
   | { phase: "game-setup" }
   | { phase: "experiment-setup" }
@@ -32,6 +35,8 @@ type LocationKey =
 
 function locationKey(screen: Screen): LocationKey {
   switch (screen.phase) {
+    case "analysis":
+      return screen;
     case "playing":
       return { phase: "playing", gameId: screen.source.kind === "resume" ? screen.source.gameId : null };
     case "experiment":
@@ -43,6 +48,7 @@ function locationKey(screen: Screen): LocationKey {
 
 function sameLocation(a: LocationKey, b: LocationKey): boolean {
   if (a.phase !== b.phase) return false;
+  if (a.phase === "analysis" && b.phase === "analysis") return a.runId === b.runId && a.moveId === b.moveId;
   if (a.phase === "playing" && b.phase === "playing") return a.gameId === b.gameId;
   if (a.phase === "experiment" && b.phase === "experiment") return a.experimentId === b.experimentId;
   return true;
@@ -56,7 +62,11 @@ function sameLocation(a: LocationKey, b: LocationKey): boolean {
 function urlForScreen(screen: Screen): string {
   const url = new URL(window.location.href);
   url.search = "";
-  if (screen.phase === "playing" && screen.source.kind === "resume") {
+  if (screen.phase === "analysis") {
+    url.searchParams.set("analysis", "1");
+    if (screen.runId !== null) url.searchParams.set("run", String(screen.runId));
+    if (screen.moveId !== null) url.searchParams.set("move", String(screen.moveId));
+  } else if (screen.phase === "playing" && screen.source.kind === "resume") {
     url.searchParams.set("game", screen.source.gameId);
   } else if (screen.phase === "experiment") {
     url.searchParams.set("experiment", screen.experimentId);
@@ -78,6 +88,11 @@ function urlForScreen(screen: Screen): string {
  * the URL never stores. */
 function screenFromUrl(): Screen {
   const params = new URLSearchParams(window.location.search);
+  if (params.has("analysis")) {
+    const positiveId = (value: string | null) => value !== null && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
+    const runId = positiveId(params.get("run"));
+    return { phase: "analysis", runId, moveId: runId === null ? null : positiveId(params.get("move")) };
+  }
   const gameId = params.get("game");
   if (gameId) return { phase: "playing", source: { kind: "resume", gameId }, gameSeq: 0 };
   const experimentId = params.get("experiment");
@@ -162,6 +177,7 @@ export default function App() {
           >
             Bee Chess
           </button>
+          {screen.phase !== "analysis" && <Button onClick={() => setScreen({ phase: "analysis", runId: null, moveId: null })}>Analysis</Button>}
           {screen.phase !== "dashboard" && (
             <Button variant="secondary" onClick={() => setScreen({ phase: "dashboard" })}>
               Dashboard
@@ -178,6 +194,8 @@ export default function App() {
               }
               onOpenExperiment={(experimentId) => setScreen({ phase: "experiment", experimentId })}
             />
+          ) : screen.phase === "analysis" ? (
+            <Analysis runId={screen.runId} moveId={screen.moveId} onNavigate={(runId, moveId) => setScreen({ phase: "analysis", runId, moveId })} />
           ) : screen.phase === "game-setup" ? (
             <GameSetup
               onStart={(white, black) =>

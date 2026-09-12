@@ -177,6 +177,7 @@ dependencies = [
  "futures-util",
  "litchee",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -190,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "bee-game-catalog",
  "litchee",
+ "serde_json",
  "tokio",
 ]
 
@@ -199,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bee-chess-core",
+ "bee-game-catalog",
  "chrono",
  "futures-util",
  "serde",

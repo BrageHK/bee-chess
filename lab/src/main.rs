@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
+mod analysis;
 mod api;
 mod experiment;
 mod game;
@@ -90,7 +91,11 @@ async fn main() {
     // it isn't mistaken for something `cargo clean`/version control
     // should touch.
     let games_data_dir = root.join("data/lab");
+    let catalog_path = std::env::var_os("BEE_GAMES_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("data/games/catalog.sqlite3"));
     let app = api::router(GameStore::with_data_dir(games_data_dir), registry)
+        .merge(analysis::router(catalog_path))
         .fallback_service(ServeDir::new(&frontend_dist))
         // See the module docs above for why -- permissive (`Any`)
         // since this is a development/orchestration server (#67), not

@@ -72,8 +72,13 @@ pub fn report(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
     let mut run = None;
     let mut top = 20;
     let mut phase = None;
+    let mut json = false;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
+        if flag == "--json" {
+            json = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -91,7 +96,27 @@ pub fn report(catalog: &GameCatalog, args: &[String]) -> Result<(), String> {
             _ => return Err(format!("unknown report flag: {flag}")),
         }
     }
-    print_report(catalog, run.ok_or("--run is required")?, top, phase)
+    let run = run.ok_or("--run is required")?;
+    if json {
+        let report = bee_game_catalog::reporting::report(
+            catalog,
+            run,
+            &bee_game_catalog::reporting::ReportFilter {
+                limit: top,
+                phase,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or("analysis run not found")?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        Ok(())
+    } else {
+        print_report(catalog, run, top, phase)
+    }
 }
 
 fn print_report(

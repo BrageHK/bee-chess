@@ -47,6 +47,20 @@ impl GameCatalog {
         Self::from_connection(conn)
     }
 
+    /// Read an existing, migrated catalog without creating files or running
+    /// migrations. Lab uses this path; analysis/import remain offline commands.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::InvalidAnalysis(format!(
+                "catalog schema {version} requires migration; open it with the current bee-games CLI (expected {SCHEMA_VERSION})"
+            )));
+        }
+        Ok(Self { conn })
+    }
+
     /// Opens an in-memory catalog. Used by tests that don't need the file
     /// round-trip itself (see also `tests/` for on-disk temp-directory
     /// coverage of `open`).
@@ -448,6 +462,16 @@ impl GameCatalog {
             "SELECT id, engine, nodes_per_position, multipv, schema_version, created_at, configuration
              FROM analysis_runs WHERE id = ?1", [id], row_to_analysis_run,
         ).optional().map_err(Error::from)
+    }
+
+    pub fn analysis_runs(&self) -> Result<Vec<crate::analysis::AnalysisRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, engine, nodes_per_position, multipv, schema_version, created_at, configuration
+             FROM analysis_runs ORDER BY created_at DESC, id DESC"
+        )?;
+        let rows = stmt.query_map([], row_to_analysis_run)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
     }
 
     /// Complete-game moves only, optionally restricted to Bee and/or a phase.
