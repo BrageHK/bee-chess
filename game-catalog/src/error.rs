@@ -3,6 +3,8 @@
 /// Errors from [`crate::GameCatalog`] and the importers.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid analysis: {0}")]
+    InvalidAnalysis(String),
     #[error("database error")]
     Database(#[from] rusqlite::Error),
 

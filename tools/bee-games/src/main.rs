@@ -15,6 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod analysis;
+
 use bee_game_catalog::book::{self, BuildConfig};
 use bee_game_catalog::{import::lichess, GameCatalog, GameFilter};
 
@@ -44,6 +46,10 @@ async fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [cmd, rest @ ..] if cmd == "list" => list(&catalog, rest),
+        [cmd, rest @ ..] if cmd == "analyze" => analysis::analyze(&catalog, rest),
+        [cmd, sub, rest @ ..] if cmd == "analysis" && sub == "report" => {
+            analysis::report(&catalog, rest)
+        }
         [cmd, sub, rest @ ..] if cmd == "book" && sub == "build-experience" => {
             build_experience(&catalog, rest)
         }
@@ -200,6 +206,7 @@ fn builder_commit() -> Option<String> {
 }
 
 fn print_usage() {
+    eprintln!("  bee-games analyze --player <name> [--player <name> ...] [--stockfish <path>] [--nodes 100000] [--limit N] [--top 20]\n  bee-games analysis report --run <id> [--top 20] [--phase opening|middlegame|endgame]");
     eprintln!(
         "usage:\n  bee-games sync lichess <username>\n  bee-games count\n  bee-games list [--limit N]\n  bee-games book build-experience --player <name> [--player <name> ...] [--max-ply 20] [--min-games 5] --output <path.book>"
     );
