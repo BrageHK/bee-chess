@@ -4,15 +4,14 @@
 //! #105, #106): change one `setoption` on Bee, run an experiment, find
 //! out whether it actually won more games.
 //!
-//! v1 is deliberately Bee-vs-Bee only (both variants use the same
-//! `EngineSpec`, just different `options`) -- see the design-system
-//! milestone's discussion for why: Stockfish's Elo/`UCI_LimitStrength`
-//! semantics and asymmetric engines add real complexity that has
-//! nothing to do with "did this Bee change help." Nothing here
-//! actually enforces that (an `EngineVariant` carries its own full
-//! `EngineConfig`, spec included), so lifting the restriction later --
-//! if there's ever a real reason to A/B two different engines -- needs
-//! no redesign, only a decision to allow it in the API layer.
+//! Variants can name different engines (an `EngineVariant` carries its
+//! own full `EngineConfig`, spec included -- see `api::
+//! ExperimentVariantRequest`), e.g. Bee vs Stockfish or Bee vs
+//! Bee-Mamba, not just two `setoption` variations of the same engine.
+//! Search-telemetry stats (`ExperimentSearchStats`) stay Bee-specific
+//! (see below) and simply report empty/zero for a variant whose engine
+//! never emits Bee's `info string bee-tm ...` lines -- a non-Bee
+//! variant is still a fully playable, tallyable opponent.
 //!
 //! Games run through the exact same `GameStore`/`run_engine_loop` a
 //! normal `POST /api/games` game does -- an experiment is an

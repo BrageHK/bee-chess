@@ -136,17 +136,25 @@ fn engine_spawn_error_message(err: &UciProcessError) -> String {
     format!("failed to query engine options: {err}")
 }
 
-/// One side of an experiment request: a human-readable label plus the
-/// `setoption`s that define it -- e.g. `{"label": "Candidate",
-/// "options": {"UseTT": false}}`. Deliberately no `engine` field here
-/// (unlike `ParticipantRequest`): v1 experiments are Bee-vs-Bee only
-/// (see `experiment`'s module docs), so `CreateExperimentRequest`
-/// names the engine once for the whole experiment, not per variant.
+/// One side of an experiment request: a human-readable label plus
+/// which engine it runs and the `setoption`s that define it -- e.g.
+/// `{"label": "Candidate", "engine": "bee-mamba", "options":
+/// {"Simulations": 1600}}`. `engine`/`debug` are per-variant but each
+/// falls back to `CreateExperimentRequest`'s top-level `engine`/
+/// `debug` when omitted, so old Bee-vs-Bee requests (which only ever
+/// set those once, for the whole experiment) keep working unchanged
+/// while a new request can pit two different engines against each
+/// other -- see `experiment`'s module docs on why nothing in the
+/// domain model (`EngineVariant`) ever required same-engine variants.
 #[derive(Debug, Deserialize)]
 struct ExperimentVariantRequest {
     label: String,
     #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
     options: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    debug: Option<bool>,
 }
 
 impl ExperimentVariantRequest {
@@ -168,11 +176,11 @@ impl ExperimentVariantRequest {
 
 #[derive(Debug, Deserialize)]
 struct CreateExperimentRequest {
-    /// Which engine both variants are (see this module's docs on why
-    /// v1 doesn't support two different engines). Defaults to `"bee"`
-    /// since that's the only realistic value right now, but still
-    /// resolved through `EngineRegistry` like everything else rather
-    /// than hardcoded, so a differently-registered name still works.
+    /// Fallback engine for either variant that doesn't name its own
+    /// (see `ExperimentVariantRequest::engine`). Defaults to `"bee"`
+    /// for backward compatibility with requests that predate per-
+    /// variant engines, but still resolved through `EngineRegistry`
+    /// like everything else rather than hardcoded.
     #[serde(default = "default_experiment_engine")]
     engine: String,
     variant_a: ExperimentVariantRequest,
@@ -192,6 +200,8 @@ struct CreateExperimentRequest {
     /// that only ever knew about a flat movetime don't break.
     #[serde(default)]
     move_time_ms: Option<u64>,
+    /// Fallback `debug` for either variant that doesn't set its own --
+    /// see `ExperimentVariantRequest::debug`.
     #[serde(default)]
     debug: bool,
 }
@@ -273,31 +283,40 @@ async fn create_experiment(
             .into_response();
     }
 
-    let Some(spec) = state.engines.get(&request.engine) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody::new(format!(
-                "unknown engine {:?}",
-                request.engine
-            ))),
-        )
-            .into_response();
+    let resolve_variant_spec = |variant: &ExperimentVariantRequest| -> Result<EngineSpec, String> {
+        let name = variant.engine.as_deref().unwrap_or(&request.engine);
+        state
+            .engines
+            .get(name)
+            .ok_or_else(|| format!("unknown engine {name:?}"))
+    };
+    let spec_a = match resolve_variant_spec(&request.variant_a) {
+        Ok(spec) => spec,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody::new(message))).into_response()
+        }
+    };
+    let spec_b = match resolve_variant_spec(&request.variant_b) {
+        Ok(spec) => spec,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody::new(message))).into_response()
+        }
     };
 
     let variant_a = EngineVariant {
         label: request.variant_a.label.clone(),
         config: EngineConfig {
-            spec: spec.clone(),
+            spec: spec_a,
             options: request.variant_a.options(),
-            debug: request.debug,
+            debug: request.variant_a.debug.unwrap_or(request.debug),
         },
     };
     let variant_b = EngineVariant {
         label: request.variant_b.label.clone(),
         config: EngineConfig {
-            spec,
+            spec: spec_b,
             options: request.variant_b.options(),
-            debug: request.debug,
+            debug: request.variant_b.debug.unwrap_or(request.debug),
         },
     };
     let experiment_spec = ExperimentSpec {
@@ -1271,6 +1290,68 @@ mod tests {
                             "engine": "no-such-engine",
                             "variant_a": {"label": "A"},
                             "variant_b": {"label": "B"},
+                            "games": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_experiments_resolves_each_variants_engine_independently() {
+        // No top-level `engine` at all (it would default to "bee",
+        // which isn't registered here) -- each variant names its own
+        // engine, proving they're resolved independently rather than
+        // both forced onto one shared engine.
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        registry.insert("fake-alt", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experiments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "variant_a": {"label": "A", "engine": "fake"},
+                            "variant_b": {"label": "B", "engine": "fake-alt"},
+                            "games": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn post_experiments_with_an_unknown_engine_on_just_one_variant_is_400() {
+        let mut registry = EngineRegistry::new();
+        registry.insert("fake", fake_engine_spec());
+        let app = router(GameStore::new(), registry);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experiments")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "engine": "fake",
+                            "variant_a": {"label": "A"},
+                            "variant_b": {"label": "B", "engine": "no-such-engine"},
                             "games": 2,
                         })
                         .to_string(),

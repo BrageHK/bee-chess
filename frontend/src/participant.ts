@@ -28,7 +28,7 @@ export type Participant =
   | { kind: "human" }
   | { kind: "stockfish"; elo: number; moveTimeMs: number; debug: boolean }
   | { kind: "bee"; moveTimeMs: number; debug: boolean; options: EngineOptions }
-  | { kind: "bee-mamba"; moveTimeMs: number };
+  | { kind: "bee-mamba"; moveTimeMs: number; options: EngineOptions };
 
 export type ParticipantKind = Participant["kind"];
 
@@ -53,7 +53,13 @@ export function defaultParticipant(kind: ParticipantKind): Participant {
       // fields don't have real values before their schema loads.
       return { kind: "bee", moveTimeMs: 100, debug: false, options: {} };
     case "bee-mamba":
-      return { kind: "bee-mamba", moveTimeMs: 500 };
+      // Unlike "bee" above, Simulations/BatchSize are hardcoded here
+      // rather than discovered via GET /api/engines/bee-mamba/options:
+      // that endpoint spawns the engine fresh (loads the Torch model)
+      // just to read back its option list, which is slow enough to
+      // stall GameSetup. Values must match mamba_mcts_batched_uci's
+      // own DEFAULT_SIMULATIONS/DEFAULT_BATCH_SIZE (main.rs).
+      return { kind: "bee-mamba", moveTimeMs: 500, options: { Simulations: 800, BatchSize: 64 } };
   }
 }
 

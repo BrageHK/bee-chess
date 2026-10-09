@@ -1,0 +1,20 @@
+[package]
+name = "mamba_mcts_batched_uci"
+version = "0.1.0"
+edition = "2021"
+description = "UCI engine: wave-batched PUCT MCTS for Bee-Mamba through a dynamic-batch TorchScript module, no PyO3/Python at runtime"
+
+# Its own workspace, not a member of the root one -- same reasoning as
+# mamba_mcts_native's Cargo.toml: this crate's dependency tree (tch/libtorch)
+# is unrelated to the root workspace's (bee-engine/bee-chess-core), and it
+# uses the external `chess` crate rather than bee-chess-core, matching
+# mamba_mcts_native's own precedent for the same pragmatic reason.
+[workspace]
+
+[[bin]]
+name = "mamba_mcts_batched_uci"
+path = "src/main.rs"
+
+[dependencies]
+chess = "3.2.0"
+tch = "0.22"

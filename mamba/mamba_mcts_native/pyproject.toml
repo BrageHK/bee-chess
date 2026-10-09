@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mamba-mcts-native"
+version = "0.1.0"
+description = "Rust PUCT MCTS (tree search + NN-eval cache) for Bee-Mamba, called from Python"
+requires-python = ">=3.14"
+
+[tool.maturin]
+module-name = "mamba_mcts_native"
+features = ["pyo3/extension-module"]

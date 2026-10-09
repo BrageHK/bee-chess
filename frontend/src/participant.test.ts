@@ -44,7 +44,7 @@ describe("defaultParticipant", () => {
 describe("validateParticipant", () => {
   it("rejects zero or negative move time for every bot kind", () => {
     const zero: Participant = { kind: "bee", moveTimeMs: 0, debug: false, options: {} };
-    const negative: Participant = { kind: "bee-mamba", moveTimeMs: -1 };
+    const negative: Participant = { kind: "bee-mamba", moveTimeMs: -1, options: {} };
     expect(validateParticipant(zero)).not.toBeNull();
     expect(validateParticipant(negative)).not.toBeNull();
   });
@@ -89,7 +89,7 @@ describe("validateParticipant", () => {
   });
 
   it("bee-mamba has no elo/debug field to validate beyond move time", () => {
-    const p: Participant = { kind: "bee-mamba", moveTimeMs: 250 };
+    const p: Participant = { kind: "bee-mamba", moveTimeMs: 250, options: {} };
     expect(validateParticipant(p)).toBeNull();
   });
 

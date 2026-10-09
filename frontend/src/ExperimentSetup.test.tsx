@@ -29,14 +29,42 @@ describe("ExperimentSetup", () => {
 
     expect(labClient.createExperiment).toHaveBeenCalledWith(
       expect.objectContaining({
-        variantA: { label: "Baseline", options: {} },
-        variantB: { label: "Candidate", options: {} },
+        variantA: { label: "Baseline", engine: "bee", options: {} },
+        variantB: { label: "Candidate", engine: "bee", options: {} },
         games: 20,
         concurrency: 2,
         timeControl: { type: "move_time", move_time_ms: 100 },
       }),
     );
     expect(onStarted).toHaveBeenCalledWith("exp-1");
+  });
+
+  it("lets each variant pick a different bot and sends its engine-specific config", async () => {
+    vi.mocked(labClient.createExperiment).mockResolvedValue(experimentSnapshotFixture());
+    const user = userEvent.setup();
+
+    render(<ExperimentSetup onStarted={() => {}} />);
+
+    const bots = screen.getAllByRole("combobox", { name: "Bot" });
+    await user.selectOptions(bots[0], "stockfish");
+    await user.selectOptions(bots[1], "bee-mamba");
+
+    await user.click(screen.getByRole("button", { name: /run experiment/i }));
+
+    expect(labClient.createExperiment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        variantA: {
+          label: "Baseline",
+          engine: "stockfish",
+          options: { UCI_LimitStrength: true, UCI_Elo: 1600 },
+        },
+        variantB: {
+          label: "Candidate",
+          engine: "bee-mamba",
+          options: { Simulations: 800, BatchSize: 64 },
+        },
+      }),
+    );
   });
 
   it("switching to Fischer sends initial/increment in milliseconds", async () => {
